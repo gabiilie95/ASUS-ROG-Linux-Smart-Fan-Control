@@ -448,6 +448,7 @@ FAND_RUN = Path("/run/rog-fand")
 FAND_UNIT = Path("/etc/systemd/system/rog-fand.service")
 FAND_MODES = {"auto": "Automatic", "off": "Off · base curve", "preset:light": "Light",
               "preset:heavy": "Heavy", "preset:max": "Maximum"}
+last_mode_request = None     # (mode, monotonic time) of this panel's latest request
 
 
 def validate_fand_sample(s):
@@ -523,6 +524,8 @@ def request_fan_mode(mode):
             os.replace(tmp, directory / "mode")
         finally:
             tmp.unlink(missing_ok=True)
+    global last_mode_request
+    last_mode_request = mode, time.monotonic()
 
 
 def manual_fan_problem(holding_lease=False):

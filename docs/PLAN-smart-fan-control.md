@@ -123,6 +123,33 @@ In `ui/rog-panel-qt.py` (shared logic in `ui/rogcore.py`):
   with live progress, a per-step results table and CSV export. Restores the exact curve at the end
   and on cancel, as the script does. Shows a warning when the internal sound device is busy.
 
+### 2b. System tray and notifications
+
+A tray icon for the panel (`QSystemTrayIcon`; KDE shows it as a status notifier item).
+
+**Status:** built on 2026-11-17 in `ui/fan_tray.py` (branch `feat/tray-notifications`). Additions
+to the design below:
+- Blue also covers calibration in control and profiles other than Performance.
+- Red for drops leaves out stream start-up skips.
+- A down service notifies only after two polls, which covers resume and restarts.
+- Mode changes made by this panel do not notify.
+- **Icon:** the ROG logo that asusctl already installs, loaded by theme name, never copied into this
+  repository (it is ASUS's trademark): `asus_notif_green` while Auto is clean, `asus_notif_yellow`
+  while boosted or ramping down from a boost, `asus_notif_orange` on the sensor fallback,
+  `asus_notif_red` on USB drops or when the service is stopped or stale, `asus_notif_blue` in Off
+  or a manual preset, `asus_notif_white` when unknown. Fall back to `preferences-system` if they
+  are missing.
+- **Tooltip:** mode, floors, GPU W, board C, USB drops/s.
+- **Menu:** open the panel; mode (Auto, Off, Light, Heavy, Max); start or stop the stall monitor;
+  quit.
+- **Notifications** (rate-limited, each kind at most once per few minutes):
+  - USB drop boost, with the drop rate;
+  - service stopped, stale or restarted;
+  - sensor fallback entered or left;
+  - mode changed from elsewhere.
+- **Background:** closing the window keeps the panel in the tray (setting). Start at login is an
+  opt-in setting that writes `~/.config/autostart/`.
+
 ### 3. Load test and model (Phase 3)
 
 `tools/autotune.py`, unattended, about 60-90 minutes, loud:
