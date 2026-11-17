@@ -376,23 +376,25 @@ the red logo (`asus_notif_red`), as does the window when the tray icon is off:
 | Yellow | Fans boosted after USB drops, or ramping back down (about 4 minutes) |
 | Orange | Sensor fallback: a sensor is missing and the fans are held at safe floors |
 | Red | USB audio dropping packets now (start-up skips excluded), or the service stopped, stale or unreadable |
-| Blue | Off, a manual preset, calibration in control, or a profile other than Performance |
+| Blue | Off, a manual preset, calibration in control, or a profile the service does not protect |
 | White | Service not installed or state unknown |
 
 - **Tooltip:** floors, GPU power, board temperature and USB drops, plus the stall monitor's rate while it runs.
-  Outside Performance it reads "Paused: Quiet profile" (or Balanced), because rog-fand stands down there.
+  In a profile the service does not protect it reads "Paused: Quiet profile" (or Balanced), because
+  rog-fand stands down there. Services from 0.3.0 and older protect Performance only.
 - **Menu:** open or hide the panel, fan mode, start or stop the stall monitor, update check and
   install, the Settings tab's switches (except the tray icon itself), **Settings…** and Quit.
-  While the service is paused by another profile, **Switch to Performance profile** runs
+  In any profile other than Performance, **Switch to Performance profile** runs
   `asusctl profile set Performance` (asusd does this for the desktop user, no password).
 - **Notifications:** each kind at most once per 5 minutes, for:
   - a USB drop boost, with the drop rate;
   - the service stopped, stale or unreadable for two polls in a row, running again, or restarted;
   - the sensor fallback starting or ending;
   - a mode change made outside this panel;
-  - the power profile leaving Performance (Fn+F5 or the desktop's power settings), and its return.
-    A Quiet profile caps the fans, which brought the crackle back under load. A paused notice
-    right after a resumed one always shows, so the last profile notice never says all is well.
+  - the power profile changing to one the service does not protect (Fn+F5 or the desktop's power
+    settings), and back to a protected one. An unprotected Quiet profile caps the fans, which
+    brought the crackle back under load. A switch between protected profiles needs no notice. A
+    paused notice right after a resumed one always shows, so the last one never says all is well.
 - **Background:** closing the window hides it to the tray. While hidden, only a 2 s read of
   `/run/rog-fand/status.json` keeps running. Use **Quit** in the tray menu to exit. If the stall
   monitor is running, hiding the window says so, because the monitor keeps the internal speakers

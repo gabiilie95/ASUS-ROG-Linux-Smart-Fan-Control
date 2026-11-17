@@ -64,9 +64,8 @@ def classify(state, s, wall, last_boost):
         return "red", f"USB audio dropping {drops:g} packets/s"
     if s.get("manual_control"):
         return "blue", "Calibration controls the fans"
-    profile = s["sensors"].get("profile")
-    if profile != "performance":
-        return "blue", f"Paused: {core.profile_name(profile)} profile"
+    if not core.fans_protected(s):
+        return "blue", f"Paused: {core.profile_name(s['sensors'].get('profile'))} profile"
     if s["mode"] == "off":
         return "blue", "Off, base curve only"
     if s.get("degraded"):
@@ -130,16 +129,21 @@ class TrayModel:
                 own = requested is not None and requested[0] == s["mode"] and mono - requested[1] < OWN_REQUEST_S
                 if s["mode"] != last["mode"] and not own:
                     due.append(("mode", "Fan mode changed", f"Now {mode}."))
-            if last is not None:     # rog-fand stands down outside Performance (see service/rog_fand.py)
-                was, now = last["sensors"].get("profile"), s["sensors"].get("profile")
-                if was == "performance" and now != "performance":
+            now = s["sensors"].get("profile")
+            if last is not None and now != last["sensors"].get("profile"):
+                # rog-fand stands down in a profile it does not protect. A change between two protected
+                # profiles needs no notice: the protection stays on.
+                was_on, is_on = core.fans_protected(last), core.fans_protected(s)
+                if was_on and not is_on:
                     due.append(("profile", "Fan protection paused",
-                                f"The power profile is now {core.profile_name(now)}. rog-fand only controls the "
-                                "fans in Performance, so audio may crackle under load. Switch back from the tray "
-                                "menu."))
-                elif was != "performance" and now == "performance" and self.told_profile == "profile":
+                                f"The power profile is now {core.profile_name(now)}, which rog-fand does not "
+                                "protect, so audio may crackle under load."
+                                + (" Switch to Performance from the tray menu." if core.performance_protected(s)
+                                   else "")))
+                elif is_on and not was_on and self.told_profile == "profile":
                     due.append(("profile-back", "Fan protection resumed",
-                                f"The power profile is Performance again; rog-fand is back in {mode} mode."))
+                                f"The power profile is now {core.profile_name(now)}, which rog-fand protects "
+                                f"({mode} mode)."))
             self.down_sent = False
             self.last_running = s
         else:
@@ -237,8 +241,8 @@ class FanTray(QObject):
     def keep_running(self):
         return self.prefs.get("close_to_tray")
 
-    def paused(self):
-        """rog-fand is running but stands down because the platform profile is not Performance."""
+    def other_profile(self):
+        """rog-fand runs and the platform profile is not Performance, protected or not."""
         return self.state == "Running" and bool(self.sample) and self.sample["sensors"].get("profile") != "performance"
 
     def can_control(self):
@@ -292,9 +296,9 @@ class FanTray(QObject):
         for key, act in self.mode_acts.items():
             act.setChecked(key == mode)
         self.mode_menu.setEnabled(self.can_control())
-        paused = self.paused()
-        self.profile_act.setVisible(paused)
-        self.profile_act.setEnabled(paused and self.profile_proc is None)
+        other = self.other_profile()
+        self.profile_act.setVisible(other)
+        self.profile_act.setEnabled(other and self.profile_proc is None)
         self.profile_act.setText("Switching to Performance…" if self.profile_proc else "Switch to Performance profile")
         self.monitor_act.setText("Stop stall monitor" if self.win.monitor_running() else "Start stall monitor")
         up = self.updater

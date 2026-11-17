@@ -112,6 +112,15 @@ def service_tabs(w, q):
           and "asusctl profile set Performance" in auto.detail.text(), "auto: paused outside Performance, with the way back")
     auto.display("Running", s)
     check("Paused" not in auto.detail.text(), "auto: no pause note in Performance")
+    auto.display("Running", dict(s, sensors=dict(s["sensors"], profile="quiet"), controlled=True,
+                                 profiles=["performance", "quiet"]))
+    check(auto.detail.text().startswith("Quiet profile") and "Paused" not in auto.detail.text(),
+          "auto: no pause note in a protected Quiet profile")
+    auto.display("Running", dict(s, sensors=dict(s["sensors"], profile="quiet"), controlled=False,
+                                 profiles=["quiet"]))
+    check("Paused" in auto.detail.text() and "asusctl" not in auto.detail.text(),
+          "auto: Performance is not suggested when the service does not protect it")
+    auto.display("Running", s)
     with patch.object(core, "read_fans", return_value=dict(cpu_rpm=3150, gpu_rpm=None, mid_rpm=7400)):
         auto.display("Running", s)
     check(auto.speeds["cpu"].value() == 3150 and auto.speeds["cpu"].format() == "3,150 rpm · 50%"
@@ -227,6 +236,23 @@ def tray_model_tests():
           == "Paused: unknown profile", "tray: outside Performance the summary says paused")
     check(core.profile_name("low-power") == "Low power" and core.profile_name(None) == "unknown",
           "tray: profile names for people")
+    on = lambda profile, controlled, **c: fand_sample(sensors=dict(s["sensors"], profile=profile),
+                                                      controlled=controlled, **c)
+    check(m.classify("Running", on("quiet", True), wall, None) == ("green", "Automatic")
+          and m.classify("Running", on("balanced", True, degraded=True), wall, None)[0] == "orange",
+          "tray: a protected Quiet or Balanced profile keeps the usual colours")
+    check(m.classify("Running", on("quiet", False), wall, None) == ("blue", "Paused: Quiet profile")
+          and m.classify("Running", on("performance", False), wall, None) == ("blue", "Paused: Performance profile"),
+          "tray: the controlled field decides paused, not the profile name")
+    check(core.validate_fand_sample(on("quiet", True, profiles=["performance", "quiet"])) is not None,
+          "status: controlled and profiles accepted")
+    for bad in (dict(controlled="yes"), dict(profiles="quiet"), dict(profiles=[1])):
+        try:
+            core.validate_fand_sample(fand_sample(**bad))
+            ok = False
+        except ValueError:
+            ok = True
+        check(ok, "status: invalid %s rejected" % next(iter(bad)))
     warm = dict(name="USB interface", packets=16000, skipped=10, warmup_skipped=10, drops_per_s=5.0)
     real = dict(name="USB interface", packets=16000, skipped=20, warmup_skipped=10, drops_per_s=10.0)
     check(m.usb_drops(fand_sample(usb=dict(audio_active=True, error=None, devices=[warm]))) == 0
@@ -267,8 +293,8 @@ def tray_model_tests():
     check(model.observe("Running", prof("performance"), wall, 2002) == [],
           "profile: no resumed notice without a paused notice")
     due = model.observe("Running", prof("quiet"), wall, 2004)
-    check(kinds(due) == ["profile"] and due[0][1] == "Fan protection paused" and "now Quiet." in due[0][2]
-          and "tray menu" in due[0][2], "profile: leaving Performance names the new profile")
+    check(kinds(due) == ["profile"] and due[0][1] == "Fan protection paused" and "now Quiet," in due[0][2]
+          and "tray menu" in due[0][2], "profile: leaving Performance names the new profile (older service)")
     check(model.observe("Running", prof("balanced"), wall, 2006) == [], "profile: Quiet to Balanced stays paused, no notice")
     due = model.observe("Running", prof("performance"), wall, 2008)
     check(kinds(due) == ["profile-back"] and due[0][1] == "Fan protection resumed" and "Automatic" in due[0][2],
@@ -283,6 +309,24 @@ def tray_model_tests():
     check(model.observe("Stale", None, wall, 2400) == [] and kinds(model.observe("Stale", None, wall, 2402))
           == ["service-down"] and kinds(model.observe("Running", prof(None), wall, 2404)) == ["service-up", "profile"],
           "profile: a profile change across a service outage is still noticed")
+
+    model = m.TrayModel()     # a service that reports which profiles it protects
+    every = ["performance", "balanced", "quiet"]
+    check(model.observe("Running", on("performance", True, profiles=every), wall, 3000) == []
+          and model.observe("Running", on("quiet", True, profiles=every), wall, 3002) == []
+          and model.observe("Running", on("balanced", True, profiles=every), wall, 3004) == [],
+          "profile: no notice while every profile stays protected")
+    due = model.observe("Running", on("quiet", False, profiles=["performance", "balanced"]), wall, 3006)
+    check(kinds(due) == ["profile"] and "now Quiet, which rog-fand does not protect" in due[0][2]
+          and "Switch to Performance" in due[0][2], "profile: paused when the new profile is not protected")
+    due = model.observe("Running", on("balanced", True, profiles=["performance", "balanced"]), wall, 3008)
+    check(kinds(due) == ["profile-back"] and "now Balanced, which rog-fand protects (Automatic mode)" in due[0][2],
+          "profile: resumed in another protected profile")
+    model = m.TrayModel()
+    model.observe("Running", on("quiet", True, profiles=["quiet"]), wall, 3100)
+    due = model.observe("Running", on("performance", False, profiles=["quiet"]), wall, 3102)
+    check(kinds(due) == ["profile"] and "Switch to Performance" not in due[0][2],
+          "profile: Performance is not suggested when the service does not protect it")
 
     ps = panel_settings
     check(ps.exec_arg("/usr/bin/python3") == "/usr/bin/python3", "exec: plain path unquoted")
@@ -448,6 +492,14 @@ def profile_tests(w, tray, shown, status):
     heavy = lambda profile: fand_sample(mode="preset:heavy", sensors=dict(fand_sample()["sensors"], profile=profile))
     tray.update_menu()
     check(not tray.profile_act.isVisible(), "profile: no switch entry in Performance")
+    publish(status, json.dumps(dict(heavy("quiet"), controlled=True, profiles=["performance", "quiet"])))
+    tray.poll()
+    tray.update_menu()
+    check(not shown and "ROG fans: Heavy preset" in tray.tray.toolTip() and tray.profile_act.isVisible(),
+          "profile: a protected Quiet profile needs no notice and still offers Performance")
+    publish(status, json.dumps(dict(heavy("performance"), controlled=True, profiles=["performance", "quiet"])))
+    tray.poll()
+    check(not shown, "profile: back to Performance from a protected profile without a notice")
     publish(status, json.dumps(heavy("quiet")))
     tray.poll()
     check(tray.colour == "blue" and "ROG fans: Paused: Quiet profile" in tray.tray.toolTip() and len(shown) == 1
