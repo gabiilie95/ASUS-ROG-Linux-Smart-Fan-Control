@@ -20,8 +20,13 @@ import rog_fand as fand
 import rog_sensors as sensors
 
 ROOT = HERE.parent
-CFG = fand.config()
+DEFAULTS = fand.config()
+# Most tests check where the floors go, not how fast they climb: let them climb at once.
+CFG = dict(DEFAULTS, max_up_step=100)
 BASE = CFG["base_curve"]
+# The timings before 2026-11-17; with a heat-soaked board the ramp still moves at this pace.
+LEGACY = dict(CFG, fall_s=60, hold_s=60, down_step_s=20, hot_down_step_s=20, clean_s=1800, max_up_step=100)
+HOT = 80
 
 
 class PolicyTest(unittest.TestCase):
@@ -36,7 +41,7 @@ class PolicyTest(unittest.TestCase):
                 self.assertEqual(p.heat, watts + 100)
 
     def test_smoothing_and_missing_heat(self):
-        p = fand.Policy(CFG)
+        p = fand.Policy(LEGACY)
         p.step(0, 40, 10)
         p.step(6, 100, 20)
         self.assertAlmostEqual(p.gpu, 77.9272, places=3)
@@ -62,7 +67,7 @@ class PolicyTest(unittest.TestCase):
         self.assertEqual(floors, (65, 70, 100))
 
     def test_decay_requires_clean_active_time_in_same_bin(self):
-        p = fand.Policy(CFG, {"50": 5, "140": 10})
+        p = fand.Policy(LEGACY, {"50": 5, "140": 10})
         def clean(t):
             p.step(t, 80, 10, active=True, traffic=True)
         clean(0)
@@ -81,7 +86,7 @@ class PolicyTest(unittest.TestCase):
     def test_ramp_per_fan(self):
         ramp = fand.Ramp()
         def step(t, target):
-            return ramp.step(target, t, CFG)
+            return ramp.step(target, t, LEGACY, board=HOT)
         self.assertEqual(step(0, (80, 80, 80)), (80, 80, 80))
         step(2, (35, 40, 70))
         self.assertEqual(step(61, (83, 40, 90)), (80, 80, 90))
@@ -97,6 +102,101 @@ class PolicyTest(unittest.TestCase):
         self.assertEqual(p.step(4, 150, None, mode="off")[0], fand.ZERO)
         self.assertEqual(p.step(6, 150, None, mode="preset:light")[0], (35, 40, 70))
         self.assertEqual(p.step(8, 150, None, controlled=False)[0], fand.ZERO)
+
+
+class FasterResponseTest(unittest.TestCase):
+    """Faster on the way down without spikes: proportional steps, heat-soak pace, mode changes."""
+
+    def ramp_down(self, board, start=(80, 80, 80), cfg=CFG):
+        ramp = fand.Ramp()
+        ramp.step(start, 0, cfg)
+        t, seen = 2, []
+        while any(ramp.floors) and t < 2000:
+            seen.append((t, ramp.step((0, 0, 0), t, cfg, board=board)))
+            t += 2
+        return t, seen
+
+    def test_cool_board_steps_by_a_third_and_lands_on_target(self):
+        t, seen = self.ramp_down(board=50)
+        mids = [f[2] for _, f in seen]
+        self.assertEqual(mids[:15], [80] * 15, "30 s hold before the first step")
+        steps = [a - b for a, b in zip(mids, mids[1:]) if a != b]
+        self.assertTrue(all(5 <= d <= 20 for d in steps[:-1]) and 0 < steps[-1] <= 20, steps)
+        self.assertEqual(mids[-1], 0)
+        self.assertLess(t, 150, "80 % to 0 within about two minutes")
+        ramp = fand.Ramp()
+        ramp.step((80, 80, 80), 0, CFG)
+        for t in range(2, 400, 2):
+            ramp.step((35, 40, 70), t, CFG, board=50)
+        self.assertEqual(ramp.floors, (35, 40, 70), "no residue inside the dead band")
+
+    def test_heat_soaked_board_keeps_the_cautious_pace(self):
+        t, seen = self.ramp_down(board=HOT)
+        steps = [a[2] - b[2] for (_, a), (_, b) in zip(seen, seen[1:]) if a != b]
+        self.assertEqual(set(steps), {5})
+        self.assertGreater(t, 300)
+
+    def test_mode_change_skips_the_hold(self):
+        p = fand.Policy(CFG)
+        for t in range(0, 60, 2):
+            floors, _ = p.step(t, 20, 10, mode="preset:max", board=50)
+        self.assertEqual(floors, (100, 100, 100))
+        floors, _ = p.step(60, 20, 10, mode="auto", board=50)
+        self.assertLess(floors[2], 100, "the first step comes with the change, not after the hold")
+        for t in range(62, 300, 2):
+            floors, _ = p.step(t, 20, 10, mode="auto", board=50)
+            if not any(floors):
+                break
+        self.assertLess(t - 60, 120)
+        # A dip in load is not a decision: it still waits for the hold.
+        p = fand.Policy(CFG)
+        for t in range(0, 300, 2):
+            p.step(t, 150, 40, board=50)
+        p.step(300, 20, 10, board=50)
+        self.assertEqual(p.ramp.floors, (80, 80, 80))
+
+    def test_loading_screen_causes_no_dip(self):
+        p = fand.Policy(CFG)
+        for t in range(0, 300, 2):
+            p.step(t, 150, 40, board=60)
+        lowest = 100
+        for t in range(300, 420, 2):
+            gpu = 40 if t < 320 else 150
+            floors, _ = p.step(t, gpu, 40, board=60)
+            lowest = min(lowest, floors[2])
+        self.assertEqual(lowest, 80)
+
+    def test_quick_boost_on_a_large_burst_only(self):
+        p = fand.Policy(CFG)
+        p.step(0, 150, 40, active=True, traffic=True)
+        _, event = p.step(2, 150, 40, active=True, traffic=True, drops=50)
+        self.assertIsNone(event, "a small single sample still needs a second one")
+        p = fand.Policy(CFG)
+        p.step(0, 150, 40, active=True, traffic=True)
+        _, event = p.step(2, 150, 40, active=True, traffic=True, drops=2000)
+        self.assertEqual(event, "USB drop boost")
+        p = fand.Policy(CFG)
+        _, event = p.step(2, 150, 40, active=True, traffic=True, drops=2000, mode="preset:heavy")
+        self.assertIsNone(event, "presets never boost")
+
+    def test_up_is_a_quick_ramp_not_a_jump(self):
+        ramp = fand.Ramp()
+        ups = [ramp.step((80, 80, 100), t, DEFAULTS)[2] for t in (0, 2, 4, 6, 8)]
+        self.assertEqual(ups, [30, 60, 90, 100, 100])
+        ramp = fand.Ramp()
+        self.assertEqual(ramp.step((35, 40, 70), 0, DEFAULTS), (30, 30, 30))
+        self.assertEqual(ramp.step((35, 40, 70), 2, DEFAULTS), (35, 40, 60))
+        self.assertEqual(ramp.step((35, 40, 70), 4, DEFAULTS), (35, 40, 70))
+        self.assertEqual(DEFAULTS["max_up_step"], 30)
+
+    def test_old_default_timings_migrate(self):
+        installed = dict(fall_s=60, hold_s=60, down_step_s=20, clean_s=1800, rise_s=6)
+        self.assertEqual(fand.migrate_timing(installed), dict(rise_s=6))
+        self.assertEqual(fand.migrate_timing(dict(hold_s=45, clean_s=1800)), dict(hold_s=45))
+        with tempfile.TemporaryDirectory() as tmp, patch.object(fand, "ETC", Path(tmp)):
+            (Path(tmp) / "config.json").write_text(json.dumps(dict(hold_s=60, down_step_s=12)))
+            cfg = fand.config(installed=True)
+        self.assertEqual((cfg["hold_s"], cfg["down_step_s"]), (DEFAULTS["hold_s"], 12))
 
 
 class CurveTest(unittest.TestCase):
@@ -315,8 +415,9 @@ class LifecycleTest(unittest.TestCase):
                 fand.run_service(True, 120)
         status = json.loads(output.getvalue())
         # RAPL and usbmon are unavailable to the user; they are reported but must not force the
-        # fallback (review fix 2026-11-17). 81 W selects the 50-110 W row.
-        self.assertEqual(tuple(status["floors"].values()), (35, 40, 70))
+        # fallback (review fix 2026-11-17). 81 W selects the 50-110 W row (35/40/70); the first
+        # sample is the first step of the up-ramp toward it.
+        self.assertEqual(tuple(status["floors"].values()), (30, 30, 30))
         self.assertFalse(status["degraded"])
         self.assertFalse(status["applied"])
         self.assertIn("usbmon requires root", status["unavailable"])
@@ -363,7 +464,7 @@ class LifecycleTest(unittest.TestCase):
         model = self.path / "model.json"
         fand.atomic_write(model, '{"table":[{"min_gpu_w":0,"floors":[20,30,45]}]}')
         cfg = fand.config(installed=True)
-        self.assertEqual(fand.Policy(cfg).step(0, 42, 10)[0], (20,30,45))
+        self.assertEqual(fand.Policy(dict(cfg, max_up_step=100)).step(0, 42, 10)[0], (20,30,45))
         fand.atomic_write(model, '{"table":[]}')
         with self.assertRaises(ValueError):
             fand.config(installed=True)

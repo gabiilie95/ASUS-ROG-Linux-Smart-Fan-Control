@@ -77,7 +77,7 @@ Decision:
   GPU < 50 W: no floor; 50-110 W: 35 / 40 / 70; 110-140 W: 60 / 60 / 75; >= 140 W: 80 / 80 / 80.
 - Feedback: when audio is active and drops are seen in 2 consecutive samples, boost at once
   (middle +20 points, others +10, capped at 100) and raise that heat bin's margin by 5 points
-  (cap 20). After 30 min clean in a bin, lower its margin by 2.5 (floor 0). Persist margins in
+  (cap 20). After 15 min clean in a bin (was 30), lower its margin by 2.5 (floor 0). Persist margins in
   `/var/lib/rog-fand/state.json`.
 - No feedback when no USB audio is playing (nothing to protect on USB); feed-forward still applies.
 
@@ -90,8 +90,10 @@ Applying (fail-safe by construction):
   are touched only while their floors are above zero, with their own curves and enable flags saved
   in a per-profile receipt and restored exactly afterwards.) If the owner switches profile, finish
   or defer the write and log it.
-- Write only when a floor changes by at least 5 points. Up: immediately. Down: after a 60 s hold, at
-  most 5 points per 20 s (no surging).
+- Write only when a floor changes by at least 5 points. Up: at most 30 points per 2 s sample.
+  Down: after a 30 s hold, a third of the gap (5 to 20 points) every 10 s, finishing at the target;
+  5 points per 20 s while the board sensor reads 75 °C or more. A mode the user picks skips the
+  hold. (Was: up at once; down after a 60 s hold, 5 points per 20 s. Changed 2026-11-17.)
 - On stop (SIGTERM, `ExecStopPost`) and on any unhandled error: restore the base curve exactly.
 - If a sensor fails (NVML unavailable, RAPL unreadable), use a conservative floor (for example 60 / 60 / 80)
   and report it in the status.

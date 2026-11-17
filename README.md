@@ -294,13 +294,49 @@ Click counting in recordings (mono 16-bit 48 kHz WAV, high-passed at 17.5 kHz fi
 
 `rog-fand` samples the G814JZ every two seconds. Smoothed GPU watts select minimum
 CPU/GPU/middle fan levels. Each point keeps the higher of the calibrated balanced PWM
-and the requested floor. Two consecutive USB drop samples trigger a boost and raise the margin
-for that power range. Status reports missing sensors. The conservative floor of at least 60/60/80 applies only when
+and the requested floor. Two consecutive USB drop samples, or one large burst (200 or more
+skipped packets in a sample), trigger a boost and raise the margin for that power range. Status reports missing sensors. The conservative floor of at least 60/60/80 applies only when
 GPU power, a temperature or a fan speed has been missing for three consecutive samples (6 s);
 a single gap holds the last GPU reading. CPU power (RAPL) and usbmon are reported when missing
 but never force the fallback, because they only feed the heat display and the feedback.
 USB skips in the first second of a stream (after 2 s without traffic) are reported as
 `warmup_skipped` and do not count as drops.
+
+**Response timing** (2026-11-17). Going up stays fast, but is no longer a jump. Coming down is
+quicker, and slow only while the board is still heat-soaked.
+- **Up:** a floor rises by at most 30 points per 2 s sample (`max_up_step`), so a game starting
+  ramps the middle fan to 70 % over 6 s instead of in one jump. GPU power is still smoothed with a
+  6 s time constant on the way up, so a 2 s burst (a video, a web page) does not raise the fans.
+- **Down:** a floor waits 30 s (`hold_s`, was 60 s) after the target drops. It then steps down
+  every 10 s (`down_step_s`, was 20 s) by a third of the remaining gap: at least 5 and at most 20
+  points (`max_down_step`). It finishes exactly at the target.
+- **Heat soak:** while the board sensor reads 75 °C or more (`hot_board_c`), it keeps the old pace
+  of 5 points every 20 s (`hot_down_step_s`), so the chipset area cools before airflow drops.
+- **Your mode changes** (leaving Max or a preset) skip the hold. A load dip, such as a loading
+  screen, does not.
+- **GPU power smoothing on the way down:** 30 s (`fall_s`, was 60 s). Learned margins relax
+  2.5 points per 15 clean minutes (`clean_s`, was 30).
+
+Simulated with the controller code (`Policy`) and the real logs:
+
+| | Before | After |
+|---|---|---|
+| Game ends: middle floor below 50 % | 184 s | 52 s |
+| Game ends: all floors 0 | 364 s | 102 s |
+| Max preset back to Auto | 440 s | 80 s |
+| Crackle burst to boost | 2 s | first sample |
+| Game starts: floors reach 80/80/80 | 14 s | 14 s |
+| 20 s loading screen | no dip | no dip |
+| Biggest single floor change (2.6 h of logs) | 70 points | 30 points |
+| Floor changes per hour (same logs) | 10 | 27 |
+
+The extra changes are the smaller up-steps. That is still one change every two minutes, each
+gentle. The fans are speed-controlled brushless fans, and the EC limits their acceleration itself.
+Varying speed this slowly does not wear them; constant full speed and start/stop cycling would.
+
+An existing `/etc/rog-fand/config.json` was written as a full copy of the old example. Timing
+values equal to the old defaults (`fall_s` 60, `hold_s` 60, `down_step_s` 20, `clean_s` 1800) are
+therefore treated as unset and pick up the new defaults. Any other value you set is kept.
 
 **Profiles.** The service protects the platform profiles listed in `profiles` in
 `/etc/rog-fand/config.json`. By default that is all three: Performance, Balanced and Quiet. It used to
@@ -387,7 +423,7 @@ the red logo (`asus_notif_red`), as does the window when the tray icon is off:
 | Colour | Meaning |
 |---|---|
 | Green | Automatic control, no drops |
-| Yellow | Fans boosted after USB drops, or ramping back down (about 4 minutes) |
+| Yellow | Fans boosted after USB drops, or ramping back down (up to about 2.5 minutes) |
 | Orange | Sensor fallback: a sensor is missing and the fans are held at safe floors |
 | Red | USB audio dropping packets now (start-up skips excluded), or the service stopped, stale or unreadable |
 | Blue | Off, a manual preset, calibration in control, or a profile the service does not protect |
