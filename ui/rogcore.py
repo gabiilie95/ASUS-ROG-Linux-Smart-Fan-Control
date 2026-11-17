@@ -56,6 +56,8 @@ if (Path(ROOT) / "rog_fand.py").is_file():  # Installed layout beside the root-o
     FAND_PROGRAM = Path(ROOT) / "rog_fand.py"
     config_home = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
     PRESET_FILE = str(config_home / "rog-settings-panel" / "custom-presets.json")
+UPDATER = FAND_PROGRAM.parent / "rog_update.py"                 # this copy's update helper
+UPDATER_INSTALLED = Path("/usr/local/lib/rog-fand/rog_update.py")  # the root-owned copy pkexec runs
 MAX_PRESETS = 20
 NAME_RE = re.compile(r"[A-Za-z0-9 _-]{1,32}")
 
@@ -526,6 +528,28 @@ def request_fan_mode(mode):
             tmp.unlink(missing_ok=True)
     global last_mode_request
     last_mode_request = mode, time.monotonic()
+
+
+def load_updater():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("rog_update", UPDATER)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def updater_installed():
+    """The installed updater, if root owns it and nobody else can write it (pkexec runs it as root)."""
+    try:
+        st = os.stat(UPDATER_INSTALLED, follow_symlinks=False)
+    except OSError:
+        return False
+    import stat
+    return stat.S_ISREG(st.st_mode) and st.st_uid == 0 and not st.st_mode & 0o022
+
+
+def update_command(tag):
+    return ["pkexec", "/usr/bin/python3", "-IB", str(UPDATER_INSTALLED), "install", tag]
 
 
 def manual_fan_problem(holding_lease=False):

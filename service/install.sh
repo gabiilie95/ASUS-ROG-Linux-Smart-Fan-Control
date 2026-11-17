@@ -52,7 +52,7 @@ case "${1:-}" in
                 echo "note: $desk_home/.local/share/applications/rog-panel-qt.desktop hides the installed" \
                      "launcher in the menu; remove it to use the installed panel." >&2
             fi
-            for file in rog_fand.py rog_sensors.py config.example.json; do
+            for file in rog_fand.py rog_sensors.py rog_update.py config.example.json; do
                 copy_atomic "$src/$file" "$app/$file"
             done
             if [[ ! -e $etc/config.json ]]; then
@@ -78,6 +78,8 @@ PY
             copy_atomic "$src/rog-fand.service" "$unit"
             systemctl daemon-reload
             systemctl enable --now rog-fand.service
+            # Last, so an interrupted install is offered again by the updater.
+            copy_atomic "$src/../VERSION" "$app/VERSION"
         else
             if [[ -f $unit ]]; then
                 systemctl stop rog-fand.service
@@ -91,7 +93,9 @@ PY
             fi
             if [[ -f $unit ]]; then systemctl disable rog-fand.service; fi
             for file in "${panel_files[@]}"; do rm -f -- "$app/$file"; done
-            rm -f -- "$launcher" "$unit" "$app/rog_fand.py" "$app/rog_sensors.py" "$app/config.example.json"
+            rm -f -- "$launcher" "$unit" "$app/rog_fand.py" "$app/rog_sensors.py" "$app/rog_update.py" \
+                  "$app/config.example.json" "$app/VERSION"
+            rm -rf -- "$state/update"
             rm -f -- "$etc/config.json" "$etc/model.json" "$state/state.json"
             rm -f -- /var/log/rog-fand/*.csv /run/rog-fand/mode /run/rog-fand/status.json
             rm -f -- /run/rog-fand/control/mode

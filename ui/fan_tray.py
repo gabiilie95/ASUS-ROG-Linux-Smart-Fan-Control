@@ -10,9 +10,10 @@ from pathlib import Path
 import re
 import sys
 import tempfile
+import threading
 import time
 
-from PySide6.QtCore import QObject, QSettings, QTimer
+from PySide6.QtCore import QObject, QProcess, QSettings, QTimer, Signal
 from PySide6.QtGui import QActionGroup, QIcon
 from PySide6.QtWidgets import QMenu, QSystemTrayIcon
 
@@ -29,6 +30,8 @@ BAD_STATES = {
     "Stale": ("Fan service not updating", "The last fan floors stay applied. Check the rog-fand journal."),
     "Unreadable": ("Fan service status unreadable", "Check the rog-fand journal."),
 }
+UPDATE_FIRST_MS = 60_000              # first check a minute after start, then every 12 hours
+UPDATE_EVERY_MS = 12 * 3600_000
 PANEL = Path(core.UI) / "rog-panel-qt.py"
 AUTOSTART_MARK = "X-ROG-Panel-Autostart=true"
 
@@ -202,8 +205,22 @@ def set_autostart(enabled):
             tmp.unlink(missing_ok=True)
 
 
+def check_updates():
+    """Ask GitHub for the newest release (runs as the desktop user, in a worker thread)."""
+    try:
+        mod = core.load_updater()
+        release = mod.latest()
+        installed = mod.installed_version()
+        tag = release["tag_name"] if release else None
+        return dict(installed=installed, tag=tag, newer=bool(tag and mod.is_newer(tag, installed)))
+    except Exception as e:      # network, TLS, JSON or import problems all mean "try again later"
+        return dict(error=str(e) or type(e).__name__)
+
+
 # ---- Qt ----------------------------------------------------------------------------------------
 class FanTray(QObject):
+    updateChecked = Signal(object)
+
     def __init__(self, win):
         super().__init__(win)
         self.win = win
@@ -211,8 +228,11 @@ class FanTray(QObject):
         self.settings = QSettings("rog-fand", "rog-panel-qt")
         self.icons = {}
         self.colour = None
-        self.state, self.sample = "", None
+        self.state, self.sample, self.summary = "", None, ""
         self.hidden_told = False
+        self.update_tag = None
+        self.update_proc = None
+        self.checking = self.manual_check = False
         self.tray = QSystemTrayIcon(self)
         self.tray.setIcon(self.icon("white"))
         self.tray.setToolTip("ROG Settings Panel")
@@ -235,8 +255,15 @@ class FanTray(QObject):
         self.monitor_act = menu.addAction("Start stall monitor")
         self.monitor_act.triggered.connect(self.toggle_monitor)
         menu.addSeparator()
+        self.install_act = menu.addAction("Install update")
+        self.install_act.triggered.connect(self.install_update)
+        self.install_act.setVisible(False)
+        self.check_act = menu.addAction("Check for updates now")
+        self.check_act.triggered.connect(lambda: self.start_update_check(manual=True))
+        menu.addSeparator()
         self.keep_act = self.option("Keep running in the tray when closed", "close_to_tray")
         self.notify_act = self.option("Show notifications", "notifications")
+        self.auto_check_act = self.option("Check for updates every 12 hours", "check_updates")
         self.login_act = menu.addAction("Start in the tray at login")
         self.login_act.setCheckable(True)
         self.login_act.setChecked(autostart_enabled())
@@ -250,6 +277,12 @@ class FanTray(QObject):
         self.timer.setInterval(POLL_MS)
         self.timer.timeout.connect(self.poll)
         self.timer.start()
+        self.updateChecked.connect(self.update_checked)
+        self.update_timer = QTimer(self)
+        self.update_timer.setInterval(UPDATE_EVERY_MS)
+        self.update_timer.timeout.connect(self.start_update_check)
+        self.update_timer.start()
+        QTimer.singleShot(UPDATE_FIRST_MS, self.start_update_check)
         self.poll()
         self.tray.show()
 
@@ -277,11 +310,11 @@ class FanTray(QObject):
         wall, mono = time.time(), time.monotonic()
         due = self.model.observe(state, s, wall, mono, core.last_mode_request)
         self.state, self.sample = state, s
-        colour, summary = classify(state, s, wall, self.model.last_boost)
+        colour, self.summary = classify(state, s, wall, self.model.last_boost)
         if colour != self.colour:
             self.colour = colour
             self.tray.setIcon(self.icon(colour))
-        self.tray.setToolTip(self.tooltip(summary, s))
+        self.tray.setToolTip(self.tooltip(self.summary, s))
         for _kind, title, text in due:
             self.notify(title, text)
         if self.menu.isVisible():
@@ -303,6 +336,8 @@ class FanTray(QObject):
             rate = self.win.mon_samples[-1][0] if self.win.mon_samples else None
             lines.append("Stall monitor running" + ("" if rate is None else f": {rate:.2f} stalls/s")
                          + " (internal speakers in use)")
+        if self.update_tag:
+            lines.append(f"Update {self.update_tag} available")
         return "\n".join(lines)
 
     def notify(self, title, text):
@@ -317,6 +352,14 @@ class FanTray(QObject):
             act.setChecked(key == mode)
         self.mode_menu.setEnabled(self.can_control())
         self.monitor_act.setText("Stop stall monitor" if self.win.monitor_running() else "Start stall monitor")
+        self.install_act.setVisible(bool(self.update_tag))
+        if self.update_tag:
+            ready = core.updater_installed() and self.update_proc is None and not self.calibrating()
+            self.install_act.setEnabled(ready)
+            self.install_act.setText(f"Installing {self.update_tag}…" if self.update_proc else
+                                     f"Install update {self.update_tag}…" if core.updater_installed() else
+                                     f"Update {self.update_tag} available (install the service first)")
+        self.check_act.setEnabled(not self.checking and self.update_proc is None)
 
     def on_activated(self, reason):
         if reason == QSystemTrayIcon.Trigger:
@@ -368,6 +411,80 @@ class FanTray(QObject):
             self.notify("Still running in the tray", "Open or quit the panel from its tray icon.")
         self.hidden_told = True
 
+    # ---- updates ----
+    def calibrating(self):
+        return self.win.auto_tab.calibrating or bool(self.win.cal_tab.process)
+
+    def start_update_check(self, manual=False):
+        if self.checking or not (manual or self.auto_check_act.isChecked()):
+            return
+        self.checking, self.manual_check = True, manual
+        threading.Thread(target=lambda: self.updateChecked.emit(check_updates()), daemon=True).start()
+        self.update_menu()
+
+    def update_checked(self, result):
+        self.checking = False
+        manual, self.manual_check = self.manual_check, False
+        if result.get("error"):
+            if manual:
+                self.notify("Update check failed", result["error"])
+        elif result["newer"]:
+            self.update_tag = result["tag"]
+            if manual or self.settings.value("update_notified", "") != self.update_tag:
+                self.settings.setValue("update_notified", self.update_tag)
+                self.notify("Update available", f"{self.update_tag} is published (installed: "
+                            f"{result['installed']}). Install it from the tray menu.")
+        else:
+            self.update_tag = None
+            if manual:
+                self.notify("Up to date", f"Installed {result['installed'] or 'version unknown'}; newest "
+                            f"release {result['tag'] or 'none'}.")
+        self.update_menu()
+        self.tray.setToolTip(self.tooltip(self.summary, self.sample))
+
+    def install_update(self):
+        tag = self.update_tag
+        if not tag or self.update_proc is not None or not core.updater_installed():
+            return
+        if self.calibrating():
+            self.notify("Update postponed", "Finish or cancel the calibration first.")
+            return
+        p = self.update_proc = QProcess(self)
+        p.setProcessChannelMode(QProcess.MergedChannels)
+        p.finished.connect(lambda code, _status: self.update_done(tag, code))
+        p.errorOccurred.connect(lambda error: self.update_done(tag, None) if error == QProcess.FailedToStart else None)
+        command = core.update_command(tag)
+        p.start(command[0], command[1:])
+        self.notify("Installing " + tag, "A password dialog will appear.")
+        self.update_menu()
+
+    def update_done(self, tag, code):
+        p, self.update_proc = self.update_proc, None
+        if p is None:
+            return
+        output = bytes(p.readAll()).decode(errors="replace").strip()
+        p.deleteLater()
+        if code == 0:
+            self.update_tag = None
+            self.notify("Updated to " + tag, "The panel restarts to load the new version.")
+            QTimer.singleShot(1500, self.restart_panel)
+        elif code in (126, 127):
+            self.notify("Update not installed", "The password dialog was cancelled.")
+        else:
+            last = output.splitlines()[-1] if output else "pkexec could not start"
+            self.notify("Update failed", last)
+        self.update_menu()
+
+    def restart_panel(self):
+        """Start this panel again once this process has gone, then quit."""
+        args = [str(PANEL)] + (["--dry-run"] if self.win.dry_run else []) + ([] if self.win.isVisible() else ["--tray"])
+        started, _pid = QProcess.startDetached("/bin/sh", ["-c", 'sleep 2; exec "$0" -IB "$@"', sys.executable, *args])
+        if started:
+            self.win.quit_app()
+        else:
+            self.notify("Restart the panel", "The update is installed; reopen the panel to load it.")
+
     def remove(self):
         self.timer.stop()
+        self.update_timer.stop()
         self.tray.hide()

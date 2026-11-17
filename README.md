@@ -360,6 +360,35 @@ state:
   monitor is running, hiding the window says so, because the monitor keeps the internal speakers
   in use. `--tray` starts hidden (used at login); `--no-tray` restores the old behaviour.
 
+**Updates** (`service/rog_update.py`). The tray checks GitHub for a newer published release a
+minute after it starts and then every 12 hours. The check runs as you, with no root, sends a
+generic client name, and can be turned off in the tray menu. When a newer release exists, it
+notifies once per release and adds **Install update vX.Y.Z…** to the tray menu.
+
+Clicking that runs the installed, root-owned copy of the updater through `pkexec`, so a
+password dialog appears. Nothing installs without it. The updater:
+
+- accepts only a tag; the repository is fixed in the script;
+- checks that the tag is a published `vX.Y.Z` release (pre-releases count) and newer than the
+  installed `/usr/local/lib/rog-fand/VERSION`, so it never downgrades;
+- downloads the release archive and unpacks it with Python's `data` filter, which blocks absolute
+  paths, links out of the tree, devices and set-id bits;
+- requires the release's `VERSION` file to match the tag, and every Python file to compile;
+- runs that release's `service/install.sh install`, which restarts `rog-fand`.
+
+The panel then restarts itself on the new version. Updates are not offered during a calibration,
+or when the installed version is unknown (no `VERSION` file, so installs older than v0.2.0).
+
+    python3 service/rog_update.py latest                  # newest release vs installed, as JSON
+    python3 service/rog_update.py install v0.2.0 --dry-run  # download and verify only, no root
+
+Releasing:
+
+1. Set `VERSION` to the release number (`0.2.0`, without `-dev`) and merge to main.
+2. Publish a GitHub release tagged `v0.2.0` on that commit.
+3. Set `VERSION` on main to the next development version (`0.3.0-dev`), so checkouts installed
+   from main stay older than the next release.
+
 Native version (PySide6, launched as the desktop user):
 
     python3 ui/rog-panel-qt.py           # installed app menu entry: ROG Settings Panel

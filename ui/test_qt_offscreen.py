@@ -255,6 +255,61 @@ def tray_model_tests():
     path.unlink()
 
 
+def update_tests(tray, shown):
+    class Fake:
+        INSTALLED = None
+        def __init__(self, tag, installed, fail=None):
+            self.tag, self.installed, self.fail = tag, installed, fail
+        def latest(self):
+            if self.fail:
+                raise OSError(self.fail)
+            return dict(tag_name=self.tag)
+        def installed_version(self):
+            return self.installed
+        is_newer = staticmethod(core.load_updater().is_newer)
+    with patch.object(core, "load_updater", return_value=Fake("v0.2.0", "0.2.0-dev")):
+        check(fan_tray.check_updates() == dict(installed="0.2.0-dev", tag="v0.2.0", newer=True), "update: newer release found")
+    with patch.object(core, "load_updater", return_value=Fake("v0.1.0", "0.2.0-dev")):
+        check(fan_tray.check_updates()["newer"] is False, "update: older release not offered")
+    with patch.object(core, "load_updater", return_value=Fake(None, None, fail="offline")):
+        check(fan_tray.check_updates() == dict(error="offline"), "update: network errors reported, not raised")
+
+    found = dict(installed="0.2.0-dev", tag="v0.2.0", newer=True)
+    before = len(shown)
+    with patch.object(fan_tray, "check_updates", return_value=found):
+        tray.start_update_check()
+        check(wait_for(lambda: tray.update_tag == "v0.2.0" and not tray.checking, 5000), "update: background check")
+        tray.start_update_check()
+        check(wait_for(lambda: not tray.checking, 5000) and len(shown) == before + 1
+              and shown[-1][0] == "Update available", "update: notified once per release")
+    tray.update_menu()
+    check(tray.install_act.isVisible() and "v0.2.0" in tray.install_act.text()
+          and "Update v0.2.0 available" in tray.tray.toolTip(), "update: menu entry and tooltip")
+    check(core.update_command("v0.2.0") == ["pkexec", "/usr/bin/python3", "-IB",
+                                            "/usr/local/lib/rog-fand/rog_update.py", "install", "v0.2.0"],
+          "update: pkexec runs only the root-owned installed updater with the tag")
+    restarts = []
+    tray.restart_panel = lambda: restarts.append(1)
+    for code, output, title in ((126, "", "Update not installed"), (1, "error: v0.2.0 VERSION file says '0.1.0'",
+                                                                    "Update failed"), (0, "installed v0.2.0", "Updated to v0.2.0")):
+        script = f"echo \"{output}\"; exit {code}"
+        with patch.object(core, "updater_installed", return_value=True), \
+             patch.object(core, "update_command", return_value=["/bin/sh", "-c", script]):
+            tray.update_tag = "v0.2.0"
+            tray.update_menu()
+            check(tray.install_act.isEnabled(), "update: install enabled when the root-owned updater exists")
+            tray.install_act.trigger()
+            check(wait_for(lambda: tray.update_proc is None, 5000) and shown[-1][0] == title
+                  and (code != 1 or "VERSION file says" in shown[-1][1]), "update: exit %d -> %s" % (code, title))
+    check(wait_for(lambda: restarts, 4000) and tray.update_tag is None, "update: panel restarts after installing")
+    with patch.object(core, "updater_installed", return_value=False):
+        tray.update_tag = "v0.2.0"
+        tray.update_menu()
+        check(not tray.install_act.isEnabled() and "install the service first" in tray.install_act.text(),
+              "update: no install without the root-owned updater")
+    tray.update_tag = None
+
+
 def tray_tests(w):
     tray_model_tests()
     hicolor = Path("/usr/share/icons/hicolor/512x512/apps/asus_notif_green.png").exists()
@@ -296,6 +351,7 @@ def tray_tests(w):
     tray.toggle_panel()
     pump(100)
     check(w.isVisible() and w.timer.isActive(), "tray: click reopens the window")
+    update_tests(tray, shown)
     quits = []
     with patch.object(QApplication, "quit", side_effect=lambda: quits.append(1)):
         tray.menu.actions()[-1].trigger()
