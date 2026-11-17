@@ -107,6 +107,19 @@ def service_tabs(w, q):
     check(len(auto.chart.samples) == 101 and auto.bars["mid"].value()==80, "timestamped graph deduplicates samples")
     check("1.5 drops/s" in auto.usb.text() and "+5 pp" in auto.margin.text(), "USB rates and learned margins")
     check("boost" in auto.events.toPlainText() and not auto.apply.isEnabled(), "dry panel reads live events without control")
+    with patch.object(core, "read_fans", return_value=dict(cpu_rpm=3150, gpu_rpm=None, mid_rpm=7400)):
+        auto.display("Running", s)
+    check(auto.speeds["cpu"].value() == 3150 and auto.speeds["cpu"].format() == "3,150 rpm · 50%"
+          and auto.speeds["gpu"].format() == "5,500 rpm · 80%" and auto.speeds["mid"].format() == "7,400 rpm · 100%",
+          "fan speeds: live sensors first, service sample as fallback, scaled to full speed")
+    with patch.object(core, "read_fans", return_value=dict(cpu_rpm=None, gpu_rpm=None, mid_rpm=None)):
+        auto.display("Stopped", None)
+    check(auto.speeds["cpu"].format() == "—" and auto.speeds["cpu"].value() == 0, "fan speeds: unknown shows a dash")
+    with patch.object(core, "read_fans", return_value=dict(cpu_rpm=4100, gpu_rpm=2500, mid_rpm=9000)):
+        auto.display("Stopped", None)
+    check(auto.speeds["mid"].value() == 7400 and auto.speeds["mid"].format() == "9,000 rpm · 122%",
+          "fan speeds: shown without the service, bar capped at full speed")
+    auto.refresh()
     auto.change_mode()
     check(mode.read_text() == "auto\n", "panel dry run leaves mode file alone")
     auto.dry_run = False  # Everything from this point targets the fixture directory.

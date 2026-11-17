@@ -15,6 +15,8 @@ import rogcore as core
 
 FAN_LABELS = ("CPU", "GPU", "Middle")
 COLORS = ("#4288cf", "#dc8e32", "#329b87")
+# Full speed of each fan with every curve point at 255, measured on the G814JZ on 2026-11-16.
+TOP_RPM = {"cpu": 6300, "gpu": 6900, "mid": 7400}
 SERIES = {"Fan floors": ("% floor", FAN_LABELS), "Fan speeds": ("RPM", FAN_LABELS),
           "Heat input": ("W", ("Smoothed total", "Smoothed GPU")),
           "USB drops": ("packets/s", ("All devices",))}
@@ -145,19 +147,31 @@ class AutoTab(QWidget):
         grid = QGridLayout()
         fans = QGroupBox("Fan response")
         fg = QGridLayout(fans)
-        for i, title in enumerate(("Fan", "Requested floor", "Measured speed")):
+        for i, title in enumerate(("Fan", "Speed now", "Requested floor")):
             fg.addWidget(label(title), 0, i)
-        self.bars, self.rpms = {}, {}
+        self.speeds, self.bars = {}, {}
         for i, (fan, title) in enumerate(zip(core.FANS, FAN_LABELS), 1):
             fg.addWidget(label(title), i, 0)
+            colour = QColor(COLORS[i-1])
+            speed = QProgressBar()
+            speed.setRange(0, TOP_RPM[fan])
+            speed.setStyleSheet("QProgressBar::chunk {background:" + colour.name() + ";}")
+            speed.setAccessibleName(title + " fan speed")
+            self.speeds[fan] = speed
             bar = QProgressBar()
             bar.setRange(0, 100)
-            bar.setStyleSheet("QProgressBar::chunk {background:" + COLORS[i-1] + ";}")
+            bar.setStyleSheet("QProgressBar::chunk {background: rgba(%d, %d, %d, 110);}" % colour.getRgb()[:3])
             bar.setAccessibleName(title + " fan floor")
             self.bars[fan] = bar
-            self.rpms[fan] = label()
-            fg.addWidget(bar, i, 1)
-            fg.addWidget(self.rpms[fan], i, 2)
+            fg.addWidget(speed, i, 1)
+            fg.addWidget(bar, i, 2)
+        fg.setColumnStretch(1, 3)
+        fg.setColumnStretch(2, 2)
+        note = label("Speed is the fan sensor now, against that fan's full speed (%s rpm). The floor is the "
+                     "minimum the service requests; the laptop's curve may run the fan faster."
+                     % " / ".join(f"{TOP_RPM[f]:,}" for f in core.FANS))
+        note.setEnabled(False)
+        fg.addWidget(note, len(core.FANS) + 1, 0, 1, 3)
         grid.addWidget(fans, 0, 0)
         thermal = QGroupBox("Heat input")
         form = QFormLayout(thermal)
@@ -302,11 +316,20 @@ class AutoTab(QWidget):
         self.sample_time = s["t"] if s else None
         self.feedback.setVisible(bool(self.feedback.text()) or self.pending is not None)
         self.detail.setText(detail)
+        try:
+            live = core.read_fans()      # the sensors themselves, so speeds show without the service too
+        except OSError:
+            live = {}
         for fan in core.FANS:
             floor = s["floors"][fan] if s else None
             self.bars[fan].setValue(round(floor or 0))
             self.bars[fan].setFormat("—" if floor is None else f"{floor:g}%")
-            self.rpms[fan].setText(metric(s["sensors"].get(fan + "_rpm") if s else None, "RPM"))
+            rpm = live.get(fan + "_rpm")
+            if rpm is None and s:
+                rpm = s["sensors"].get(fan + "_rpm")
+            speed = self.speeds[fan]
+            speed.setValue(min(rpm or 0, TOP_RPM[fan]))
+            speed.setFormat("—" if rpm is None else f"{rpm:,.0f} rpm · {100 * rpm / TOP_RPM[fan]:.0f}%")
         for k, lab in self.heat.items():
             value = (s["heat_w"] if k == "heat_w" else s["sensors"].get(k)) if s else None
             lab.setText(metric(value, "°C" if k == "board_c" else "W"))
