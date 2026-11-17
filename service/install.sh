@@ -1,11 +1,15 @@
 #!/bin/bash
-# Install from a trusted checkout. The invoking desktop user owns only the mode file.
+# Install from a trusted checkout. The invoking desktop user owns the mode control directory.
 set -euo pipefail
 src=$(cd -- "$(dirname -- "$0")" && pwd -P)
 app=/usr/local/lib/rog-fand
 etc=/etc/rog-fand
 state=/var/lib/rog-fand
 unit=/etc/systemd/system/rog-fand.service
+launcher=/usr/local/share/applications/rog-panel-qt.desktop
+panel_files=(ui/{rog-panel-qt,rogcore,fan_auto,fan_calibration}.py
+             tools/{fan-calibrate,stall-counter}.py tools/fans-{balanced,max,mid-max,original,ramped}.sh
+             tools/jellyfin-software-ui.sh root-tests/{setup-cool-performance,usb-drop-count}.sh)
 tmp=
 cleanup() {
     if [[ -n $tmp ]]; then rm -f -- "$tmp"; fi
@@ -32,6 +36,11 @@ case "${1:-}" in
             install -d -o root -g root -m 0755 -- "$app" "$etc"
             install -d -o root -g root -m 0700 -- "$state"
             if [[ -f $unit ]]; then systemctl stop rog-fand.service; fi
+            install -d -o root -g root -m 0755 -- "$app"/{ui,tools,root-tests} /usr/local/share/applications
+            for file in "${panel_files[@]}"; do
+                copy_atomic "$src/../$file" "$app/$file"
+            done
+            copy_atomic "$src/../ui/rog-panel-qt.desktop" "$launcher"
             for file in rog_fand.py rog_sensors.py config.example.json; do
                 copy_atomic "$src/$file" "$app/$file"
             done
@@ -64,10 +73,12 @@ PY
                 }
             fi
             if [[ -f $unit ]]; then systemctl disable rog-fand.service; fi
-            rm -f -- "$unit" "$app/rog_fand.py" "$app/rog_sensors.py" "$app/config.example.json"
+            for file in "${panel_files[@]}"; do rm -f -- "$app/$file"; done
+            rm -f -- "$launcher" "$unit" "$app/rog_fand.py" "$app/rog_sensors.py" "$app/config.example.json"
             rm -f -- "$etc/config.json" "$etc/model.json" "$state/state.json"
             rm -f -- /var/log/rog-fand/*.csv /run/rog-fand/mode /run/rog-fand/status.json
-            for dir in "$app" "$etc" "$state" /var/log/rog-fand /run/rog-fand; do
+            rm -f -- /run/rog-fand/control/mode
+            for dir in "$app"/{ui,tools,root-tests} "$app" "$etc" "$state" /var/log/rog-fand /run/rog-fand/control /run/rog-fand; do
                 if [[ -d $dir ]]; then rmdir -- "$dir"; fi
             done
             systemctl daemon-reload

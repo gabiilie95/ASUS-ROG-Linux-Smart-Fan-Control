@@ -277,8 +277,10 @@ python3 -B -m unittest discover -s service
 Dry run prints read-only live status to stdout. Replay uses the recorded GPU watts and timestamps.
 The historical logs contain internal audio stalls. USB feedback uses live usbmon packet counts.
 
-For live control, run `sudo service/install.sh install` from a trusted checkout. The installer
-sets the invoking desktop user as the owner of `/run/rog-fand/mode`. Write one line in place:
+For live control, run `sudo service/install.sh install` from a trusted checkout. This installs the
+root service and the **ROG Settings Panel** application launcher. Open the panel as your desktop
+user and select **Auto**. The installer gives that user the mode control directory.
+Scripts may still write one line to `/run/rog-fand/mode`:
 `auto`, `off` (exact base), `preset:light` (35/40/70), `preset:heavy` (80/80/80), or
 `preset:max` (100/100/100). Read `/run/rog-fand/status.json` or `journalctl -u rog-fand`.
 The root-owned `/etc/rog-fand/config.json` holds the base, table and timing. An optional
@@ -307,9 +309,21 @@ and switches the settings that already exist as scripts.
 
 The server listens on 127.0.0.1 only, POSTs need a per-run token, and only the whitelisted commands above can run.
 
-Native version (a normal Qt window, no web server, no browser; needs PySide6):
+The native **Auto** tab shows the service mode, requested fan floors, measured RPM, heat input,
+USB drops per device and learned margins. Select a measurement to chart its last five minutes.
+**Apply mode** waits for acknowledgement from the service. **Preview live sensors** runs the
+controller read-only in your desktop session and works before installation.
 
-    python3 ui/rog-panel-qt.py           # also in the app menu as "ROG Settings Panel" (~/.local/share/applications/rog-panel-qt.desktop)
+**Calibrate** offers Observe, Light, Heavy and Custom sessions under your current workload.
+Observe measures stalls using the internal sound device. For a stepped run, select Performance
+and set Auto to **Off · base curve** first. The calibration tool holds control through restoration
+of the saved Performance curves and their enable flags. You can cancel a run, inspect per-step
+mean and peak stalls, and export the complete or partial sample CSV. Closing the panel during a
+run waits for cleanup. In panel dry-run mode, the start button previews the command.
+
+Native version (PySide6, launched as the desktop user):
+
+    python3 ui/rog-panel-qt.py           # installed app menu entry: ROG Settings Panel
     python3 ui/rog-panel-qt.py --dry-run # shows a DRY RUN banner; actions only show the command they would run
 
 It does the same as the web panel (readings every 2 s, presets, Jellyfin, CPU cap, stall test, fan-curve editor with
