@@ -467,6 +467,10 @@ def validate_fand_sample(s):
     sensors = s["sensors"]
     if sensors.get("profile") is not None and not isinstance(sensors["profile"], str):
         raise ValueError("Invalid platform profile")
+    if "controlled" in s and not isinstance(s["controlled"], bool):
+        raise ValueError("Invalid protection state")
+    if "profiles" in s and not (isinstance(s["profiles"], list) and all(isinstance(x, str) for x in s["profiles"])):
+        raise ValueError("Invalid protected profiles")
     for key in ("cpu_w", "gpu_w", "board_c"):
         metric(sensors.get(key))
     for fan in FANS:
@@ -550,6 +554,28 @@ def updater_installed():
 
 def update_command(tag):
     return ["pkexec", "/usr/bin/python3", "-IB", str(UPDATER_INSTALLED), "install", tag]
+
+
+def performance_profile_command():
+    """Switch the platform profile back to Performance. asusd does it over D-Bus, so no root is needed."""
+    return ["asusctl", "profile", "set", "Performance"]
+
+
+def profile_name(profile):
+    """A platform profile as people read it: quiet -> Quiet, low-power -> Low power, None -> unknown."""
+    return profile.replace("-", " ").capitalize() if profile else "unknown"
+
+
+def fans_protected(s):
+    """Whether rog-fand protects the active platform profile. A service without the controlled
+    field (0.3.0 and older) protects Performance only."""
+    controlled = s.get("controlled")
+    return controlled if isinstance(controlled, bool) else s["sensors"].get("profile") == "performance"
+
+
+def performance_protected(s):
+    """Whether switching to Performance would bring the protection back (worth suggesting)."""
+    return "performance" in s.get("profiles", ["performance"])
 
 
 def manual_fan_problem(holding_lease=False):

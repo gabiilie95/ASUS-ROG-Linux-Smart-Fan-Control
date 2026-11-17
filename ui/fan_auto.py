@@ -287,6 +287,10 @@ class AutoTab(QWidget):
             profile = s["sensors"].get("profile") or "unknown"
             if state == "Running":
                 detail = f"{profile.capitalize()} profile  ·  {core.FAND_MODES[s['mode']]} mode"
+                if not core.fans_protected(s):
+                    detail += "  ·  Paused: rog-fand does not protect this profile, so audio may crackle under load."
+                    if core.performance_protected(s):
+                        detail += " Switch to Performance from the tray menu or with: asusctl profile set Performance"
                 if s.get("manual_control"):
                     detail += "  ·  Calibration owns the fans"
                 elif not s.get("applied"):

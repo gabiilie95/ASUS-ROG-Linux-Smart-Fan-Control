@@ -8,7 +8,7 @@ from datetime import datetime
 import os
 import time
 
-from PySide6.QtCore import QObject, QTimer
+from PySide6.QtCore import QObject, QProcess, QTimer
 from PySide6.QtGui import QActionGroup, QIcon
 from PySide6.QtWidgets import QMenu, QSystemTrayIcon
 
@@ -64,9 +64,8 @@ def classify(state, s, wall, last_boost):
         return "red", f"USB audio dropping {drops:g} packets/s"
     if s.get("manual_control"):
         return "blue", "Calibration controls the fans"
-    profile = s["sensors"].get("profile")
-    if profile != "performance":
-        return "blue", f"Idle in the {profile or 'unknown'} profile"
+    if not core.fans_protected(s):
+        return "blue", f"Paused: {core.profile_name(s['sensors'].get('profile'))} profile"
     if s["mode"] == "off":
         return "blue", "Off, base curve only"
     if s.get("degraded"):
@@ -88,6 +87,7 @@ class TrayModel:
         self.down_sent = False
         self.last_boost = None
         self.sent = {}
+        self.told_profile = None    # the last profile notice shown: "profile" (paused) or "profile-back"
 
     def observe(self, state, s, wall, mono, requested=None):
         """Feed one poll; returns [(kind, title, text)] after rate limiting."""
@@ -129,6 +129,21 @@ class TrayModel:
                 own = requested is not None and requested[0] == s["mode"] and mono - requested[1] < OWN_REQUEST_S
                 if s["mode"] != last["mode"] and not own:
                     due.append(("mode", "Fan mode changed", f"Now {mode}."))
+            now = s["sensors"].get("profile")
+            if last is not None and now != last["sensors"].get("profile"):
+                # rog-fand stands down in a profile it does not protect. A change between two protected
+                # profiles needs no notice: the protection stays on.
+                was_on, is_on = core.fans_protected(last), core.fans_protected(s)
+                if was_on and not is_on:
+                    due.append(("profile", "Fan protection paused",
+                                f"The power profile is now {core.profile_name(now)}, which rog-fand does not "
+                                "protect, so audio may crackle under load."
+                                + (" Switch to Performance from the tray menu." if core.performance_protected(s)
+                                   else "")))
+                elif is_on and not was_on and self.told_profile == "profile":
+                    due.append(("profile-back", "Fan protection resumed",
+                                f"The power profile is now {core.profile_name(now)}, which rog-fand protects "
+                                f"({mode} mode)."))
             self.down_sent = False
             self.last_running = s
         else:
@@ -137,9 +152,14 @@ class TrayModel:
 
         shown = []
         for kind, title, text in due:
-            if mono - self.sent.get(kind, -NOTIFY_GAP_S) >= NOTIFY_GAP_S:
+            # A pause right after a "resumed" notice always shows: the last profile notice must not say all is
+            # well while the fans are unprotected. That still allows at most two pause notices per 5 minutes.
+            urgent = kind == "profile" and self.told_profile == "profile-back"
+            if urgent or mono - self.sent.get(kind, -NOTIFY_GAP_S) >= NOTIFY_GAP_S:
                 self.sent[kind] = mono
                 shown.append((kind, title, text))
+                if kind in ("profile", "profile-back"):
+                    self.told_profile = kind
         return shown
 
 
@@ -155,6 +175,7 @@ class FanTray(QObject):
         self.colour = None
         self.state, self.sample, self.summary = "", None, ""
         self.hidden_told = self.removed = False
+        self.profile_proc = None
         self.tray = QSystemTrayIcon(self)
         self.tray.setIcon(self.icon("white"))
         self.tray.setToolTip("ROG Settings Panel")
@@ -165,6 +186,9 @@ class FanTray(QObject):
         self.open_act = menu.addAction("Open ROG Settings Panel")
         self.open_act.triggered.connect(self.toggle_panel)
         menu.addSeparator()
+        self.profile_act = menu.addAction("Switch to Performance profile")
+        self.profile_act.triggered.connect(self.switch_profile)
+        self.profile_act.setVisible(False)
         self.mode_menu = menu.addMenu("Fan mode")
         group = QActionGroup(self.mode_menu)
         self.mode_acts = {}
@@ -217,6 +241,10 @@ class FanTray(QObject):
     def keep_running(self):
         return self.prefs.get("close_to_tray")
 
+    def other_profile(self):
+        """rog-fand runs and the platform profile is not Performance, protected or not."""
+        return self.state == "Running" and bool(self.sample) and self.sample["sensors"].get("profile") != "performance"
+
     def can_control(self):
         return (self.state == "Running" and not self.win.dry_run and not self.win.auto_tab.calibrating
                 and not (self.sample or {}).get("manual_control") and os.access(core.FAND_RUN / "control", os.W_OK))
@@ -268,6 +296,10 @@ class FanTray(QObject):
         for key, act in self.mode_acts.items():
             act.setChecked(key == mode)
         self.mode_menu.setEnabled(self.can_control())
+        other = self.other_profile()
+        self.profile_act.setVisible(other)
+        self.profile_act.setEnabled(other and self.profile_proc is None)
+        self.profile_act.setText("Switching to Performance…" if self.profile_proc else "Switch to Performance profile")
         self.monitor_act.setText("Stop stall monitor" if self.win.monitor_running() else "Start stall monitor")
         up = self.updater
         self.install_act.setVisible(bool(up.tag))
@@ -319,6 +351,33 @@ class FanTray(QObject):
                 core.request_fan_mode(key)
             except (ValueError, OSError) as e:
                 self.notify("Fan mode not changed", str(e))
+        self.update_menu()
+
+    def switch_profile(self):
+        """Set the Performance profile through asusd (no password), without blocking the tray."""
+        if self.profile_proc is not None:
+            return
+        command = core.performance_profile_command()
+        if self.win.dry_run:
+            self.notify("Profile not changed", "Dry run: " + " ".join(command) + " was not run.")
+            return
+        p = self.profile_proc = QProcess(self)
+        p.setProcessChannelMode(QProcess.MergedChannels)
+        p.finished.connect(lambda code, status: self.profile_done(code if status == QProcess.NormalExit else None))
+        p.errorOccurred.connect(lambda error: self.profile_done(None) if error == QProcess.FailedToStart else None)
+        p.start(command[0], command[1:])
+        self.update_menu()
+
+    def profile_done(self, code):
+        p, self.profile_proc = self.profile_proc, None
+        if p is None:
+            return
+        output = bytes(p.readAll()).decode(errors="replace").strip()
+        error = p.errorString()
+        p.deleteLater()
+        if code != 0:
+            self.notify("Profile not changed", output.splitlines()[-1] if output else
+                        f"asusctl exited with code {code}" if code is not None else "asusctl: " + error)
         self.update_menu()
 
     def toggle_monitor(self):
