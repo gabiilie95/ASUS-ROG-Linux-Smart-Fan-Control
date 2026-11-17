@@ -96,7 +96,7 @@ class PolicyTest(unittest.TestCase):
         self.assertEqual(p.step(2, 150, None, degraded=True)[0], (80, 80, 80))
         self.assertEqual(p.step(4, 150, None, mode="off")[0], fand.ZERO)
         self.assertEqual(p.step(6, 150, None, mode="preset:light")[0], (35, 40, 70))
-        self.assertEqual(p.step(8, 150, None, performance=False)[0], fand.ZERO)
+        self.assertEqual(p.step(8, 150, None, controlled=False)[0], fand.ZERO)
 
 
 class CurveTest(unittest.TestCase):
@@ -367,6 +367,158 @@ class LifecycleTest(unittest.TestCase):
         fand.atomic_write(model, '{"table":[]}')
         with self.assertRaises(ValueError):
             fand.config(installed=True)
+
+
+QUIET_OUTPUT = """
+Fan curves for Quiet
+
+[
+    (
+        fan: CPU,
+        pwm: (2, 2, 12, 12, 35, 35, 53, 76),
+        temp: (64, 64, 72, 72, 76, 76, 80, 85),
+        enabled: false,
+    ),
+    (
+        fan: GPU,
+        pwm: (2, 2, 28, 28, 38, 38, 73, 73),
+        temp: (64, 64, 72, 72, 76, 76, 80, 85),
+        enabled: false,
+    ),
+    (
+        fan: MID,
+        pwm: (2, 2, 25, 25, 58, 58, 71, 84),
+        temp: (64, 64, 72, 72, 76, 76, 80, 85),
+        enabled: false,
+    ),
+]
+"""
+
+
+class AllProfilesTest(unittest.TestCase):
+    """Balanced and Quiet: untouched at zero floors, raised with an exact receipt, handed back."""
+    setUp = LifecycleTest.setUp
+
+    def stored(self):
+        self.command.return_value = subprocess.CompletedProcess([], 0, stdout=QUIET_OUTPUT, stderr="")
+        return fand.read_stored("quiet")
+
+    def argv(self, i):
+        return self.command.call_args_list[i].args[0]
+
+    def test_read_stored_parses_asusctl_output(self):
+        stored = self.stored()
+        self.assertEqual(stored["curves"]["mid"][0], [64, 2])
+        self.assertEqual(stored["curves"]["cpu"][-1], [85, 76])
+        self.assertEqual(stored["enabled"], dict(cpu=False, gpu=False, mid=False))
+        self.assertEqual(self.argv(0), ["/usr/bin/asusctl", "fan-curve", "--mod-profile", "quiet"])
+        self.command.return_value = subprocess.CompletedProcess([], 0, stdout="no curves", stderr="")
+        with self.assertRaises(ValueError):
+            fand.read_stored("quiet")
+
+    def test_raise_and_hand_back_quiet(self):
+        stored = self.stored()
+        self.command.reset_mock()
+        self.profile.return_value = "quiet"
+        with self.assertRaisesRegex(ValueError, "own curves"):
+            self.actuator.apply(BASE, (35, 40, 70), "quiet")
+        self.assertTrue(self.actuator.apply(BASE, (35, 40, 70), "quiet", stored))
+        receipt = self.path / "restore-quiet.json"
+        self.assertEqual(fand.read_json(receipt), stored)
+        self.assertFalse(self.actuator.receipt.exists(), "Performance's receipt is separate")
+        self.assertEqual([self.argv(i)[3] for i in range(4)], ["quiet"] * 4)
+        self.assertEqual(self.argv(3)[-2:], ["--enable-fan-curves", "true"])
+        mid = dict(zip(fand.FANS, fand.build_curves(BASE, (35, 40, 70)).values()))["mid"]
+        self.assertEqual(self.argv(2)[-1], ",".join(f"{t}c:{p}" for t, p in mid))
+        # The stored curves were disabled: handing back only switches custom curves off again.
+        self.assertTrue(self.actuator.restore_profile("quiet"))
+        self.assertEqual(self.argv(4), ["/usr/bin/asusctl", "fan-curve", "--mod-profile", "quiet",
+                                        "--enable-fan-curves", "false"])
+        self.assertFalse(receipt.exists())
+
+    def test_enabled_stored_curves_are_rewritten_with_their_flags(self):
+        stored = self.stored()
+        stored["enabled"]["mid"] = True
+        self.command.reset_mock()
+        self.profile.return_value = "balanced"
+        self.actuator.apply(BASE, (80, 80, 80), "balanced", stored)
+        self.command.reset_mock()
+        self.assertTrue(self.actuator.restore_profile("balanced"))
+        calls = [self.argv(i)[4:] for i in range(self.command.call_count)]
+        self.assertEqual(calls[2], ["--fan", "mid", "--data", ",".join(f"{t}c:{p}" for t, p in stored["curves"]["mid"])])
+        self.assertEqual(calls[3:], [["--fan", "cpu", "--enable-fan-curve", "false"],
+                                     ["--fan", "gpu", "--enable-fan-curve", "false"],
+                                     ["--fan", "mid", "--enable-fan-curve", "true"]])
+
+    def test_receipt_waits_for_its_own_profile(self):
+        stored = self.stored()
+        self.profile.return_value = "quiet"
+        self.actuator.apply(BASE, (35, 40, 70), "quiet", stored)
+        self.command.reset_mock()
+        self.profile.return_value = "performance"
+        self.assertFalse(fand.Actuator().restore(), "Quiet can only be handed back while active")
+        self.assertEqual(self.command.call_count, 0)
+        self.assertEqual(fand.Actuator().pending(), ["quiet"])
+        self.profile.return_value = "quiet"
+        self.assertTrue(fand.Actuator().restore())
+        self.assertEqual(fand.Actuator().pending(), [])
+
+    def test_config_profiles(self):
+        self.assertEqual(CFG["profiles"], ["performance", "balanced", "quiet"])
+        for bad in (["turbo"], ["quiet", "quiet"], "quiet"):
+            with patch.object(fand, "read_json", side_effect=[dict(CFG, profiles=bad)]):
+                with self.assertRaisesRegex(ValueError, "profiles"):
+                    fand.config()
+
+    def run_loop(self, samples, cfg=CFG, drops=0):
+        records = []
+        original_write = fand.atomic_write
+        def capture(path, text, *args, **kwargs):
+            if path.name == "status.json":
+                records.append(json.loads(text))
+            original_write(path, text, *args, **kwargs)
+        usb = dict(audio_active=True, devices=[dict(skipped=drops)], error=None)
+        with contextlib.ExitStack() as stack:
+            sensor = stack.enter_context(patch.object(fand, "Sensors")).return_value
+            sensor.sample.side_effect = [*samples, RuntimeError("end of simulation")]
+            stack.enter_context(patch.object(fand, "UsbMonitor")).return_value.snapshot.return_value = usb
+            stack.enter_context(patch.object(fand, "config", return_value=cfg))
+            stack.enter_context(patch.object(fand.signal, "signal"))
+            stack.enter_context(patch.object(fand, "atomic_write", side_effect=capture))
+            stack.enter_context(patch.object(fand, "read_mode", return_value="auto"))
+            stack.enter_context(patch.object(threading.Event, "wait", return_value=False))
+            stored = stack.enter_context(patch.object(fand, "read_stored", return_value=self.stored()))
+            self.command.reset_mock()
+            with self.assertRaisesRegex(RuntimeError, "end of simulation"):
+                fand.run_service(False, None)
+        return records, stored
+
+    def test_live_loop_protects_quiet_only_when_needed(self):
+        self.profile.return_value = "quiet"
+        idle = dict(cpu_w=8, gpu_w=12, gpu_c=45, cpu_c=50, board_c=50, cpu_rpm=2000, gpu_rpm=2000,
+                    mid_rpm=2000, profile="quiet")
+        records, stored = self.run_loop([idle] * 3)
+        self.assertEqual(self.command.call_count, 0, "an idle Quiet profile is left alone")
+        self.assertTrue(records[0]["controlled"] and records[0]["profiles"] == CFG["profiles"])
+        stored.assert_not_called()
+        gaming = dict(idle, gpu_w=54)
+        records, stored = self.run_loop([gaming] * 3, drops=40)
+        stored.assert_called_once_with("quiet")
+        self.assertTrue(records[-1]["applied"] and records[-1]["floors"]["mid"] >= 70)
+        self.assertTrue(all(c.args[0][3] == "quiet" for c in self.command.call_args_list[:4]))
+        # The service stops while still raised: the finally block hands Quiet back exactly.
+        self.assertEqual(self.argv(-1)[3:], ["quiet", "--enable-fan-curves", "false"])
+        self.assertFalse((self.path / "restore-quiet.json").exists())
+
+    def test_excluded_profile_is_never_touched(self):
+        self.profile.return_value = "quiet"
+        sample = dict(cpu_w=8, gpu_w=150, gpu_c=70, cpu_c=80, board_c=80, cpu_rpm=2000, gpu_rpm=2000,
+                      mid_rpm=2000, profile="quiet")
+        records, stored = self.run_loop([sample] * 3, cfg=dict(CFG, profiles=["performance"]), drops=40)
+        self.assertEqual(self.command.call_count, 0)
+        stored.assert_not_called()
+        self.assertFalse(records[-1]["controlled"])
+        self.assertEqual(records[-1]["floors"], dict(cpu=0, gpu=0, mid=0))
 
 
 class ReplayTest(unittest.TestCase):

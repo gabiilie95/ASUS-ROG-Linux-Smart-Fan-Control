@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Performance-profile fan controller for the ASUS G814JZ."""
+"""Fan controller for the ASUS G814JZ: raises fan floors in the protected platform profiles."""
 import argparse
 from collections import deque
 import csv
@@ -12,6 +12,7 @@ import math
 import os
 from pathlib import Path
 import pwd
+import re
 import signal
 import stat
 import subprocess
@@ -33,6 +34,10 @@ ETC = Path("/etc/rog-fand")
 LOG = Path("/var/log/rog-fand")
 ZERO = (0, 0, 0)
 PRESETS = {"light": (35, 40, 70), "heavy": (80, 80, 80), "max": (100, 100, 100)}
+# Platform profiles asusd keeps fan curves for. Performance always runs the configured base curve;
+# in the others the service leaves the laptop's own curves alone until the floors are above zero.
+CONTROL_PROFILES = ("performance", "balanced", "quiet")
+STORED_RE = re.compile(r"fan:\s*(\w+),\s*pwm:\s*\(([^)]*)\),\s*temp:\s*\(([^)]*)\),\s*enabled:\s*(true|false)")
 MODES = {"auto", "off", *("preset:" + name for name in PRESETS)}
 # Readings the decision depends on. RAPL (reported heat only) and usbmon (feedback only) are
 # deliberately absent: losing them must not force the loud fallback.
@@ -120,6 +125,10 @@ def config(installed=False):
         number(cfg[k], 0.001, 86400)
     if type(cfg["log_csv"]) != bool:
         raise ValueError("log_csv must be a boolean")
+    profiles = cfg["profiles"]
+    if (not isinstance(profiles, list) or len(set(profiles)) != len(profiles)
+            or not set(profiles) <= set(CONTROL_PROFILES)):
+        raise ValueError("profiles must list distinct names from " + ", ".join(CONTROL_PROFILES))
     user = cfg.get("control_user")
     if user is not None:
         if not isinstance(user, str):
@@ -222,13 +231,13 @@ class Policy:
         self.clean_since = self.clean_bin = None
 
     def step(self, now, gpu, cpu, *, active=False, traffic=False, drops=0, degraded=False,
-             mode="auto", performance=True):
+             mode="auto", controlled=True):
         dt = 0 if self.last is None else max(0, now - self.last)
         self.last = now
         self.gpu = smooth(self.gpu, gpu, dt, self.cfg)
         total = None if gpu is None or cpu is None else gpu + cpu
         self.heat = smooth(self.heat, total, dt, self.cfg)
-        if not performance or mode == "off":
+        if not controlled or mode == "off":
             self.reset_control()
             return ZERO, None
 
@@ -296,18 +305,25 @@ def rounded(value):
     return None if value is None else round(value, 2)
 
 
-def write_curves(curves, restoring=False, previous=None):
-    # Recheck before *each* command: a profile switch can interrupt a three-fan update.
-    args = [["--fan", fan, "--data", ",".join(f"{t}c:{p}" for t, p in curves[fan])]
-            for fan in FANS if previous is None or curves[fan] != previous[fan]]
-    args.append(["--enable-fan-curves", "true"])
+def write_curves(curves, restoring=False, previous=None, profile="performance", enabled=True):
+    """Write `curves` (None: flags only) and the enable flags (bool, or a bool per fan) to `profile`.
+    Recheck before *each* command: a profile switch can interrupt a three-fan update, and asusd only
+    writes a profile's curves to the hardware while that profile is active."""
+    args = [] if curves is None else [
+        ["--fan", fan, "--data", ",".join(f"{t}c:{p}" for t, p in curves[fan])]
+        for fan in FANS if previous is None or curves[fan] != previous[fan]]
+    flags = enabled if isinstance(enabled, dict) else dict.fromkeys(FANS, bool(enabled))
+    if len(set(flags.values())) == 1:
+        args.append(["--enable-fan-curves", "true" if flags["cpu"] else "false"])
+    else:
+        args += [["--fan", fan, "--enable-fan-curve", "true" if flags[fan] else "false"] for fan in FANS]
     failures = []
     for suffix in args:
-        if read(PROFILE) != "performance":
-            logging.warning("Performance profile inactive; curve write deferred")
+        if read(PROFILE) != profile:
+            logging.warning("%s profile inactive; curve write deferred", profile.capitalize())
             return False
         try:
-            subprocess.run(["/usr/bin/asusctl", "fan-curve", "--mod-profile", "performance",
+            subprocess.run(["/usr/bin/asusctl", "fan-curve", "--mod-profile", profile,
                             *suffix], check=True, timeout=10)
         except (OSError, subprocess.SubprocessError) as exc:
             if not restoring:
@@ -318,38 +334,109 @@ def write_curves(curves, restoring=False, previous=None):
     return True
 
 
+def check_stored(stored):
+    """A profile's own curves and enable flags, as asusd reports them (points may repeat)."""
+    curves, enabled = stored["curves"], stored["enabled"]
+    if set(curves) != set(FANS) or set(enabled) != set(FANS):
+        raise ValueError("stored curves need cpu, gpu and mid")
+    for fan, points in curves.items():
+        if len(points) != 8 or type(enabled[fan]) != bool:
+            raise ValueError(f"invalid stored {fan} curve")
+        prev_t, prev_pwm = 0, 0
+        for temp, pwm in points:
+            if type(temp) != int or type(pwm) != int or not prev_t <= temp <= 120 or not 0 <= pwm <= 255:
+                raise ValueError(f"invalid stored {fan} curve")
+            prev_t = temp
+    return curves, enabled
+
+
+def read_stored(profile):
+    """Read a profile's curves and enable flags from asusd before the service changes them."""
+    out = subprocess.run(["/usr/bin/asusctl", "fan-curve", "--mod-profile", profile], check=True,
+                         timeout=10, capture_output=True, text=True).stdout
+    curves, enabled = {}, {}
+    for name, pwm, temp, flag in STORED_RE.findall(out):
+        fan = name.lower()
+        temps = [int(x) for x in temp.replace(",", " ").split()]
+        pwms = [int(x) for x in pwm.replace(",", " ").split()]
+        if fan not in FANS or len(temps) != len(pwms):
+            raise ValueError("unexpected asusctl fan-curve output")
+        curves[fan] = [[t, p] for t, p in zip(temps, pwms)]
+        enabled[fan] = flag == "true"
+    stored = {"curves": curves, "enabled": enabled}
+    check_stored(stored)
+    return stored
+
+
 class Actuator:
-    """The root-only receipt survives partial writes, process death and profile changes."""
+    """Root-only receipts survive partial writes, process death and profile changes.
+
+    Performance's receipt is the configured base curve (enabled), as before. Another profile's
+    receipt holds the curves and enable flags asusd had for it before the service raised its fans."""
     def __init__(self):
         self.receipt = STATE / "restore.json"
         self.last = None
+        self.last_profile = None
 
-    def restore(self):
+    def receipt_for(self, profile):
+        return self.receipt if profile == "performance" else STATE / f"restore-{profile}.json"
+
+    def pending(self, profile=None):
+        """Profiles whose receipt still waits (or whether `profile`'s does)."""
+        waiting = [p for p in CONTROL_PROFILES if self.receipt_for(p).exists()]
+        return waiting if profile is None else profile in waiting
+
+    def restore_profile(self, profile):
+        """Restore `profile` if a receipt waits for it. Only possible while it is active."""
+        path = self.receipt_for(profile)
         try:
-            base = read_json(self.receipt)
+            data = read_json(path)
         except FileNotFoundError:
             return True
-        validate_base(base)
-        if not write_curves(base, restoring=True):
-            return False
-        self.receipt.unlink()
-        self.last = build_curves(base, ZERO)
-        logging.info("restored exact base curve")
+        if profile == "performance":
+            validate_base(data)
+            if not write_curves(data, restoring=True):
+                return False
+            last = build_curves(data, ZERO)
+        else:
+            curves, enabled = check_stored(data)
+            # A profile whose curves were disabled runs the laptop's own curve; switching custom
+            # curves off again restores that. Its stored points are rewritten only when in use.
+            if not write_curves(curves if any(enabled.values()) else None, restoring=True,
+                                profile=profile, enabled=enabled):
+                return False
+            last = None
+        path.unlink()
+        self.last, self.last_profile = last, profile if last else None
+        logging.info("restored exact %s curve", profile)
         return True
 
-    def apply(self, base, floors):
+    def restore(self):
+        """Restore what the active profile allows; True when no receipt is left anywhere."""
+        active = read(PROFILE)
+        done = True
+        for profile in self.pending():
+            done = (profile == active and self.restore_profile(profile)) and done
+        return done
+
+    def apply(self, base, floors, profile="performance", stored=None):
         curves = build_curves(base, floors)
-        if curves == self.last:
+        if curves == self.last and profile == self.last_profile:
             return True
-        if not self.receipt.exists():
-            atomic_write(self.receipt, json.dumps(base))
-        previous = self.last
+        path = self.receipt_for(profile)
+        if not path.exists():
+            if profile != "performance":
+                if stored is None:
+                    raise ValueError(f"the {profile} profile's own curves are needed before changing them")
+                check_stored(stored)
+            atomic_write(path, json.dumps(base if profile == "performance" else stored))
+        previous = self.last if profile == self.last_profile else None
         self.last = None
-        if not write_curves(curves, previous=previous):
+        if not write_curves(curves, previous=previous, profile=profile):
             return False
-        self.last = curves
-        if not any(floors):
-            self.receipt.unlink()
+        self.last, self.last_profile = curves, profile
+        if profile == "performance" and not any(floors):
+            path.unlink()
         return True
 
 
@@ -423,7 +510,8 @@ def run_service(dry, duration):
     events = deque(maxlen=12)
     mode, last_mode_error = "auto", None
     last_profile = last_problems = last_decision = None
-    needs_recovery = bool(actuator and actuator.receipt.exists())
+    actuated = object()       # the profile the actuator last saw; forces a recovery check at start
+    needs_recovery = False
 
     def event(message):
         events.append({"t": timestamp, "message": message})
@@ -465,13 +553,14 @@ def run_service(dry, duration):
                 event(", ".join(problems) if problems else "all sensors available")
                 last_problems = problems
             before = policy.margins.copy()
+            controlled = profile in cfg["profiles"]
             gpu, degraded = gaps.update(values)
             floors, boost = policy.step(
                 now, gpu, values["cpu_w"], active=usb["audio_active"],
                 traffic=bool(usb["devices"]),
                 # Skips in a stream's first second are start-up artefacts, not chipset stalls.
                 drops=sum(d["skipped"] - d.get("warmup_skipped", 0) for d in usb["devices"]),
-                degraded=degraded, mode=mode, performance=profile == "performance")
+                degraded=degraded, mode=mode, controlled=controlled)
             if boost:
                 event(boost)
             if before != policy.margins:
@@ -480,10 +569,12 @@ def run_service(dry, duration):
                     atomic_write(STATE / "state.json", json.dumps({"margins": policy.margins}))
             applied = manual_control = False
             if actuator:
-                if profile != "performance":
-                    actuator.last = None
-                    needs_recovery = actuator.receipt.exists()
-                else:
+                if profile != actuated:
+                    # asusd rewrites a profile's own curves when it becomes active.
+                    actuator.last = actuator.last_profile = None
+                    needs_recovery = profile in CONTROL_PROFILES and actuator.pending(profile)
+                    actuated = profile
+                if profile in CONTROL_PROFILES:
                     # A desktop calibration takes this lease only after Off is acknowledged.
                     # It holds the lease through exact-curve restoration on finish or cancel.
                     lock = os.open(mode_path.parent, os.O_DIRECTORY)
@@ -494,18 +585,27 @@ def run_service(dry, duration):
                             manual_control = True
                         else:
                             if needs_recovery:
-                                needs_recovery = not actuator.restore()
-                            if not needs_recovery:
-                                applied = actuator.apply(cfg["base_curve"], floors)
+                                needs_recovery = not actuator.restore_profile(profile)
+                            if needs_recovery:
+                                pass    # the receipt stays; retried next sample
+                            elif controlled and (profile == "performance" or any(floors)):
+                                stored = None
+                                if profile != "performance" and not actuator.pending(profile):
+                                    stored = read_stored(profile)
+                                applied = actuator.apply(cfg["base_curve"], floors, profile, stored)
                                 needs_recovery = not applied
+                            elif actuator.pending(profile):
+                                # Floors are back at zero (or Off): hand the profile its own curves back.
+                                needs_recovery = not actuator.restore_profile(profile)
                     finally:
                         os.close(lock)
-            decision = floors if profile == "performance" else None
+            decision = floors if controlled else None
             if decision != last_decision:
                 event(f"{'planned' if dry else 'requested'} floors (% cpu/gpu/mid): {decision}")
                 last_decision = decision
             status = dict(version=VERSION, t=timestamp, elapsed_s=round(now-start, 2),
                           dry_run=dry, mode=mode, invalid_mode=last_mode_error is not None,
+                          controlled=controlled, profiles=cfg["profiles"],
                           sensors=values, unavailable=problems, degraded=degraded, heat_w=rounded(policy.heat),
                           smoothed_gpu_w=rounded(policy.gpu), floors=dict(zip(FANS, floors)),
                           applied=applied, manual_control=manual_control, margins=policy.margins, usb=usb, events=list(events))
@@ -520,7 +620,8 @@ def run_service(dry, duration):
         stop.set()
         try:
             if actuator and not actuator.restore():
-                logging.warning("restore pending; select Performance and run --restore")
+                logging.warning("restore pending for %s; select it and run --restore",
+                                ", ".join(actuator.pending()))
         finally:
             if usbmon.thread.is_alive():
                 usbmon.thread.join(timeout=2)
@@ -550,7 +651,12 @@ def main(argv=None):
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             if args.restore:
-                return 0 if Actuator().restore() else 1
+                actuator = Actuator()
+                if actuator.restore():
+                    return 0
+                print("restore pending for " + ", ".join(actuator.pending()) + "; select that profile "
+                      "and run --restore again", file=sys.stderr)
+                return 1
             run_service(False, None)
         finally:
             os.close(lock)
