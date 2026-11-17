@@ -351,7 +351,9 @@ and switches the settings that already exist as scripts.
 
 The server listens on 127.0.0.1 only, POSTs need a per-run token, and only the whitelisted commands above can run.
 
-The native **Auto** tab shows the service mode, requested fan floors, measured RPM, heat input,
+The native **Auto** tab shows the service mode, each fan's live speed (read from the fan sensors,
+so it shows without the service too, as rpm and percent of that fan's full speed) beside its
+requested floor, heat input,
 USB drops per device and learned margins. Select a measurement to chart its last five minutes.
 **Apply mode** waits for acknowledgement from the service. **Preview live sensors** runs the
 controller read-only in your desktop session and works before installation.
