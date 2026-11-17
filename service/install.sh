@@ -7,7 +7,7 @@ etc=/etc/rog-fand
 state=/var/lib/rog-fand
 unit=/etc/systemd/system/rog-fand.service
 launcher=/usr/local/share/applications/rog-panel-qt.desktop
-panel_files=(ui/{rog-panel-qt,rogcore,fan_auto,fan_calibration,fan_tray}.py
+panel_files=(ui/{rog-panel-qt,rogcore,fan_auto,fan_calibration,fan_tray,panel_settings}.py
              tools/{fan-calibrate,stall-counter}.py tools/fans-{balanced,max,mid-max,original,ramped}.sh
              tools/jellyfin-software-ui.sh root-tests/{setup-cool-performance,usb-drop-count}.sh)
 tmp=

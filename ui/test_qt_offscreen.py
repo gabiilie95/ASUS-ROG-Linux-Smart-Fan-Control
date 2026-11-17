@@ -17,6 +17,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import rogcore as core  # noqa: E402
 import fan_tray  # noqa: E402
+import panel_settings  # noqa: E402
 from PySide6.QtCore import Qt, QPoint, QTimer, QSaveFile, QIODevice  # noqa: E402
 from PySide6.QtGui import QGuiApplication, QIcon  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
@@ -236,28 +237,29 @@ def tray_model_tests():
     check(kinds(model.observe("Running", fand_sample(mode="preset:max"), wall, 1508, ("off", 1500))) == ["mode"],
           "notify: mode changed elsewhere")
 
-    check(m.exec_arg("/usr/bin/python3") == "/usr/bin/python3", "exec: plain path unquoted")
-    check(m.exec_arg("/home/u/ROG Audio/ui/rog-panel-qt.py") == '"/home/u/ROG Audio/ui/rog-panel-qt.py"',
+    ps = panel_settings
+    check(ps.exec_arg("/usr/bin/python3") == "/usr/bin/python3", "exec: plain path unquoted")
+    check(ps.exec_arg("/home/u/ROG Audio/ui/rog-panel-qt.py") == '"/home/u/ROG Audio/ui/rog-panel-qt.py"',
           "exec: spaces quoted")
     # Quoting escapes \ " ` $ with a backslash; string escaping then doubles every backslash.
-    check(m.exec_arg('/a b/$x"`\\%') == '"/a b/\\\\$x\\\\"\\\\`\\\\\\\\%%"', "exec: reserved characters escaped")
-    path = m.autostart_path()
-    check(str(path).startswith(OUT) and not m.autostart_enabled(), "autostart: isolated and off by default")
-    m.set_autostart(True)
+    check(ps.exec_arg('/a b/$x"`\\%') == '"/a b/\\\\$x\\\\"\\\\`\\\\\\\\%%"', "exec: reserved characters escaped")
+    path = ps.autostart_path()
+    check(str(path).startswith(OUT) and not ps.autostart_enabled(), "autostart: isolated and off by default")
+    ps.set_autostart(True)
     text = path.read_text()
-    check(m.autostart_enabled() and "--tray" in text and m.exec_arg(str(m.PANEL)) in text
+    check(ps.autostart_enabled() and "--tray" in text and ps.exec_arg(str(ps.PANEL)) in text
           and oct(path.stat().st_mode & 0o777) == "0o644", "autostart: entry written atomically")
-    m.set_autostart(False)
+    ps.set_autostart(False)
     check(not path.exists(), "autostart: entry removed")
     path.write_text("[Desktop Entry]\nExec=something-else\n")
-    m.set_autostart(False)
+    ps.set_autostart(False)
     check(path.exists(), "autostart: never removes an entry it did not write")
     path.unlink()
 
 
-def update_tests(tray, shown):
+def update_tests(w, tray, shown):
+    up = w.updater
     class Fake:
-        INSTALLED = None
         def __init__(self, tag, installed, fail=None):
             self.tag, self.installed, self.fail = tag, installed, fail
         def latest(self):
@@ -268,46 +270,130 @@ def update_tests(tray, shown):
             return self.installed
         is_newer = staticmethod(core.load_updater().is_newer)
     with patch.object(core, "load_updater", return_value=Fake("v0.2.0", "0.2.0-dev")):
-        check(fan_tray.check_updates() == dict(installed="0.2.0-dev", tag="v0.2.0", newer=True), "update: newer release found")
+        check(panel_settings.check_updates() == dict(installed="0.2.0-dev", tag="v0.2.0", newer=True),
+              "update: newer release found")
     with patch.object(core, "load_updater", return_value=Fake("v0.1.0", "0.2.0-dev")):
-        check(fan_tray.check_updates()["newer"] is False, "update: older release not offered")
+        check(panel_settings.check_updates()["newer"] is False, "update: older release not offered")
     with patch.object(core, "load_updater", return_value=Fake(None, None, fail="offline")):
-        check(fan_tray.check_updates() == dict(error="offline"), "update: network errors reported, not raised")
+        check(panel_settings.check_updates() == dict(error="offline"), "update: network errors reported, not raised")
 
     found = dict(installed="0.2.0-dev", tag="v0.2.0", newer=True)
     before = len(shown)
-    with patch.object(fan_tray, "check_updates", return_value=found):
-        tray.start_update_check()
-        check(wait_for(lambda: tray.update_tag == "v0.2.0" and not tray.checking, 5000), "update: background check")
-        tray.start_update_check()
-        check(wait_for(lambda: not tray.checking, 5000) and len(shown) == before + 1
+    with patch.object(panel_settings, "check_updates", return_value=found):
+        up.check()
+        check(wait_for(lambda: up.tag == "v0.2.0" and not up.checking, 5000), "update: background check")
+        up.check()
+        check(wait_for(lambda: not up.checking, 5000) and len(shown) == before + 1
               and shown[-1][0] == "Update available", "update: notified once per release")
     tray.update_menu()
     check(tray.install_act.isVisible() and "v0.2.0" in tray.install_act.text()
-          and "Update v0.2.0 available" in tray.tray.toolTip(), "update: menu entry and tooltip")
+          and "Update v0.2.0 available" in tray.tray.toolTip(), "update: tray menu entry and tooltip")
+    tab = w.settings_tab
+    check(tab.install_btn.isVisibleTo(tab) and "v0.2.0" in tab.install_btn.text()
+          and "newest release v0.2.0" in tab.version.text() and "Update available" in tab.update_status.text(),
+          "update: Settings tab shows the release and the install button")
     check(core.update_command("v0.2.0") == ["pkexec", "/usr/bin/python3", "-IB",
                                             "/usr/local/lib/rog-fand/rog_update.py", "install", "v0.2.0"],
           "update: pkexec runs only the root-owned installed updater with the tag")
     restarts = []
-    tray.restart_panel = lambda: restarts.append(1)
-    for code, output, title in ((126, "", "Update not installed"), (1, "error: v0.2.0 VERSION file says '0.1.0'",
-                                                                    "Update failed"), (0, "installed v0.2.0", "Updated to v0.2.0")):
+    up.restart_panel = lambda: restarts.append(1)
+    cases = ((126, "", "Update not installed", tray.install_act.trigger),
+             (1, "error: v0.2.0 VERSION file says '0.1.0'", "Update failed", tab.install_btn.click),
+             (0, "installed v0.2.0", "Updated to v0.2.0", tab.install_btn.click))
+    for code, output, title, press in cases:
         script = f"echo \"{output}\"; exit {code}"
         with patch.object(core, "updater_installed", return_value=True), \
              patch.object(core, "update_command", return_value=["/bin/sh", "-c", script]):
-            tray.update_tag = "v0.2.0"
+            up.tag = "v0.2.0"
             tray.update_menu()
-            check(tray.install_act.isEnabled(), "update: install enabled when the root-owned updater exists")
-            tray.install_act.trigger()
-            check(wait_for(lambda: tray.update_proc is None, 5000) and shown[-1][0] == title
+            tab.refresh()
+            check(tray.install_act.isEnabled() and tab.install_btn.isEnabled(),
+                  "update: install enabled when the root-owned updater exists")
+            press()
+            check(up.proc is not None and not tab.install_btn.isEnabled() and not tab.check_btn.isEnabled(),
+                  "update: buttons disabled while installing")
+            check(wait_for(lambda: up.proc is None, 5000) and shown[-1][0] == title and title in tab.update_status.text()
                   and (code != 1 or "VERSION file says" in shown[-1][1]), "update: exit %d -> %s" % (code, title))
-    check(wait_for(lambda: restarts, 4000) and tray.update_tag is None, "update: panel restarts after installing")
+    check(wait_for(lambda: restarts, 4000) and up.tag is None and up.installed == "0.2.0",
+          "update: panel restarts after installing")
     with patch.object(core, "updater_installed", return_value=False):
-        tray.update_tag = "v0.2.0"
+        up.tag = "v0.2.0"
         tray.update_menu()
-        check(not tray.install_act.isEnabled() and "install the service first" in tray.install_act.text(),
+        tab.refresh()
+        check(not tray.install_act.isEnabled() and "install the service first" in tray.install_act.text()
+              and not tab.install_btn.isEnabled() and "Install the service" in tab.update_status.text(),
               "update: no install without the root-owned updater")
-    tray.update_tag = None
+    up.tag = None
+    newest = dict(installed="0.2.0", tag="v0.2.0", newer=False)
+    with patch.object(panel_settings, "check_updates", return_value=newest):
+        tab.check_btn.click()
+        check(up.checking and not tab.check_btn.isEnabled() and tab.check_btn.text() == "Checking…",
+              "update: Check now shows progress")
+        check(wait_for(lambda: not up.checking, 5000) and "Up to date" in tab.update_status.text()
+              and shown[-1][0] == "Up to date" and not tab.install_btn.isVisibleTo(tab) and tab.check_btn.isEnabled(),
+              "update: manual check reports up to date")
+    with patch.object(panel_settings, "check_updates", return_value=dict(error="offline")):
+        up.check()
+        check(wait_for(lambda: not up.checking, 5000) and "last check failed: offline" in tab.version.text(),
+              "update: a failed automatic check shows in the tab quietly")
+    w.prefs.set("check_updates", False)
+    up.check()
+    check(not up.checking and not tray.options["check_updates"].isChecked(), "update: automatic checks can be off")
+    w.prefs.set("check_updates", True)
+
+
+def settings_tests(w, tray, shown):
+    tab, prefs = w.settings_tab, w.prefs
+    w.tabs.setCurrentWidget(w.settings_scroll)
+    pump(100)
+    screenshot(w, "6-settings.png")
+    tab.boxes["close_to_tray"].setChecked(False)
+    check(not prefs.get("close_to_tray") and not tray.keep_act.isChecked() and not tray.keep_running(),
+          "settings: tab checkbox updates the tray menu")
+    tray.keep_act.setChecked(True)
+    check(prefs.get("close_to_tray") and tab.boxes["close_to_tray"].isChecked(), "settings: tray menu updates the tab")
+    count = len(shown)
+    tab.boxes["notifications"].setChecked(False)
+    tray.notify("Test", "hidden")
+    check(len(shown) == count and not tray.notify_act.isChecked(), "settings: notifications can be switched off")
+    tab.boxes["notifications"].setChecked(True)
+    tray.notify("Test", "shown")
+    check(len(shown) == count + 1, "settings: notifications back on")
+    path = panel_settings.autostart_path()
+    tab.boxes["start_at_login"].setChecked(True)
+    check(path.exists() and "--tray" in path.read_text() and tray.options["start_at_login"].isChecked(),
+          "settings: start at login writes the autostart entry")
+    tray.options["start_at_login"].setChecked(False)
+    check(not path.exists() and not tab.boxes["start_at_login"].isChecked(), "settings: start at login removed from the tray")
+    with patch.object(panel_settings, "set_autostart", side_effect=OSError("read-only")):
+        tab.boxes["start_at_login"].setChecked(True)
+    check(not tab.boxes["start_at_login"].isChecked() and "read-only" in tab.message.text(),
+          "settings: a failed change is shown and the box reverts")
+    w.tabs.setCurrentIndex(0)
+    tray.settings_act.trigger()
+    check(w.tabs.currentWidget() is w.settings_scroll and w.isVisible(), "settings: tray menu opens the Settings tab")
+
+    old = tray
+    w.hide()
+    tab.boxes["tray"].setChecked(False)
+    check(w.tray is None and not old.tray.isVisible() and not old.timer.isActive() and w.isVisible()
+          and not tab.boxes["notifications"].isEnabled() and not tab.boxes["close_to_tray"].isEnabled(),
+          "settings: tray icon off removes it and shows the hidden window")
+    check(w.windowIcon().name() == "asus_notif_red", "icon: window back to the red logo without the tray")
+    pump(100)
+    with patch.object(w, "quit_app", return_value=True) as quit_app:
+        w.close()
+    check(quit_app.called and not w.isVisible(), "settings: without the tray, closing quits")
+    w.show()
+    tab.boxes["tray"].setChecked(True)
+    check(w.tray is not None and w.tray is not old and tab.boxes["notifications"].isEnabled(),
+          "settings: tray icon back on")
+    w.tray_allowed = False
+    w.apply_tray()
+    check(w.tray is None and not tab.boxes["tray"].isEnabled() and "No system tray" in tab.tray_note.text(),
+          "settings: desktop without a tray")
+    w.tray_allowed = True
+    return w.apply_tray()
 
 
 def tray_tests(w):
@@ -315,16 +401,22 @@ def tray_tests(w):
     hicolor = Path("/usr/share/icons/hicolor/512x512/apps/asus_notif_green.png").exists()
     QIcon.setThemeSearchPaths(["/usr/share/icons"])   # offscreen has no icon theme; a desktop sets these
     QIcon.setThemeName("hicolor")
-    tray = w.enable_tray()
+    w.tray_allowed = True
+    tray = w.apply_tray()
     shown = []
-    tray.notify_act.setChecked(True)
-    tray.notify = lambda title, text: shown.append((title, text))
+    w.prefs.set("notifications", True)
+    capture = lambda title, text, *_: shown.append((title, text))
+    tray.tray.showMessage = capture
     check(not tray.icon("green").isNull(), "tray: icon available (%s)" %
           ("ROG logo from asusctl" if hicolor else "fallback icon"))
     status = core.FAND_RUN / "status.json"
     publish(status, json.dumps(fand_sample()))
     tray.poll()
     check(tray.colour == "green" and "Floors 60 / 60 / 75" in tray.tray.toolTip(), "tray: live status and tooltip")
+    check(w.windowIcon().name() == "asus_notif_green", "icon: window follows the tray colour")
+    launcher = (Path(HERE) / "rog-panel-qt.desktop").read_text()
+    check("Icon=asus_notif_red\n" in launcher and "Icon=asus_notif_red\n" in panel_settings.autostart_entry(),
+          "icon: launcher and login entry use the red ROG logo by name")
     tray.update_menu()
     check(not tray.mode_menu.isEnabled(), "tray: dry run cannot change mode")
     w.dry_run = False   # the control directory is the test fixture
@@ -351,7 +443,9 @@ def tray_tests(w):
     tray.toggle_panel()
     pump(100)
     check(w.isVisible() and w.timer.isActive(), "tray: click reopens the window")
-    update_tests(tray, shown)
+    update_tests(w, tray, shown)
+    tray = settings_tests(w, tray, shown)
+    tray.tray.showMessage = capture
     quits = []
     with patch.object(QApplication, "quit", side_effect=lambda: quits.append(1)):
         tray.menu.actions()[-1].trigger()
@@ -366,6 +460,7 @@ def main():
     q = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(q)
     w = q.MainWindow(dry_run=True)
+    w.updater.stop()     # no automatic network checks during the test
     w.resize(1280, 800)
     w.show()
     check(w.height() <= 800 and w.width() <= 1280, "window fits 1280x800 (%dx%d)" % (w.width(), w.height()))

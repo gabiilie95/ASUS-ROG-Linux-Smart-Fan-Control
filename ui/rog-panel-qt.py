@@ -15,6 +15,7 @@ import rogcore as core  # noqa: E402
 from fan_auto import AutoTab, heading
 from fan_calibration import CalibrateTab
 from fan_tray import FanTray
+from panel_settings import PanelSettings, SettingsTab, Updater
 
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, Qt, Signal, QPointF, QRectF  # noqa: E402
 from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPen, QPolygonF  # noqa: E402
@@ -352,14 +353,20 @@ def note_label(text):
     return l
 
 
+def app_icon():
+    """The red ROG logo asusctl installs (loaded by name, never copied: ASUS trademark)."""
+    return QIcon.fromTheme("asus_notif_red", QIcon.fromTheme("preferences-system"))
+
+
 class MainWindow(QMainWindow):
     def __init__(self, dry_run=False):
         super().__init__()
         self.dry_run = dry_run
         self.setWindowTitle("ROG Settings Panel")
-        self.setWindowIcon(QIcon.fromTheme("preferences-system"))
+        self.setWindowIcon(app_icon())
         self.jobs = set()
         self.tray = None
+        self.tray_allowed = False    # main() sets this when the desktop has a system tray
         self.quitting = False
         self.refreshing = False
         self.acting = False
@@ -409,18 +416,25 @@ class MainWindow(QMainWindow):
         self.cal_tab = CalibrateTab(dry_run, lambda: self.acting)
         self.close_after_calibration = False
         self.cal_tab.runningChanged.connect(self.calibration_changed)
+        self.prefs = PanelSettings(self)
+        self.updater = Updater(self, self.prefs)
+        self.settings_tab = SettingsTab(self)
+        self.prefs.changed.connect(self.pref_changed)
         self.tabs.addTab(self._scroll(self.auto_tab), "Auto")
         self.tabs.addTab(self._scroll(self._build_status_tab()), "Status")
         self.tabs.addTab(self._build_editor_tab(), "Fan curves")
         self.tabs.addTab(self._scroll(self._build_monitor_tab()), "Monitor")
         self.tabs.addTab(self._scroll(self.cal_tab), "Calibrate")
+        self.settings_scroll = self._scroll(self.settings_tab)
+        self.tabs.addTab(self.settings_scroll, "Settings")
         gb, lay = card("Last result")
         self.out = QPlainTextEdit("Nothing run yet.")
         self.out.setReadOnly(True)
         self.out.setMaximumHeight(100)
         lay.addWidget(self.out)
         root.addWidget(gb)
-        self.tabs.currentChanged.connect(lambda i: gb.setVisible(self.tabs.tabText(i) not in ("Auto", "Calibrate")))
+        self.tabs.currentChanged.connect(
+            lambda i: gb.setVisible(self.tabs.tabText(i) not in ("Auto", "Calibrate", "Settings")))
         gb.hide()
         self.setStyleSheet("""
             QFrame#masthead {background: #192e40; border-radius: 7px;}
@@ -462,10 +476,30 @@ class MainWindow(QMainWindow):
         self.timer.stop()
         self.auto_tab.timer.stop()
 
-    def enable_tray(self):
-        if self.tray is None:
+    def apply_tray(self):
+        """Show or remove the tray icon to match the setting (a desktop may have no tray at all)."""
+        want = self.tray_allowed and self.prefs.get("tray")
+        if want and self.tray is None:
             self.tray = FanTray(self)
+        elif not want and self.tray is not None:
+            tray, self.tray = self.tray, None
+            tray.remove()
+            tray.deleteLater()
+            self.setWindowIcon(app_icon())   # no state colour without the tray
+            if not self.isVisible() and not self.quitting:
+                self.show()          # nothing else would lead back to a hidden window
+        self.settings_tab.refresh()
         return self.tray
+
+    def pref_changed(self, key, _value):
+        if key == "tray":
+            self.apply_tray()
+
+    def show_settings(self):
+        self.tabs.setCurrentWidget(self.settings_scroll)
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
 
     @staticmethod
     def _scroll(w):
@@ -885,6 +919,7 @@ class MainWindow(QMainWindow):
 
     def shutdown(self):
         self.auto_tab.shutdown()
+        self.updater.stop()
         self.monitor_stop("Stopped.")
         if self.tray is not None:
             self.tray.remove()
@@ -1271,14 +1306,14 @@ def main():
     tries = [0]
 
     def place():
-        if not a.no_tray and QSystemTrayIcon.isSystemTrayAvailable():
-            win.enable_tray()
-            if not a.tray:
-                win.show()
-        elif a.tray and not a.no_tray and tries[0] < 30:
+        available = not a.no_tray and QSystemTrayIcon.isSystemTrayAvailable()
+        if not available and a.tray and not a.no_tray and win.prefs.get("tray") and tries[0] < 30:
             tries[0] += 1            # at login the panel can start before the tray host
             QTimer.singleShot(1000, place)
-        else:
+            return
+        win.tray_allowed = available
+        win.apply_tray()
+        if win.tray is None or not a.tray:   # without a tray icon the window is the only way in
             win.show()
     place()
     return app.exec()

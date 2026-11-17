@@ -4,6 +4,6 @@ Type=Application
 Name=ROG Settings Panel
 Comment=Smart fan control, calibration and system settings for the ROG G18
 Exec=/usr/bin/python3 -IB /usr/local/lib/rog-fand/ui/rog-panel-qt.py
-Icon=preferences-system
+Icon=asus_notif_red
 Terminal=false
 Categories=Utility;
