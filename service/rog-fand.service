@@ -1,0 +1,30 @@
+[Unit]
+Description=ASUS ROG G18 smart fan controller
+After=asusd.service
+Wants=asusd.service
+
+[Service]
+Type=simple
+ExecStartPre=-/usr/sbin/modprobe usbmon
+ExecStart=/usr/bin/python3 -IB /usr/local/lib/rog-fand/rog_fand.py
+ExecStopPost=/usr/bin/python3 -IB /usr/local/lib/rog-fand/rog_fand.py --restore
+TimeoutStopSec=120
+Restart=on-failure
+RestartSec=5
+RuntimeDirectory=rog-fand
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=restart
+StateDirectory=rog-fand
+StateDirectoryMode=0700
+LogsDirectory=rog-fand
+LogsDirectoryMode=0700
+UMask=0077
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

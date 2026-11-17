@@ -260,6 +260,48 @@ Click counting in recordings (mono 16-bit 48 kHz WAV, high-passed at 17.5 kHz fi
 - `data/phone-recordings/` – the three phone recordings of the crackle
 - `data/systemdgenie-installed-files.txt` – what the systemdgenie build installed under `~/.local`
 
+## Smart fan service
+
+`rog-fand` samples the G814JZ every two seconds. In Performance, smoothed GPU watts select
+minimum CPU/GPU/middle fan levels. Each point keeps the higher of the calibrated balanced PWM
+and the requested floor. Two consecutive USB drop samples trigger a boost and raise the margin
+for that power range. Status reports missing sensors. The conservative floor of at least 60/60/80 applies only when
+GPU power, a temperature or a fan speed has been missing for three consecutive samples (6 s);
+a single gap holds the last GPU reading. CPU power (RAPL) and usbmon are reported when missing
+but never force the fallback, because they only feed the heat display and the feedback.
+USB skips in the first second of a stream (after 2 s without traffic) are reported as
+`warmup_skipped` and do not count as drops.
+
+```sh
+python3 -IB service/rog_fand.py --replay data/logs/10-fan-calibration-light.csv
+python3 -IB service/rog_fand.py --dry-run --seconds 120
+python3 -B -m unittest discover -s service
+```
+
+Dry run prints read-only live status to stdout. Replay uses the recorded GPU watts and timestamps.
+The historical logs contain internal audio stalls. USB feedback uses live usbmon packet counts.
+
+For live control, run `sudo service/install.sh install` from a trusted checkout. The installer
+sets the invoking desktop user as the owner of `/run/rog-fand/mode`. Write one line in place:
+`auto`, `off` (exact base), `preset:light` (35/40/70), `preset:heavy` (80/80/80), or
+`preset:max` (100/100/100). Read `/run/rog-fand/status.json` or `journalctl -u rog-fand`.
+The root-owned `/etc/rog-fand/config.json` holds the base, table and timing. An optional
+`/etc/rog-fand/model.json` supplies a replacement `table` in the example config's format.
+Set `log_csv` to true for per-minute sample files in `/var/log/rog-fand/`.
+
+`service/install.sh status` shows unit status. `sudo service/install.sh undo` stops the service,
+restores its base, and removes the installation, learned margins and sample logs. If a profile
+switch interrupts restoration, the service saves the exact base in `/var/lib/rog-fand/restore.json`.
+Return to Performance for recovery on the next service run, or repeat undo there.
+
+Things to know once it is installed:
+- In `auto` and the presets, the Performance curve is the configured base (in
+  `/etc/rog-fand/config.json`) raised to the floors. Curve edits made elsewhere only stay while the
+  mode is `off`.
+- `/run` is cleared at boot, so the mode starts as `auto` after every reboot.
+- Install with `sudo` or `pkexec`; the installer takes the desktop user from either. Without one,
+  the mode can only be changed by root.
+
 ## Settings panel
 
 A small local web page (`ui/`) that shows temperatures, fans, the live fan curve, CPU and GPU readings,
