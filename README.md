@@ -177,6 +177,36 @@ light load; then raise its 58 C point to 178 (70 %).
 - Still to check: light load (Rocksmith) with the cooler CPU, because the middle fan follows CPU
   temperature and may drop to 60 %, which was not enough at light load.
 
+## Quieter at idle (2026-11-17)
+
+At desktop idle the CPU sits around 58-62 C. The balanced curve ran the middle fan at 60-70 % there,
+about 5200 rpm and audibly whiny, while the CPU and GPU fans idled at about 2300-2500 rpm. That part
+of the curve predates `rog-fand`. The service now sets the load floors itself (middle fan 70 % from
+50 W of GPU power), so the curve below 70 C was lowered and partly moved to the CPU fan:
+
+| CPU temp | Middle fan before / after | CPU fan before / after |
+|---|---|---|
+| 58 C | 60 % / 31 % | 14 % / 20 % |
+| 62 C | 70 % / 39 % | 21 % / 27 % |
+| 66 C | 70 % / 51 % | 35 % / 39 % |
+
+From 70 C the curve is unchanged, and the GPU fan is unchanged.
+
+The new curve was checked for 150 s with GPU power at 19-38 W and USB audio playing:
+
+| | Old curve (20 s) | New curve (150 s) |
+|---|---|---|
+| Middle fan | 5200 rpm | about 4000 rpm (max 4500) |
+| CPU fan | about 2300 rpm | about 2800 rpm |
+| CPU package | 61 C (max 68) | 60 C (max 69) |
+| Board sensor | 55 C | 55 C |
+| Internal-audio stalls | - | 0 |
+| USB drops | 0 | 0 |
+
+The new curve is in `service/config.example.json`, `tools/fans-balanced.sh` and the panel's
+"balanced" preset. An existing install keeps its own `/etc/rog-fand/config.json`, so change
+`base_curve` there and restart `rog-fand` to pick it up.
+
 ## Graphics memory (separate problem, same day)
 
 The RTX 4080 has 12 GB and the laptop runs in dGPU-only mode (`supergfxctl -g` = AsusMuxDgpu),
@@ -335,7 +365,8 @@ run waits for cleanup; closing the window only hides it to the tray. In panel dr
 
 **Tray icon** (`ui/fan_tray.py`). The panel puts the ROG logo that asusctl installs in the
 system tray. The logo is loaded by icon name and not copied here. Its colour shows the service
-state:
+state, and the window icon follows the same colour. The menu launcher and the login entry use
+the red logo (`asus_notif_red`), as does the window when the tray icon is off:
 
 | Colour | Meaning |
 |---|---|
@@ -347,9 +378,8 @@ state:
 | White | Service not installed or state unknown |
 
 - **Tooltip:** floors, GPU power, board temperature and USB drops, plus the stall monitor's rate while it runs.
-- **Menu:** open or hide the panel, fan mode, start or stop the stall monitor, and three settings:
-  keep running in the tray when closed (on by default), notifications (on), and start in the tray
-  at login (off; writes `~/.config/autostart/rog-panel-qt.desktop`).
+- **Menu:** open or hide the panel, fan mode, start or stop the stall monitor, update check and
+  install, the Settings tab's switches (except the tray icon itself), **Settings…** and Quit.
 - **Notifications:** each kind at most once per 5 minutes, for:
   - a USB drop boost, with the drop rate;
   - the service stopped, stale or unreadable for two polls in a row, running again, or restarted;
@@ -360,10 +390,27 @@ state:
   monitor is running, hiding the window says so, because the monitor keeps the internal speakers
   in use. `--tray` starts hidden (used at login); `--no-tray` restores the old behaviour.
 
+**Settings tab** (`ui/panel_settings.py`). One place for the panel's settings; the tray menu shows
+the same switches and both stay in step.
+
+| Setting | Default | Effect |
+|---|---|---|
+| Show the tray icon | on | Off removes the icon at once; closing the window then quits |
+| Keep running in the tray when the window is closed | on | Off makes closing quit (needs the tray icon) |
+| Show desktop notifications | on | All tray notifications (needs the tray icon) |
+| Start at login | off | Writes `~/.config/autostart/rog-panel-qt.desktop`: the panel starts in the tray, or as a window when the tray icon is off |
+| Check for updates every 12 hours | on | The automatic check described under Updates |
+
+The Updates box shows the installed version, the newest release and when it was last checked, with
+**Check for updates now** and, when a newer release exists, **Install update vX.Y.Z…**. Settings
+are stored in `~/.config/rog-fand/rog-panel-qt.conf`. A desktop without a system tray disables the
+tray settings.
+
 **Updates** (`service/rog_update.py`). The tray checks GitHub for a newer published release a
 minute after it starts and then every 12 hours. The check runs as you, with no root, sends a
-generic client name, and can be turned off in the tray menu. When a newer release exists, it
-notifies once per release and adds **Install update vX.Y.Z…** to the tray menu.
+generic client name, and can be turned off in the Settings tab or the tray menu. When a newer
+release exists, it notifies once per release and shows **Install update vX.Y.Z…** in the Settings
+tab and the tray menu.
 
 Clicking that runs the installed, root-owned copy of the updater through `pkexec`, so a
 password dialog appears. Nothing installs without it. The updater:
