@@ -41,6 +41,18 @@ case "${1:-}" in
                 copy_atomic "$src/../$file" "$app/$file"
             done
             copy_atomic "$src/../ui/rog-panel-qt.desktop" "$launcher"
+            # A per-user launcher with the same name takes priority over this one in the menu.
+            desk_user=${SUDO_USER:-}
+            if [[ -z $desk_user && ${PKEXEC_UID:-} =~ ^[0-9]+$ ]]; then
+                desk_user=$(getent passwd "$PKEXEC_UID" | cut -d: -f1)
+            fi
+            if [[ -n $desk_user ]]; then
+                desk_home=$(getent passwd "$desk_user" | cut -d: -f6)
+                if [[ -n $desk_home && -e $desk_home/.local/share/applications/rog-panel-qt.desktop ]]; then
+                    echo "note: $desk_home/.local/share/applications/rog-panel-qt.desktop hides the installed" \
+                         "launcher in the menu; remove it to use the installed panel." >&2
+                fi
+            fi
             for file in rog_fand.py rog_sensors.py config.example.json; do
                 copy_atomic "$src/$file" "$app/$file"
             done
@@ -50,9 +62,15 @@ case "${1:-}" in
 import json, os, pwd, sys
 with open(sys.argv[1]) as src:
     cfg = json.load(src)
+# sudo sets SUDO_USER; pkexec sets PKEXEC_UID. Either names the desktop user who controls the mode.
 user = os.environ.get("SUDO_USER")
+if not user and os.environ.get("PKEXEC_UID", "").isdigit():
+    user = pwd.getpwuid(int(os.environ["PKEXEC_UID"])).pw_name
 if user and pwd.getpwnam(user).pw_uid != 0:
     cfg["control_user"] = user
+else:
+    print("note: no desktop user found (run with sudo or pkexec); the panel cannot change the mode",
+          file=sys.stderr)
 print(json.dumps(cfg, indent=2))
 PY
                 mv -fT -- "$tmp" "$etc/config.json"

@@ -34,6 +34,13 @@ LOG = Path("/var/log/rog-fand")
 ZERO = (0, 0, 0)
 PRESETS = {"light": (35, 40, 70), "heavy": (80, 80, 80), "max": (100, 100, 100)}
 MODES = {"auto", "off", *("preset:" + name for name in PRESETS)}
+# Readings the decision depends on. RAPL (reported heat only) and usbmon (feedback only) are
+# deliberately absent: losing them must not force the loud fallback.
+ESSENTIAL = ("gpu_w", "cpu_c", "board_c", "cpu_rpm", "gpu_rpm", "mid_rpm")
+# A reading counts as failed only after this many consecutive missing samples (2 s each). A single
+# gap at start-up or a momentary NVML error would otherwise jump to the fallback and, through the
+# 60 s hold and 5-point steps, keep the fans loud for about six minutes.
+MISSING_LIMIT = 3
 
 
 def atomic_write(path, text, mode=0o600, owner=None):
@@ -113,6 +120,14 @@ def config(installed=False):
         number(cfg[k], 0.001, 86400)
     if type(cfg["log_csv"]) != bool:
         raise ValueError("log_csv must be a boolean")
+    user = cfg.get("control_user")
+    if user is not None:
+        if not isinstance(user, str):
+            raise ValueError("control_user must be a user name or null")
+        try:
+            pwd.getpwnam(user)
+        except KeyError:
+            raise ValueError(f"control_user {user!r} does not exist") from None
     last = -1
     for row in cfg["table"]:
         threshold = number(row["min_gpu_w"], 0, 1000)
@@ -130,6 +145,26 @@ def parse_mode(raw):
     if mode not in MODES:
         raise ValueError("unknown or malformed mode")
     return mode
+
+
+class Gaps:
+    """Track consecutive missing essential readings and briefly hold the last GPU power."""
+    def __init__(self):
+        self.missing = dict.fromkeys(ESSENTIAL, 0)
+        self.last_gpu = None
+
+    def update(self, values):
+        for key in ESSENTIAL:
+            # Keys a caller does not provide are not counted as missing.
+            if key in values:
+                self.missing[key] = self.missing[key] + 1 if values[key] is None else 0
+        gpu = values.get("gpu_w")
+        if gpu is not None:
+            self.last_gpu = gpu
+        elif self.missing["gpu_w"] < MISSING_LIMIT:
+            gpu = self.last_gpu
+        degraded = any(count >= MISSING_LIMIT for count in self.missing.values())
+        return gpu, degraded
 
 
 def read_mode(path):
@@ -384,6 +419,7 @@ def run_service(dry, duration):
         signal.signal(sig, lambda *_: stop.set())
     usbmon = UsbMonitor(stop)
     samples = SampleCsv() if cfg["log_csv"] and not dry else None
+    gaps = Gaps()
     events = deque(maxlen=12)
     mode, last_mode_error = "auto", None
     last_profile = last_problems = last_decision = None
@@ -429,10 +465,13 @@ def run_service(dry, duration):
                 event(", ".join(problems) if problems else "all sensors available")
                 last_problems = problems
             before = policy.margins.copy()
+            gpu, degraded = gaps.update(values)
             floors, boost = policy.step(
-                now, values["gpu_w"], values["cpu_w"], active=usb["audio_active"],
-                traffic=bool(usb["devices"]), drops=sum(d["skipped"] for d in usb["devices"]),
-                degraded=bool(problems), mode=mode, performance=profile == "performance")
+                now, gpu, values["cpu_w"], active=usb["audio_active"],
+                traffic=bool(usb["devices"]),
+                # Skips in a stream's first second are start-up artefacts, not chipset stalls.
+                drops=sum(d["skipped"] - d.get("warmup_skipped", 0) for d in usb["devices"]),
+                degraded=degraded, mode=mode, performance=profile == "performance")
             if boost:
                 event(boost)
             if before != policy.margins:
@@ -467,7 +506,7 @@ def run_service(dry, duration):
                 last_decision = decision
             status = dict(version=VERSION, t=timestamp, elapsed_s=round(now-start, 2),
                           dry_run=dry, mode=mode, invalid_mode=last_mode_error is not None,
-                          sensors=values, unavailable=problems, heat_w=rounded(policy.heat),
+                          sensors=values, unavailable=problems, degraded=degraded, heat_w=rounded(policy.heat),
                           smoothed_gpu_w=rounded(policy.gpu), floors=dict(zip(FANS, floors)),
                           applied=applied, manual_control=manual_control, margins=policy.margins, usb=usb, events=list(events))
             if dry:

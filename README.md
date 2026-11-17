@@ -265,8 +265,12 @@ Click counting in recordings (mono 16-bit 48 kHz WAV, high-passed at 17.5 kHz fi
 `rog-fand` samples the G814JZ every two seconds. In Performance, smoothed GPU watts select
 minimum CPU/GPU/middle fan levels. Each point keeps the higher of the calibrated balanced PWM
 and the requested floor. Two consecutive USB drop samples trigger a boost and raise the margin
-for that power range. Status reports missing sensors and the conservative floor is at least
-60/60/80 while a sensor is unavailable.
+for that power range. Status reports missing sensors. The conservative floor of at least 60/60/80 applies only when
+GPU power, a temperature or a fan speed has been missing for three consecutive samples (6 s);
+a single gap holds the last GPU reading. CPU power (RAPL) and usbmon are reported when missing
+but never force the fallback, because they only feed the heat display and the feedback.
+USB skips in the first second of a stream (after 2 s without traffic) are reported as
+`warmup_skipped` and do not count as drops.
 
 ```sh
 python3 -IB service/rog_fand.py --replay data/logs/10-fan-calibration-light.csv
@@ -291,6 +295,14 @@ Set `log_csv` to true for per-minute sample files in `/var/log/rog-fand/`.
 restores its base, and removes the installation, learned margins and sample logs. If a profile
 switch interrupts restoration, the service saves the exact base in `/var/lib/rog-fand/restore.json`.
 Return to Performance for recovery on the next service run, or repeat undo there.
+
+Things to know once it is installed:
+- In `auto` and the presets, the Performance curve is the configured base (in
+  `/etc/rog-fand/config.json`) raised to the floors. Curve edits made elsewhere only stay while the
+  mode is `off`.
+- `/run` is cleared at boot, so the mode starts as `auto` after every reboot.
+- Install with `sudo` or `pkexec`; the installer takes the desktop user from either. Without one,
+  the mode can only be changed by root.
 
 ## Settings panel
 
