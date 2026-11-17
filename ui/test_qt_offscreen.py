@@ -11,15 +11,17 @@ import json
 from datetime import datetime, timezone
 
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
+OUT = tempfile.mkdtemp(prefix="rog-qt-offscreen-")
+os.environ["XDG_CONFIG_HOME"] = os.path.join(OUT, "config")   # tray settings and start at login
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import rogcore as core  # noqa: E402
+import fan_tray  # noqa: E402
 from PySide6.QtCore import Qt, QPoint, QTimer, QSaveFile, QIODevice  # noqa: E402
-from PySide6.QtGui import QGuiApplication  # noqa: E402
+from PySide6.QtGui import QGuiApplication, QIcon  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication, QPushButton  # noqa: E402
 
-OUT = tempfile.mkdtemp(prefix="rog-qt-offscreen-")
 core.PRESET_FILE = os.path.join(OUT, "custom-presets.json")
 core.FAND_RUN = Path(OUT) / "run"
 core.FAND_UNIT = Path(OUT) / "rog-fand.service"
@@ -170,6 +172,137 @@ def service_tabs(w, q):
     core.FAND_UNIT.unlink()
 
 
+def fand_sample(**changes):
+    now = datetime.now(timezone.utc)
+    s = dict(version=1, t=now.isoformat(), elapsed_s=100.0, dry_run=False, mode="auto", applied=True,
+             invalid_mode=False, degraded=False,
+             sensors=dict(profile="performance", cpu_rpm=4000, gpu_rpm=4200, mid_rpm=5000,
+                          cpu_w=40, gpu_w=120, board_c=70),
+             floors=dict(cpu=60, gpu=60, mid=75), heat_w=160, smoothed_gpu_w=118, unavailable=[],
+             margins={"0": 0, "50": 0, "110": 0, "140": 0},
+             usb=dict(audio_active=True, error=None,
+                      devices=[dict(name="USB interface", packets=16000, skipped=0, warmup_skipped=0,
+                                    drops_per_s=0.0)]),
+             events=[])
+    s.update(changes)
+    return s
+
+
+def tray_model_tests():
+    m = fan_tray
+    wall = time.time()
+    s = fand_sample()
+    check(m.classify("Running", s, wall, None)[0] == "green", "tray: clean automatic control is green")
+    check(m.classify("Running", s, wall, wall - 30)[0] == "yellow"
+          and m.classify("Running", s, wall, wall - 600)[0] == "green", "tray: yellow only while a boost ramps down")
+    check(m.classify("Running", fand_sample(degraded=True), wall, None)[0] == "orange", "tray: sensor fallback is orange")
+    check(all(m.classify(x, None, wall, None)[0] == "red" for x in ("Stopped", "Stale", "Unreadable")),
+          "tray: stopped, stale or unreadable service is red")
+    check(m.classify("Not installed", None, wall, None)[0] == "white", "tray: not installed is white")
+    check(all(m.classify("Running", fand_sample(mode=x), wall, None)[0] == "blue" for x in ("off", "preset:heavy"))
+          and m.classify("Running", fand_sample(sensors=dict(s["sensors"], profile="quiet")), wall, None)[0] == "blue",
+          "tray: Off, a preset and other profiles are blue")
+    warm = dict(name="USB interface", packets=16000, skipped=10, warmup_skipped=10, drops_per_s=5.0)
+    real = dict(name="USB interface", packets=16000, skipped=20, warmup_skipped=10, drops_per_s=10.0)
+    check(m.usb_drops(fand_sample(usb=dict(audio_active=True, error=None, devices=[warm]))) == 0
+          and m.usb_drops(fand_sample(usb=dict(audio_active=True, error=None, devices=[real]))) == 5,
+          "tray: stream start-up skips are not drops")
+    check(m.classify("Running", fand_sample(usb=dict(audio_active=True, error=None, devices=[real])), wall, None)
+          == ("red", "USB audio dropping 5 packets/s"), "tray: live drops are red")
+
+    model = m.TrayModel()
+    stamp = lambda t: datetime.fromtimestamp(t, timezone.utc).isoformat()
+    kinds = lambda due: [k for k, _, _ in due]
+    old = [dict(t=stamp(wall - 100), message="USB drop boost")]
+    check(model.observe("Running", fand_sample(events=old), wall, 1000) == [] and model.last_boost is not None,
+          "notify: nothing for the state found at start")
+    new = old + [dict(t=stamp(wall), message="USB drop boost")]
+    due = model.observe("Running", fand_sample(events=new, usb=dict(audio_active=True, error=None, devices=[real])),
+                        wall, 1002)
+    check(kinds(due) == ["boost"] and "5 packets/s" in due[0][2], "notify: a new boost names the drop rate")
+    newer = new + [dict(t=stamp(wall + 60), message="USB drop boost")]
+    check(model.observe("Running", fand_sample(events=newer), wall, 1060) == [], "notify: boosts rate limited")
+    check(model.observe("Stale", None, wall, 1062) == [], "notify: one stale poll is ignored")
+    check(kinds(model.observe("Stale", None, wall, 1064)) == ["service-down"], "notify: service down after two polls")
+    check(kinds(model.observe("Running", fand_sample(events=newer), wall, 1066)) == ["service-up"],
+          "notify: service running again")
+    due = model.observe("Running", fand_sample(events=newer, elapsed_s=4.0, mode="auto"), wall, 1500)
+    check(kinds(due) == ["service-up"] and "restarted" in due[0][2], "notify: restart noticed from elapsed time")
+    due = model.observe("Running", fand_sample(degraded=True, unavailable=["gpu_w unavailable"]), wall, 1502)
+    check(kinds(due) == ["fallback"] and "gpu_w" in due[0][2], "notify: sensor fallback names the sensor")
+    check(kinds(model.observe("Running", fand_sample(), wall, 1504)) == ["fallback-end"], "notify: fallback ended")
+    check(model.observe("Running", fand_sample(mode="off"), wall, 1506, ("off", 1500)) == [],
+          "notify: no notice for the panel's own mode change")
+    check(kinds(model.observe("Running", fand_sample(mode="preset:max"), wall, 1508, ("off", 1500))) == ["mode"],
+          "notify: mode changed elsewhere")
+
+    check(m.exec_arg("/usr/bin/python3") == "/usr/bin/python3", "exec: plain path unquoted")
+    check(m.exec_arg("/home/u/ROG Audio/ui/rog-panel-qt.py") == '"/home/u/ROG Audio/ui/rog-panel-qt.py"',
+          "exec: spaces quoted")
+    # Quoting escapes \ " ` $ with a backslash; string escaping then doubles every backslash.
+    check(m.exec_arg('/a b/$x"`\\%') == '"/a b/\\\\$x\\\\"\\\\`\\\\\\\\%%"', "exec: reserved characters escaped")
+    path = m.autostart_path()
+    check(str(path).startswith(OUT) and not m.autostart_enabled(), "autostart: isolated and off by default")
+    m.set_autostart(True)
+    text = path.read_text()
+    check(m.autostart_enabled() and "--tray" in text and m.exec_arg(str(m.PANEL)) in text
+          and oct(path.stat().st_mode & 0o777) == "0o644", "autostart: entry written atomically")
+    m.set_autostart(False)
+    check(not path.exists(), "autostart: entry removed")
+    path.write_text("[Desktop Entry]\nExec=something-else\n")
+    m.set_autostart(False)
+    check(path.exists(), "autostart: never removes an entry it did not write")
+    path.unlink()
+
+
+def tray_tests(w):
+    tray_model_tests()
+    hicolor = Path("/usr/share/icons/hicolor/512x512/apps/asus_notif_green.png").exists()
+    QIcon.setThemeSearchPaths(["/usr/share/icons"])   # offscreen has no icon theme; a desktop sets these
+    QIcon.setThemeName("hicolor")
+    tray = w.enable_tray()
+    shown = []
+    tray.notify_act.setChecked(True)
+    tray.notify = lambda title, text: shown.append((title, text))
+    check(not tray.icon("green").isNull(), "tray: icon available (%s)" %
+          ("ROG logo from asusctl" if hicolor else "fallback icon"))
+    status = core.FAND_RUN / "status.json"
+    publish(status, json.dumps(fand_sample()))
+    tray.poll()
+    check(tray.colour == "green" and "Floors 60 / 60 / 75" in tray.tray.toolTip(), "tray: live status and tooltip")
+    tray.update_menu()
+    check(not tray.mode_menu.isEnabled(), "tray: dry run cannot change mode")
+    w.dry_run = False   # the control directory is the test fixture
+    tray.update_menu()
+    check(tray.mode_menu.isEnabled() and tray.mode_acts["auto"].isChecked(), "tray: mode menu follows the service")
+    tray.mode_acts["preset:heavy"].trigger()
+    check((core.FAND_RUN / "control" / "mode").read_text() == "preset:heavy\n", "tray: mode request published")
+    publish(status, json.dumps(fand_sample(mode="preset:heavy")))
+    tray.poll()
+    check(tray.colour == "blue" and not shown, "tray: own mode change without a notification")
+    publish(status, json.dumps(fand_sample(mode="auto")))
+    w.dry_run = True
+    tray.toggle_monitor()
+    check(w.mon_proc is None and shown and shown[-1][0] == "Stall monitor not started", "tray: dry-run monitor refused")
+    w.show()
+    pump(100)
+    check(w.timer.isActive() and w.auto_tab.timer.isActive(), "window: status timers run while shown")
+    tray.keep_act.setChecked(True)
+    w.close()
+    pump(100)
+    check(not w.isVisible() and not w.quitting and not w.timer.isActive() and not w.auto_tab.timer.isActive()
+          and tray.timer.isActive(), "window: close hides to the tray and pauses the window's timers")
+    check(shown[-1][0] == "Still running in the tray", "window: hiding to the tray is announced")
+    tray.toggle_panel()
+    pump(100)
+    check(w.isVisible() and w.timer.isActive(), "tray: click reopens the window")
+    quits = []
+    with patch.object(QApplication, "quit", side_effect=lambda: quits.append(1)):
+        tray.menu.actions()[-1].trigger()
+    check(quits and w.quitting and not tray.timer.isActive() and not w.isVisible(), "tray: Quit shuts down and quits")
+    status.unlink()
+
+
 def main():
     app = QApplication([])
     check(QGuiApplication.platformName() == "offscreen", "platform is offscreen")
@@ -311,6 +444,7 @@ def main():
     if not existed and os.path.exists(core.PRESET_FILE) and not core.load_custom_presets():
         os.remove(core.PRESET_FILE)
     check(q.run_one("fan-preset", {"preset": "nope"}, True).get("ok") is False, "bad preset rejected")
+    tray_tests(w)
     return finish(w)
 
 

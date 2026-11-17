@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import rogcore as core  # noqa: E402
 from fan_auto import AutoTab, heading
 from fan_calibration import CalibrateTab
+from fan_tray import FanTray
 
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, Qt, Signal, QPointF, QRectF  # noqa: E402
 from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPen, QPolygonF  # noqa: E402
@@ -21,7 +22,7 @@ from PySide6.QtNetwork import QLocalServer, QLocalSocket  # noqa: E402
 from PySide6.QtWidgets import (  # noqa: E402
     QApplication, QComboBox, QFormLayout, QFrame, QGridLayout, QGroupBox, QHBoxLayout, QLabel,
     QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QHeaderView, QSpinBox,
-    QTabWidget, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget, QSizePolicy)
+    QSystemTrayIcon, QTabWidget, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget, QSizePolicy)
 
 FAN_LABELS = (("cpu", "CPU"), ("gpu", "GPU"), ("mid", "Middle"))
 TMIN, TMAX = 30, 100
@@ -358,6 +359,8 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("ROG Settings Panel")
         self.setWindowIcon(QIcon.fromTheme("preferences-system"))
         self.jobs = set()
+        self.tray = None
+        self.quitting = False
         self.refreshing = False
         self.acting = False
         self.action_buttons = []
@@ -402,6 +405,7 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         root.addWidget(self.tabs, 1)
         self.auto_tab = AutoTab(dry_run)
+        self.auto_tab.timer.stop()   # status timers run only while the window is shown
         self.cal_tab = CalibrateTab(dry_run, lambda: self.acting)
         self.close_after_calibration = False
         self.cal_tab.runningChanged.connect(self.calibration_changed)
@@ -442,8 +446,26 @@ class MainWindow(QMainWindow):
         self.timer = QTimer(self)
         self.timer.setInterval(2000)
         self.timer.timeout.connect(self.refresh)
-        self.timer.start()
         QTimer.singleShot(0, self.refresh)
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        if not self.timer.isActive():
+            self.timer.start()
+            self.auto_tab.timer.start()
+            self.auto_tab.refresh()
+            QTimer.singleShot(0, self.refresh)
+
+    def hideEvent(self, e):
+        super().hideEvent(e)
+        # Hidden in the tray, only the tray's light service poll keeps running.
+        self.timer.stop()
+        self.auto_tab.timer.stop()
+
+    def enable_tray(self):
+        if self.tray is None:
+            self.tray = FanTray(self)
+        return self.tray
 
     @staticmethod
     def _scroll(w):
@@ -752,6 +774,7 @@ class MainWindow(QMainWindow):
             return
         self.mon_rate = core.StallRate()
         self.mon_samples.clear()
+        self.mon_btn.setChecked(True)   # also when started from the tray
         self.mon_btn.setText("Stop monitor")
         self.mon_msg.setText("Running (aplay pid %d)." % self.mon_proc.pid)
         self.mon_timer.start()
@@ -837,17 +860,34 @@ class MainWindow(QMainWindow):
         self.auto_tab.calibrating = running
         self.auto_tab.refresh()
         if not running and self.close_after_calibration:
-            QTimer.singleShot(0, self.close)
+            QTimer.singleShot(0, self.quit_app)
 
     def closeEvent(self, e):
+        if self.tray is not None and self.tray.keep_running() and not self.quitting:
+            e.ignore()
+            self.hide()
+            self.tray.hidden_notice()
+            return
+        # Accept when quitting, so a session logout is never refused.
+        e.setAccepted(self.quit_app())
+
+    def quit_app(self):
+        """Quit now, or after a running calibration has restored the exact curve (returns False then)."""
+        self.quitting = True
         if self.cal_tab.process:
             self.close_after_calibration = True
             self.cal_tab.stop()
-            e.ignore()
-            return
+            return False
+        self.shutdown()
+        self.hide()
+        QApplication.quit()
+        return True
+
+    def shutdown(self):
         self.auto_tab.shutdown()
         self.monitor_stop("Stopped.")
-        super().closeEvent(e)
+        if self.tray is not None:
+            self.tray.remove()
 
     # ---- refresh ----
     def refresh(self):
@@ -1188,15 +1228,20 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--dry-run", action="store_true", help="show the commands instead of running them")
     ap.add_argument("--no-single-instance", action="store_true")
+    ap.add_argument("--tray", action="store_true", help="start hidden in the system tray (used at login)")
+    ap.add_argument("--no-tray", action="store_true", help="no tray icon; closing the window quits")
     a = ap.parse_args()
     app = QApplication(sys.argv[:1])
     app.setApplicationName("ROG Settings Panel")
     app.setDesktopFileName("rog-panel-qt")
+    app.setQuitOnLastWindowClosed(False)   # quit_app() quits; the window may live in the tray
     server = None
     if not a.no_single_instance:
         sock = QLocalSocket()
         sock.connectToServer(server_name())
         if sock.waitForConnected(300):
+            if a.tray:               # started at login while already running: stay out of the way
+                return 0
             sock.write(b"raise\n")
             sock.waitForBytesWritten(300)
             print("ROG Settings Panel is already running; raised it.", flush=True)
@@ -1206,9 +1251,11 @@ def main():
         server.listen(server_name())
     win = MainWindow(dry_run=a.dry_run)
     atexit.register(lambda: win.mon_proc is not None and win.mon_proc.poll() is None and win.mon_proc.kill())
-    app.aboutToQuit.connect(lambda: win.monitor_stop("Stopped."))
+    app.aboutToQuit.connect(win.shutdown)
+    # At logout, close requests must quit instead of hiding to the tray.
+    app.commitDataRequest.connect(lambda _manager: setattr(win, "quitting", True))
     for sg in (signal.SIGINT, signal.SIGTERM):
-        signal.signal(sg, lambda *_: win.close())
+        signal.signal(sg, lambda *_: win.quit_app())
     sigtimer = QTimer()          # lets Python run the signal handlers while Qt's loop is busy
     sigtimer.timeout.connect(lambda: None)
     sigtimer.start(300)
@@ -1221,7 +1268,19 @@ def main():
             win.raise_()
             win.activateWindow()
         server.newConnection.connect(on_conn)
-    win.show()
+    tries = [0]
+
+    def place():
+        if not a.no_tray and QSystemTrayIcon.isSystemTrayAvailable():
+            win.enable_tray()
+            if not a.tray:
+                win.show()
+        elif a.tray and not a.no_tray and tries[0] < 30:
+            tries[0] += 1            # at login the panel can start before the tray host
+            QTimer.singleShot(1000, place)
+        else:
+            win.show()
+    place()
     return app.exec()
 
 

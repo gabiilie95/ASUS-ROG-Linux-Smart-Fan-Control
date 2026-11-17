@@ -330,8 +330,35 @@ controller read-only in your desktop session and works before installation.
 Observe measures stalls using the internal sound device. For a stepped run, select Performance
 and set Auto to **Off · base curve** first. The calibration tool holds control through restoration
 of the saved Performance curves and their enable flags. You can cancel a run, inspect per-step
-mean and peak stalls, and export the complete or partial sample CSV. Closing the panel during a
-run waits for cleanup. In panel dry-run mode, the start button previews the command.
+mean and peak stalls, and export the complete or partial sample CSV. Quitting the panel during a
+run waits for cleanup; closing the window only hides it to the tray. In panel dry-run mode, the start button previews the command.
+
+**Tray icon** (`ui/fan_tray.py`). The panel puts the ROG logo that asusctl installs in the
+system tray. The logo is loaded by icon name and not copied here. Its colour shows the service
+state:
+
+| Colour | Meaning |
+|---|---|
+| Green | Automatic control, no drops |
+| Yellow | Fans boosted after USB drops, or ramping back down (about 4 minutes) |
+| Orange | Sensor fallback: a sensor is missing and the fans are held at safe floors |
+| Red | USB audio dropping packets now (start-up skips excluded), or the service stopped, stale or unreadable |
+| Blue | Off, a manual preset, calibration in control, or a profile other than Performance |
+| White | Service not installed or state unknown |
+
+- **Tooltip:** floors, GPU power, board temperature and USB drops, plus the stall monitor's rate while it runs.
+- **Menu:** open or hide the panel, fan mode, start or stop the stall monitor, and three settings:
+  keep running in the tray when closed (on by default), notifications (on), and start in the tray
+  at login (off; writes `~/.config/autostart/rog-panel-qt.desktop`).
+- **Notifications:** each kind at most once per 5 minutes, for:
+  - a USB drop boost, with the drop rate;
+  - the service stopped, stale or unreadable for two polls in a row, running again, or restarted;
+  - the sensor fallback starting or ending;
+  - a mode change made outside this panel.
+- **Background:** closing the window hides it to the tray. While hidden, only a 2 s read of
+  `/run/rog-fand/status.json` keeps running. Use **Quit** in the tray menu to exit. If the stall
+  monitor is running, hiding the window says so, because the monitor keeps the internal speakers
+  in use. `--tray` starts hidden (used at login); `--no-tray` restores the old behaviour.
 
 Native version (PySide6, launched as the desktop user):
 

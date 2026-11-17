@@ -7,7 +7,7 @@ etc=/etc/rog-fand
 state=/var/lib/rog-fand
 unit=/etc/systemd/system/rog-fand.service
 launcher=/usr/local/share/applications/rog-panel-qt.desktop
-panel_files=(ui/{rog-panel-qt,rogcore,fan_auto,fan_calibration}.py
+panel_files=(ui/{rog-panel-qt,rogcore,fan_auto,fan_calibration,fan_tray}.py
              tools/{fan-calibrate,stall-counter}.py tools/fans-{balanced,max,mid-max,original,ramped}.sh
              tools/jellyfin-software-ui.sh root-tests/{setup-cool-performance,usb-drop-count}.sh)
 tmp=
@@ -32,6 +32,12 @@ case "${1:-}" in
             echo "Run install or undo as root." >&2
             exit 1
         fi
+        desk_user=${SUDO_USER:-}
+        if [[ -z $desk_user && ${PKEXEC_UID:-} =~ ^[0-9]+$ ]]; then
+            desk_user=$(getent passwd "$PKEXEC_UID" | cut -d: -f1)
+        fi
+        desk_home=
+        if [[ -n $desk_user ]]; then desk_home=$(getent passwd "$desk_user" | cut -d: -f6); fi
         if [[ $1 == install ]]; then
             install -d -o root -g root -m 0755 -- "$app" "$etc"
             install -d -o root -g root -m 0700 -- "$state"
@@ -42,16 +48,9 @@ case "${1:-}" in
             done
             copy_atomic "$src/../ui/rog-panel-qt.desktop" "$launcher"
             # A per-user launcher with the same name takes priority over this one in the menu.
-            desk_user=${SUDO_USER:-}
-            if [[ -z $desk_user && ${PKEXEC_UID:-} =~ ^[0-9]+$ ]]; then
-                desk_user=$(getent passwd "$PKEXEC_UID" | cut -d: -f1)
-            fi
-            if [[ -n $desk_user ]]; then
-                desk_home=$(getent passwd "$desk_user" | cut -d: -f6)
-                if [[ -n $desk_home && -e $desk_home/.local/share/applications/rog-panel-qt.desktop ]]; then
-                    echo "note: $desk_home/.local/share/applications/rog-panel-qt.desktop hides the installed" \
-                         "launcher in the menu; remove it to use the installed panel." >&2
-                fi
+            if [[ -n $desk_home && -e $desk_home/.local/share/applications/rog-panel-qt.desktop ]]; then
+                echo "note: $desk_home/.local/share/applications/rog-panel-qt.desktop hides the installed" \
+                     "launcher in the menu; remove it to use the installed panel." >&2
             fi
             for file in rog_fand.py rog_sensors.py config.example.json; do
                 copy_atomic "$src/$file" "$app/$file"
@@ -96,6 +95,10 @@ PY
             rm -f -- "$etc/config.json" "$etc/model.json" "$state/state.json"
             rm -f -- /var/log/rog-fand/*.csv /run/rog-fand/mode /run/rog-fand/status.json
             rm -f -- /run/rog-fand/control/mode
+            if [[ -n $desk_home && -e $desk_home/.config/autostart/rog-panel-qt.desktop ]]; then
+                echo "note: the panel still starts at login from $desk_home/.config/autostart/rog-panel-qt.desktop;" \
+                     "remove it, or untick Start in the tray at login first." >&2
+            fi
             for dir in "$app"/{ui,tools,root-tests} "$app" "$etc" "$state" /var/log/rog-fand /run/rog-fand/control /run/rog-fand; do
                 if [[ -d $dir ]]; then rmdir -- "$dir"; fi
             done
