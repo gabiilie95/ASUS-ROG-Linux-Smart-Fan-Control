@@ -374,7 +374,9 @@ restores its base, and removes the installation, learned margins and sample logs
 switch interrupts restoration, the receipt stays in `/var/lib/rog-fand/` (`restore.json` for
 Performance, `restore-<profile>.json` for the others). A profile's curves can only be written while it
 is active, so return to the profile that `--restore` or undo names, and the next service run (or a
-repeated undo) finishes the restoration.
+repeated undo) finishes the restoration. Systemd stop-post cleanup logs deferred profiles and
+keeps their receipts without marking the unit failed. Actual restore errors still fail cleanup,
+and manual `--restore` and undo require every pending profile to be restored.
 
 Things to know once it is installed:
 - In `auto` and the presets, the Performance curve is the configured base (in

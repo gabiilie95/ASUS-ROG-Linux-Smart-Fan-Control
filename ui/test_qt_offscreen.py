@@ -348,7 +348,9 @@ def tray_model_tests():
     path.unlink()
 
 
-def update_tests(w, tray, shown):
+# Update UI scenarios use a simulated installed updater, independent of host ownership mappings.
+@patch.object(core, "updater_installed", return_value=True)
+def update_tests(w, tray, shown, _installed):
     up = w.updater
     class Fake:
         def __init__(self, tag, installed, fail=None):

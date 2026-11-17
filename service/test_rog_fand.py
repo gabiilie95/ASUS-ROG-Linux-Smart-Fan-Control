@@ -316,6 +316,32 @@ class LifecycleTest(unittest.TestCase):
         self.assertTrue(fand.Actuator().restore())
         self.assertEqual(self.command.call_count, 5)
 
+    def test_stop_post_defers_inactive_profile_but_manual_restore_requires_it(self):
+        fand.atomic_write(self.actuator.receipt, json.dumps(BASE))
+        self.profile.return_value = "balanced"
+        with patch.object(fand.os, "geteuid", return_value=0), contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(fand.main(["--restore-on-stop"]), 0)
+            self.assertEqual(fand.main(["--restore"]), 1)
+            self.assertIn("restore pending for performance", err.getvalue())
+            self.assertEqual(fand.read_json(self.actuator.receipt), BASE)
+            self.command.assert_not_called()
+            self.profile.return_value = "performance"
+            self.assertEqual(fand.main(["--restore-on-stop"]), 0)
+        self.assertFalse(self.actuator.receipt.exists())
+        self.assertEqual(self.command.call_count, 4)
+
+    def test_stop_post_keeps_command_failure_and_invalid_receipt_visible(self):
+        fand.atomic_write(self.actuator.receipt, json.dumps(BASE))
+        self.command.side_effect = OSError("asusd unavailable")
+        with patch.object(fand.os, "geteuid", return_value=0):
+            with self.assertRaisesRegex(RuntimeError, "base restore incomplete"):
+                fand.main(["--restore-on-stop"])
+            self.assertTrue(self.actuator.receipt.exists())
+            fand.atomic_write(self.actuator.receipt, "{")
+            with self.assertRaises(ValueError):
+                fand.main(["--restore-on-stop"])
+        self.assertTrue(self.actuator.receipt.exists())
+
     def test_no_duplicate_writes_and_off(self):
         self.actuator.apply(BASE, (80, 80, 80))
         self.actuator.apply(BASE, (80, 80, 80))
