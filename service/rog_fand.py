@@ -340,15 +340,31 @@ class SampleCsv:
 def init_mode(cfg):
     user = cfg["control_user"]
     owner = pwd.getpwnam(user) if user else None
-    # Preserve a validated choice across systemd restarts, including an explicit off.
-    path = RUN / "mode"
+    # Only the control directory is replaceable by the desktop user. Status stays root-owned.
+    public = RUN / "mode"
+    directory = RUN / "control"
+    directory.mkdir(mode=0o700, exist_ok=True)
+    path = directory / "mode"
+    old = public if not public.is_symlink() and public.exists() else path
     mode = "auto"
     try:
-        if path.lstat().st_uid == (owner.pw_uid if owner else 0):
-            mode = read_mode(path)
+        if old.lstat().st_uid == (owner.pw_uid if owner else 0):
+            mode = read_mode(old)
     except (OSError, ValueError):
         pass
-    atomic_write(path, mode + "\n", 0o644, owner)
+    # Stage privileged writes under the root-owned parent, never inside the user directory.
+    with tempfile.TemporaryDirectory(dir=RUN) as staging:
+        tmp = Path(staging) / "mode"
+        atomic_write(tmp, mode + "\n", 0o644, owner)
+        os.replace(tmp, path)
+        tmp.symlink_to("control/mode")
+        os.replace(tmp, public)
+    os.chmod(directory, 0o700)
+    if owner:
+        os.chown(directory, owner.pw_uid, owner.pw_gid)
+    elif os.geteuid() == 0:
+        os.chown(directory, 0, 0)
+    return path
 
 
 def run_service(dry, duration):
@@ -360,7 +376,7 @@ def run_service(dry, duration):
             saved = read_json(STATE / "state.json")["margins"]
         except FileNotFoundError:
             pass
-        init_mode(cfg)
+        mode_path = init_mode(cfg)
     policy = Policy(cfg, saved)
     sensors = Sensors()
     stop = threading.Event()
@@ -392,9 +408,12 @@ def run_service(dry, duration):
                 last_profile = profile
             if not dry:
                 try:
-                    selected = read_mode(RUN / "mode")
+                    selected = read_mode(mode_path)
                     last_mode_error = None
                     if mode != selected:
+                        if mode == "off":
+                            # A manual editor may have changed any point while control was released.
+                            actuator.last = None
                         event(f"mode: {selected}")
                     mode = selected
                 except (OSError, ValueError) as exc:
@@ -420,17 +439,28 @@ def run_service(dry, duration):
                 event(f"GPU-bin margins: {policy.margins}")
                 if not dry:
                     atomic_write(STATE / "state.json", json.dumps({"margins": policy.margins}))
-            applied = False
+            applied = manual_control = False
             if actuator:
                 if profile != "performance":
                     actuator.last = None
                     needs_recovery = actuator.receipt.exists()
                 else:
-                    if needs_recovery:
-                        needs_recovery = not actuator.restore()
-                    if not needs_recovery:
-                        applied = actuator.apply(cfg["base_curve"], floors)
-                        needs_recovery = not applied
+                    # A desktop calibration takes this lease only after Off is acknowledged.
+                    # It holds the lease through exact-curve restoration on finish or cancel.
+                    lock = os.open(mode_path.parent, os.O_DIRECTORY)
+                    try:
+                        try:
+                            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        except BlockingIOError:
+                            manual_control = True
+                        else:
+                            if needs_recovery:
+                                needs_recovery = not actuator.restore()
+                            if not needs_recovery:
+                                applied = actuator.apply(cfg["base_curve"], floors)
+                                needs_recovery = not applied
+                    finally:
+                        os.close(lock)
             decision = floors if profile == "performance" else None
             if decision != last_decision:
                 event(f"{'planned' if dry else 'requested'} floors (% cpu/gpu/mid): {decision}")
@@ -439,7 +469,7 @@ def run_service(dry, duration):
                           dry_run=dry, mode=mode, invalid_mode=last_mode_error is not None,
                           sensors=values, unavailable=problems, heat_w=rounded(policy.heat),
                           smoothed_gpu_w=rounded(policy.gpu), floors=dict(zip(FANS, floors)),
-                          applied=applied, margins=policy.margins, usb=usb, events=list(events))
+                          applied=applied, manual_control=manual_control, margins=policy.margins, usb=usb, events=list(events))
             if dry:
                 print(json.dumps(status), flush=True)
             else:
