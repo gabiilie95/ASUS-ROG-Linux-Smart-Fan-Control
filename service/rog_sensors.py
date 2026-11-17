@@ -136,8 +136,9 @@ def parse_usbmon(line):
             return None
         bad = []
         for i in range(min(nd, 5)):
-            status, _, length = map(int, parts[6+i].split(":"))
-            bad.append(status == -18 and length == 0)
+            status, _, _length = map(int, parts[6 + i].split(":"))
+            # Match usb-drop-count.sh: EXDEV can retain a nonzero descriptor length.
+            bad.append(status != 0)
         skipped = sum(bad) + (nd - len(bad) if bad[-1] else 0)
         return (bus, dev), ts, nd, skipped
     except (IndexError, ValueError):

@@ -22,6 +22,7 @@ import time
 
 # systemd runs Python in isolated mode. Import only from the installed sibling directory.
 HERE = Path(__file__).resolve().parent
+sys.dont_write_bytecode = True
 sys.path.insert(0, str(HERE))
 from rog_sensors import FANS, PROFILE, Sensors, UsbMonitor, read
 
@@ -339,8 +340,15 @@ class SampleCsv:
 def init_mode(cfg):
     user = cfg["control_user"]
     owner = pwd.getpwnam(user) if user else None
-    # The directory stays root-owned. Only this bounded, non-executable file is user-writable.
-    atomic_write(RUN / "mode", "auto\n", 0o644, owner)
+    # Preserve a validated choice across systemd restarts, including an explicit off.
+    path = RUN / "mode"
+    mode = "auto"
+    try:
+        if path.lstat().st_uid == (owner.pw_uid if owner else 0):
+            mode = read_mode(path)
+    except (OSError, ValueError):
+        pass
+    atomic_write(path, mode + "\n", 0o644, owner)
 
 
 def run_service(dry, duration):
