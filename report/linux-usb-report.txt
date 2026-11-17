@@ -1,0 +1,105 @@
+To: linux-usb@vger.kernel.org
+Cc: Mathias Nyman <mathias.nyman@intel.com>, linux-sound@vger.kernel.org
+Subject: xhci 8086:7a60 (HM770) skips ~9.5% of isoc OUT packets when hot; HDA on same PCH underruns in step
+
+Hi,
+
+On an ASUS ROG Strix G18 (G814JZ, i9-13980HX, Intel HM770) the PCH xHCI
+controller skips a large share of isochronous OUT packets to a USB audio
+interface whenever the chassis is hot, which is audible as crackle. The
+HD-audio controller on the same PCH reports FIFO errors at the same rate
+at the same time. Both go to zero within about a minute when the fans are
+run faster, with the load unchanged. I would like to know whether this is
+a known behaviour of this PCH, and whether the xhci driver could deliver
+late instead of skipping in this situation.
+
+Hardware and software
+---------------------
+  xHCI      0000:00:14.0 [8086:7a60], subsystem 1043:201f
+            hcc params 0x20007fc1 hci version 0x120
+            quirks 0x0000000200009810
+  HD-audio  0000:00:1f.3 [8086:7a50] rev 11, snd_hda_intel
+  Device    Universal Audio Volt 2 [2b5a:0021], high speed, UAC2 async
+            with explicit feedback, 48 kHz S32_LE stereo, interval 125 us,
+            behind two USB 2 hubs (17ef:30ba -> 17ef:30b7)
+  Kernel    7.3.3-300.fc45.x86_64 (Fedora 45)
+  Taint     12288 (O, E): NVIDIA open kernel modules 620.70.06. The
+            affected controllers are both Intel PCH devices.
+  Userspace PipeWire 1.6.11; it reports zero xruns throughout.
+
+What I see
+----------
+1. usbmon, 30 s of playback while the crackle is audible:
+
+   - 239,990 isoc OUT packets on ep 1; about 22,700 (9.5 %) complete
+     with status -18 (-EXDEV) and actual length 0.
+   - They come in 2,522 separate events (84 per second), a median of 9
+     consecutive packets each, i.e. about 1.1 ms.
+   - Gaps between events: minimum 3.9 ms, median 10 ms, 90th percentile
+     22 ms. Above the 4 ms floor they look random.
+   - URB status is always 0 and the iso error_count field stays 0.
+   - Completions arrive one URB period late at each event, then two
+     arrive together, the second fully skipped. Example:
+
+     C Zo:1:012:1 0:1:14116:0 7 0:0:48 0:48:48 0:96:48 0:144:48 0:192:48 336 >
+     C Zo:1:012:1 0:1:14123:0 6 -18:0:0 -18:48:0 -18:96:0 -18:144:0 -18:192:0 288 >
+     C Zo:1:012:1 0:1:14129:0 7 -18:0:0 -18:48:0 0:96:48 0:144:48 0:192:48 336 >
+
+   The URBs are queued about 10 ms ahead (submit-to-complete latency
+   9.9 ms median), so the ring is not running dry.
+
+2. At the same time, playing silence straight to the HD-audio device
+   (aplay -D hw:0,0 /dev/zero, no sound server) produces
+
+     snd_hda_intel 0000:00:1f.3: stream 7 dma error: 0x28
+
+   about 75 times per second (counted from the controller's IRQ, since
+   the message is rate-limited). The rate does not depend on format or
+   period size. The same test on the NVIDIA HDMI audio controller
+   (01:00.1, not on the PCH) gives no errors.
+
+3. The rate follows temperature and airflow, not load:
+
+   - With GPU power constant, slowing the fans raised the HD-audio error
+     rate from about 75/s to over 90/s within 20 s.
+   - Running all fans at full speed took it from 80/s to 0 within about
+     70 s, again at constant GPU power. An ACPI board sensor (thermal
+     zone SEN3) fell from 88 C to 82 C over that time.
+   - It scaled from about 20/s at 64 C to over 100/s at 91 C on that
+     sensor with the vendor fan curve.
+
+No effect on the rate: intel_pstate max_perf_pct 55/70/100, no_turbo,
+performance vs powersave governor, uncore frequency pinned min=max,
+intel_idle.max_cstate=1, synthetic CPU / memory / NVMe load, a split-lock
+generator, and stopping all sensor polling. MSR 0x34 shows no SMIs during
+the events. Reducing CPU package thermal throttling from 98 to 17 events
+per second did not change it.
+
+Questions
+---------
+1. Is a periodic ~1 ms inability to service periodic endpoints a known
+   behaviour of the 700-series PCH when it is hot (PCH thermal
+   throttling, DMI, or something else)? Is there a way to read the PCH's
+   throttle state or temperature on this platform to confirm it?
+
+2. The controller advertises CFC (hcc params bit 11), so as far as I
+   understand the isoc TDs carry explicit frame IDs and the ones whose
+   frame has passed are skipped after the Missed Service Error. For a
+   UAC2 async device with its own buffer, sending those packets late
+   would probably be inaudible, while dropping 1 ms is not. Would using
+   SIA instead of frame IDs be acceptable here, perhaps as a quirk or an
+   option I can test?
+
+3. For the sound list: is "dma error: 0x28" (FIFOE with FIFORDY) on an
+   output stream consistent with the controller being unable to fetch
+   data for about a millisecond, or does it point at something else?
+
+I can test patches, run with xhci dynamic debug, and provide the full
+usbmon capture (3 MB compressed). I can also retest on a mainline kernel
+without the NVIDIA modules if that is needed.
+
+Short excerpts of the capture, the kernel messages and the measurements
+are attached as small text files.
+
+Thanks,
+<your name>

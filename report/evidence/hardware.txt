@@ -1,0 +1,16 @@
+Machine     ASUS ROG Strix G18 G814JZ, BIOS G814JZ.334 (02/11/2026)
+CPU         Intel Core i9-13980HX
+Chipset     Intel HM770 (eSPI controller 8086:7a0c rev 11)
+xHCI        0000:00:14.0 Intel 700 Series Chipset Family USB 3.2 Gen 2x2 xHCI [8086:7a60], subsystem 1043:201f
+            hcc params 0x20007fc1 hci version 0x120 quirks 0x0000000200009810
+HD-audio    0000:00:1f.3 Intel 700 Series Chipset Family HD Audio [8086:7a50] rev 11, subsystem 1043:1cdf, snd_hda_intel
+            codec ALC285, CS35L41 amplifiers
+GPU         NVIDIA RTX 4080 Laptop (dGPU-only MUX mode); its HDMI audio function 01:00.1 shows no errors
+Kernel      7.3.3-300.fc45.x86_64 (Fedora 45), PREEMPT_DYNAMIC (lazy), HZ=1000
+            tainted 12288 (O, E): out-of-tree NVIDIA open kernel modules 620.70.06
+            cmdline extras: intel_idle.max_cstate=1 processor.max_cstate=1
+USB device  Universal Audio Volt 2 [2b5a:0021], high speed, UAC2 async with explicit feedback endpoint,
+            48 kHz S32_LE stereo, data packet interval 125 us
+            path: root port 1 -> hub 17ef:30ba -> hub 17ef:30b7 -> device (Lenovo Thunderbolt 4 dock, USB 2 lines)
+            snd_usb_audio lowlatency=Y
+Audio stack PipeWire 1.6.11, WirePlumber 0.5.19 (zero xruns reported throughout)

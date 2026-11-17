@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+
+# Personal data: room audio and raw USB audio payload (game/video sound)
+data/phone-recordings/
+data/usbmon-*.txt.gz
+
+# Machine-local state
+ui/custom-presets.json
+*.tmp
+*.before-rog-*
+
+# Unrelated to the project; lists paths in the home folder
+data/systemdgenie-installed-files.txt

@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ROG panel</title>
+<style>
+:root{color-scheme:light dark;--bg:#f6f6f4;--fg:#1d1d1b;--card:#fff;--line:#d6d6d0;--mut:#666;--warn:#b42318;--warnbg:#fde8e6;--ok:#146c2e;--btn:#e9e9e4;--act:#1f5fbf;--actfg:#fff}
+@media (prefers-color-scheme:dark){:root{--bg:#161615;--fg:#e8e8e4;--card:#222220;--line:#3a3a36;--mut:#a0a09a;--warn:#ff8a7d;--warnbg:#4a1f1a;--ok:#6fd08c;--btn:#33332f;--act:#5b9bff;--actfg:#0b1020}}
+body{font:15px/1.4 system-ui,sans-serif;background:var(--bg);color:var(--fg);margin:0;padding:16px;max-width:980px;margin-inline:auto}
+h1{font-size:1.3rem;margin:0 0 4px}h2{font-size:1rem;margin:0 0 8px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(290px,1fr));gap:12px;margin:12px 0}
+.card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:12px}
+.row{display:flex;justify-content:space-between;gap:8px;padding:2px 0}.row span:first-child{color:var(--mut)}
+.warn{background:var(--warnbg);color:var(--warn);font-weight:600;border-radius:4px;padding:0 4px}
+.mut{color:var(--mut);font-size:.9rem}.ok{color:var(--ok)}
+button{font:inherit;background:var(--btn);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:6px 10px;cursor:pointer;margin:2px 4px 2px 0}
+button.cur{outline:2px solid var(--act)}button:disabled{opacity:.5;cursor:wait}
+input[type=number]{font:inherit;width:5em;padding:4px;background:var(--card);color:var(--fg);border:1px solid var(--line);border-radius:6px}
+pre{white-space:pre-wrap;word-break:break-word;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:8px;margin:8px 0 0;max-height:240px;overflow:auto}
+.ed-fan{border-top:1px solid var(--line);padding-top:8px;margin-top:8px}
+.ed-head{display:flex;flex-wrap:wrap;align-items:center;gap:8px}
+.ed-head h3{font-size:.95rem;margin:0}
+.dirty{background:var(--warnbg);color:var(--warn);font-weight:600;border-radius:4px;padding:0 6px;font-size:.85rem}
+svg.chart{width:100%;height:auto;max-width:560px;display:block;touch-action:none;user-select:none}
+svg.chart .bg{fill:var(--bg)}svg.chart .grid{stroke:var(--line);stroke-width:1}svg.chart .full{stroke:var(--mut);stroke-dasharray:4 3}
+svg.chart text{fill:var(--mut);font-size:10px}svg.chart .ln{fill:none;stroke:var(--act);stroke-width:2}
+svg.chart circle{fill:var(--act);stroke:var(--card);stroke-width:2;cursor:grab}svg.chart circle.drag{cursor:grabbing}
+.pts{display:grid;grid-template-columns:repeat(auto-fill,minmax(112px,1fr));gap:4px;margin:6px 0}
+.pts div{display:flex;align-items:center;gap:2px;font-size:.85rem}.pts input[type=number]{width:3.6em;padding:2px}
+select,input[type=text]{font:inherit;padding:4px;background:var(--card);color:var(--fg);border:1px solid var(--line);border-radius:6px}
+.warns div{margin:4px 0}
+</style></head><body>
+<h1>ROG G18 settings panel</h1>
+<div class="mut" id="banner">Loading...</div>
+<div class="grid">
+ <div class="card"><h2>Temperatures</h2><div id="temps"></div></div>
+ <div class="card"><h2>Fans</h2><div id="fans"></div></div>
+ <div class="card"><h2>CPU</h2><div id="cpu"></div></div>
+ <div class="card"><h2>GPU</h2><div id="gpu"></div></div>
+</div>
+<div class="grid">
+ <div class="card"><h2>Fan preset</h2><div class="mut" id="curmatch"></div><div id="presets"></div></div>
+ <div class="card"><h2>Jellyfin software interface</h2><div id="jf" class="mut"></div>
+  <button data-jf="on">Turn on</button><button data-jf="off">Turn off</button>
+  <div class="mut">Applies at Jellyfin's next start. Jellyfin is not restarted.</div></div>
+ <div class="card"><h2>CPU cap</h2>
+  <input id="cap" type="number" min="40" max="100" step="1" value="55"> %
+  <button id="capgo">Apply cap</button><button id="capundo">Undo CPU profile</button>
+  <div class="mut">Asks for your password in a system dialog.</div></div>
+ <div class="card"><h2>Stall test</h2><button id="stall">Run 10 s stall test</button>
+  <div class="mut">About 12 s. Plays inaudible silence on the internal sound device.</div></div>
+</div>
+<div class="card" id="editor"><h2>Fan curve editor</h2>
+ <div class="mut" id="edmsg"></div>
+ <div id="edmain" hidden>
+  <div>Profile: <select id="edprof"></select> <span class="mut" id="edact"></span></div>
+  <div class="warns" id="edwarn"></div>
+  <div id="edfans"></div>
+  <div class="ed-fan">
+   <button id="edall">Apply all three</button>
+   <button id="edreload">Reload from saved</button>
+   <span class="dirty" id="eddirty" hidden>Unsaved edits</span>
+   <div class="mut">Drag points, or type values. Temperature in C, speed in %. Applying runs asusctl for the chosen profile.</div>
+  </div>
+  <div class="ed-fan"><h3>Presets</h3>
+   <select id="edpsel"></select>
+   <button id="edpload">Load preset into editor</button><button id="edpdel">Delete custom preset</button>
+   <div class="mut">Loading only fills the editor; nothing is applied.</div>
+   <input type="text" id="edpname" maxlength="32" placeholder="Preset name" size="20">
+   <button id="edpsave">Save as preset</button>
+   <div class="mut">Saves all three fan curves as edited. Does not apply them.</div>
+  </div>
+ </div>
+</div>
+<div class="card" style="margin-top:12px"><h2>Last result</h2><pre id="out">Nothing run yet.</pre></div>
+<script>
+const TOKEN="__TOKEN__";
+const $=id=>document.getElementById(id);
+const na=v=>v===null||v===undefined?"n/a":v;
+function rows(el,list){el.textContent="";for(const [k,v,bad] of list){
+ const r=document.createElement("div");r.className="row";
+ const a=document.createElement("span");a.textContent=k;
+ const b=document.createElement("span");if(bad)b.className="warn";b.textContent=String(na(v));
+ r.append(a,b);el.append(r)}}
+const fmt=(v,u,d=0)=>v===null||v===undefined?"n/a":(+v).toFixed(d)+u;
+let curMatch=null,presetsDone=false,busy=false,capSet=false;
+function render(s){
+ $("banner").textContent=s.dry_run?"DRY RUN: actions only show the command they would run.":"Live: actions run for real.";
+ const t=s.temps;
+ rows($("temps"),[["CPU package",fmt(t.cpu_c," C"),false],["Board sensor (SEN3)",fmt(t.board_c," C")+(t.board_hot?"  >= 85 C, crackle zone":""),t.board_hot]]);
+ const f=s.fans,c=s.curves.fans;
+ const L=[];for(const [k,n] of [["cpu","CPU"],["gpu","GPU"],["mid","Middle"]]){
+  L.push([n+" fan",fmt(f[k+"_rpm"]," rpm")+" (curve top "+fmt(c[k].top_pct," %")+")",false])}
+ L.push(["Live curve matches",s.curves.matches_preset||"no preset",false]);
+ rows($("fans"),L);
+ const u=s.cpu;
+ rows($("cpu"),[["Max / min perf",na(u.max_perf_pct)+" % / "+na(u.min_perf_pct)+" %"],["Governor",u.governor],["Energy preference",u.epp],["tuned profile",u.tuned],["Platform profile",u.platform_profile]].map(x=>[x[0],x[1],false]));
+ const g=s.gpu;
+ const G=[["Temperature",fmt(g.temp_c," C"),false],["Power",fmt(g.power_w," W",1),false],["Utilisation",fmt(g.util_pct," %"),false],
+  ["Memory",fmt(g.mem_used_mb," MB")+" / "+fmt(g.mem_total_mb," MB")+(g.mem_high?"  above 95 %":""),g.mem_high]];
+ if(!g.apps.length)G.push(["Top apps","n/a",false]);
+ for(const a of g.apps)G.push([a.name.split(/[\\/]/).pop().split(" ")[0]+" ("+a.pid+")",a.mem_mb+" MB",false]);
+ rows($("gpu"),G);
+ $("jf").textContent="Software interface is currently: "+na(s.jellyfin_software_ui);
+ curMatch=s.curves.matches_preset;
+ $("curmatch").textContent=curMatch?"Live curve matches: "+curMatch:"Live curve matches no preset.";
+ if(!presetsDone){presetsDone=true;for(const [k,d] of Object.entries(s.presets)){
+  const b=document.createElement("button");b.dataset.preset=k;b.textContent=k;b.title=d;
+  const p=document.createElement("div");p.className="mut";p.textContent=k+": "+d;
+  $("presets").append(b);$("presets").append(p)}}
+ try{renderEditor(s)}catch(e){$("edmsg").textContent="Editor error: "+e.message}
+ if(!capSet&&Number.isInteger(u.max_perf_pct)){$("cap").value=u.max_perf_pct;capSet=true}
+ for(const b of document.querySelectorAll("[data-preset]"))b.classList.toggle("cur",b.dataset.preset===curMatch);
+}
+async function poll(){try{const r=await fetch("/api/status");render(await r.json())}catch(e){$("banner").textContent="Cannot reach the panel server."}}
+function fmtResult(j){let m="";
+ if(j.error)m+="Error: "+j.error+"\n";
+ if(j.stalls_per_s!==undefined)m+="Stalls per second: "+j.stalls_per_s+"\n";
+ if(j.output)m+=j.output+"\n";
+ if(j.note)m+="\n"+j.note;
+ if(!m)m=j.ok?"Done.":"Failed"+(j.returncode!==undefined?" (exit code "+j.returncode+")":"")+".";
+ return m}
+async function post(name,body){
+ const r=await fetch("/api/"+name,{method:"POST",headers:{"X-Panel-Token":TOKEN,"Content-Type":"application/json"},body:JSON.stringify(body||{})});
+ return await r.json()}
+async function actMany(list){
+ if(busy)return false;busy=true;const bs=document.querySelectorAll("button");bs.forEach(b=>b.disabled=true);
+ let all=true,msg="";
+ try{for(const [name,body,label] of list){
+   $("out").textContent=msg+"Running "+(label||name)+"...";
+   const j=await post(name,body);msg+=(label?label+":\n":"")+fmtResult(j)+"\n";
+   if(j.ok===false||j.error){all=false;break}}
+  $("out").textContent=msg}
+ catch(e){all=false;$("out").textContent=msg+"Request failed: "+e}
+ busy=false;bs.forEach(b=>b.disabled=false);poll();return all}
+async function act(name,body){return actMany([[name,body]])}
+document.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;
+ if(b.dataset.preset)act("fan-preset",{preset:b.dataset.preset});
+ else if(b.dataset.jf)act("jellyfin",{value:b.dataset.jf});
+ else if(b.id==="capgo"){const v=Number($("cap").value);if(!Number.isInteger(v)||v<40||v>100){$("out").textContent="Cap must be a whole number from 40 to 100.";return}act("cpu-cap",{cap:v})}
+ else if(b.id==="capundo")act("cpu-undo");
+ else if(b.id==="stall")act("stall-test")});
+
+// ---- fan curve editor ----
+const FANS=[["cpu","CPU"],["gpu","GPU"],["mid","Middle"]],PROFS=["performance","balanced","quiet"];
+const pct=p=>Math.round(p*100/255),toPwm=v=>Math.round(v*255/100);
+const W=400,H=200,PL=34,PR=8,PT=8,PB=22,TMIN=30,TMAX=100;
+const X=t=>PL+(t-TMIN)/(TMAX-TMIN)*(W-PL-PR),Y=v=>PT+(100-v)/100*(H-PT-PB);
+let stored=null,presetData={builtin:{},custom:{}},ed=null,edProf=null,activeProf=null,edBuilt=false,chart={},inputs={},dragging=null,psig="";
+const pwmOf=p=>p[2]!==null?p[2]:toPwm(p[1]);
+const fromPwm=pts=>pts.map(([t,w])=>[t,pct(w),w]);
+const sendPts=f=>ed[f].map(p=>[p[0],pwmOf(p)]);
+const isDirty=f=>{const sv=stored&&stored[edProf]&&stored[edProf][f].points;if(!sv)return false;
+ return ed[f].some((p,i)=>p[0]!==sv[i][0]||pwmOf(p)!==sv[i][1])};
+function loadFromStored(){ed={};for(const [f] of FANS)ed[f]=fromPwm(stored[edProf][f].points)}
+function svgEl(n,a){const e=document.createElementNS("http://www.w3.org/2000/svg",n);for(const k in a)e.setAttribute(k,a[k]);return e}
+function buildEditor(){
+ const box=$("edfans");box.textContent="";chart={};inputs={};
+ for(const [f,label] of FANS){
+  const sec=document.createElement("div");sec.className="ed-fan";
+  const head=document.createElement("div");head.className="ed-head";
+  const h=document.createElement("h3");h.textContent=label+" fan";
+  const dv=document.createElement("span");dv.className="dirty";dv.textContent="Unsaved edits";dv.hidden=true;
+  const en=document.createElement("span");en.className="mut";
+  const ap=document.createElement("button");ap.dataset.edapply=f;
+  head.append(h,dv,en,ap);
+  const svg=svgEl("svg",{viewBox:"0 0 "+W+" "+H,class:"chart"});
+  svg.append(svgEl("rect",{x:PL,y:PT,width:W-PL-PR,height:H-PT-PB,class:"bg"}));
+  for(let v=0;v<=100;v+=25){svg.append(svgEl("line",{x1:PL,x2:W-PR,y1:Y(v),y2:Y(v),class:v===100?"grid full":"grid"}));
+   const tx=svgEl("text",{x:PL-4,y:Y(v)+3,"text-anchor":"end"});tx.textContent=v+"%";svg.append(tx)}
+  for(let t=30;t<=100;t+=10){svg.append(svgEl("line",{x1:X(t),x2:X(t),y1:PT,y2:H-PB,class:"grid"}));
+   const tx=svgEl("text",{x:X(t),y:H-PB+12,"text-anchor":"middle"});tx.textContent=t;svg.append(tx)}
+  const tl=svgEl("text",{x:W-PR,y:H-2,"text-anchor":"end"});tl.textContent="temperature (C)";svg.append(tl);
+  const ln=svgEl("polyline",{class:"ln"});svg.append(ln);
+  const cs=[];
+  for(let i=0;i<8;i++){const c=svgEl("circle",{r:6});c.dataset.fan=f;c.dataset.i=i;
+   const tt=svgEl("title",{});c.append(tt);svg.append(c);cs.push(c)}
+  const pts=document.createElement("div");pts.className="pts";const ins=[];
+  for(let i=0;i<8;i++){const d=document.createElement("div");
+   const a=document.createElement("input"),b=document.createElement("input");
+   for(const x of [a,b]){x.type="number";x.step="1";x.dataset.fan=f;x.dataset.i=i}
+   a.dataset.k="t";a.min=TMIN;a.max=TMAX;a.title="Point "+(i+1)+" temperature (C)";
+   b.dataset.k="p";b.min=0;b.max=100;b.title="Point "+(i+1)+" speed (%)";
+   const u1=document.createElement("span");u1.textContent="C";const u2=document.createElement("span");u2.textContent="%";
+   d.append(a,u1,b,u2);pts.append(d);ins.push([a,b])}
+  sec.append(head,svg,pts);box.append(sec);
+  chart[f]={ln,cs,dv,en,ap};inputs[f]=ins}
+ edBuilt=true}
+function clampPoint(f,i,t,v){const a=ed[f];
+ t=Math.round(t);v=Math.round(v);
+ t=Math.max(i>0?a[i-1][0]+1:TMIN,Math.min(i<7?a[i+1][0]-1:TMAX,t));
+ t=Math.max(TMIN+i,Math.min(TMAX-(7-i),t));
+ v=Math.max(i>0?a[i-1][1]:0,Math.min(i<7?a[i+1][1]:100,v));
+ return [t,v]}
+function setPoint(f,i,t,v){const p=ed[f][i],[nt,nv]=clampPoint(f,i,t,v);
+ if(nv!==p[1])p[2]=null;p[0]=nt;p[1]=nv}
+function redraw(f){const c=chart[f];
+ c.ln.setAttribute("points",ed[f].map(p=>X(p[0])+","+Y(p[1])).join(" "));
+ ed[f].forEach((p,i)=>{const e=c.cs[i];e.setAttribute("cx",X(p[0]));e.setAttribute("cy",Y(p[1]));
+  e.firstChild.textContent=p[0]+" C, "+p[1]+" %";
+  const [a,b]=inputs[f][i];if(document.activeElement!==a)a.value=p[0];if(document.activeElement!==b)b.value=p[1]})}
+function warnList(){const w=[];if(!ed)return w;
+ if(ed.mid.some(p=>p[0]>=70&&p[1]<100))w.push("Middle fan is below 100 % at 70 C or above. Crackle returned at 6100 rpm (83 %) under gaming load.");
+ if(ed.gpu.some(p=>p[0]>=80&&p[1]<100))w.push("GPU fan is below 100 % at 80 C or above. It needed full speed above about 80 C.");
+ if(edProf!==activeProf)w.push("Editing "+edProf+", which is not the active profile ("+na(activeProf)+"). The change takes effect when "+edProf+" is selected.");
+ return w}
+function refreshEditor(){
+ if(!edBuilt)return;
+ let any=false;
+ for(const [f,label] of FANS){const d=isDirty(f);any=any||d;const c=chart[f];
+  c.dv.hidden=!d;c.ap.textContent="Apply to "+edProf;
+  const en=stored[edProf][f].enabled;c.en.textContent="saved curve "+(en?"enabled":"disabled")}
+ $("eddirty").hidden=!any;
+ const wb=$("edwarn");wb.textContent="";for(const m of warnList()){const d=document.createElement("div");d.className="warn";d.textContent=m;wb.append(d)}
+ $("edact").textContent="Active profile: "+na(activeProf)}
+function fullRedraw(){for(const [f] of FANS)redraw(f);refreshEditor()}
+function fillPresets(s){
+ const sig=JSON.stringify([Object.keys(s.preset_curves||{}),Object.keys(s.custom_presets||{})]);
+ presetData={builtin:s.preset_curves||{},custom:s.custom_presets||{}};
+ if(sig===psig)return;psig=sig;
+ const sel=$("edpsel"),old=sel.value;sel.textContent="";
+ const g1=document.createElement("optgroup");g1.label="Built-in";
+ for(const k of Object.keys(presetData.builtin)){const o=document.createElement("option");o.value="b:"+k;o.textContent=k;g1.append(o)}
+ sel.append(g1);
+ const cu=Object.keys(presetData.custom);
+ if(cu.length){const g2=document.createElement("optgroup");g2.label="Custom";
+  for(const k of cu){const o=document.createElement("option");o.value="c:"+k;o.textContent=k;g2.append(o)}sel.append(g2)}
+ if([...sel.options].some(o=>o.value===old))sel.value=old}
+function renderEditor(s){
+ stored=s.stored_curves;
+ const p=s.cpu&&s.cpu.platform_profile;activeProf=PROFS.includes(p)?p:null;
+ fillPresets(s);
+ if(!stored){$("edmsg").textContent="Could not read or parse /etc/asusd/fan_curves.ron, so the editor is unavailable.";$("edmain").hidden=true;return}
+ $("edmsg").textContent="";$("edmain").hidden=false;
+ if(!edBuilt){
+  const sp=$("edprof");for(const n of PROFS){const o=document.createElement("option");o.value=n;sp.append(o)}
+  edProf=activeProf||"performance";sp.value=edProf;buildEditor();loadFromStored();fullRedraw()}
+ for(const o of $("edprof").options)o.textContent=o.value+(o.value===activeProf?" (active)":"");
+ refreshEditor();
+ $("edpdel").disabled=!$("edpsel").value.startsWith("c:")}
+function anyDirty(){return ed&&PROFS.length&&FANS.some(([f])=>isDirty(f))}
+function checkSend(f){try{validatePts(sendPts(f),f);return true}catch(e){$("out").textContent="Error: "+e.message;return false}}
+function validatePts(a,l){for(let i=0;i<8;i++){const [t,w]=a[i];
+  if(!Number.isInteger(t)||!Number.isInteger(w))throw new Error(l+": values must be whole numbers");
+  if(i&&t<=a[i-1][0])throw new Error(l+": temperatures must increase");
+  if(i&&w<a[i-1][1])throw new Error(l+": speeds must not decrease")}
+ if(a[7][1]<102)throw new Error(l+": the last point must be at least 40 % so a fan cannot stay nearly off when hot")}
+function applyFans(list){
+ if(!list.every(f=>checkSend(f)))return;
+ actMany(list.map(f=>["fan-curve",{profile:edProf,fan:f,points:sendPts(f)},f+" -> "+edProf]))}
+function edCurves(){const o={};for(const [f] of FANS)o[f]=sendPts(f);return o}
+document.addEventListener("pointerdown",e=>{const c=e.target.closest&&e.target.closest("svg.chart circle");if(!c||!ed)return;
+ dragging={f:c.dataset.fan,i:+c.dataset.i,el:c};c.setPointerCapture(e.pointerId);c.classList.add("drag");e.preventDefault()});
+document.addEventListener("pointermove",e=>{if(!dragging)return;const {f,i,el}=dragging;
+ const svg=el.ownerSVGElement,r=svg.getBoundingClientRect();
+ const x=(e.clientX-r.left)/r.width*W,y=(e.clientY-r.top)/r.height*H;
+ setPoint(f,i,TMIN+(x-PL)/(W-PL-PR)*(TMAX-TMIN),100-(y-PT)/(H-PT-PB)*100);
+ redraw(f);refreshEditor()});
+const endDrag=()=>{if(dragging){dragging.el.classList.remove("drag");dragging=null}};
+document.addEventListener("pointerup",endDrag);document.addEventListener("pointercancel",endDrag);
+document.addEventListener("change",e=>{const t=e.target;
+ if(t.id==="edprof"){if(anyDirty()&&!confirm("Discard unsaved edits and switch profile?")){t.value=edProf;return}
+  edProf=t.value;loadFromStored();fullRedraw();return}
+ if(t.id==="edpsel"){$("edpdel").disabled=!t.value.startsWith("c:");return}
+ if(!t.dataset||!t.dataset.k||!ed)return;
+ const f=t.dataset.fan,i=+t.dataset.i,p=ed[f][i],v=Math.round(Number(t.value));
+ if(t.value===""||!Number.isFinite(v)){redraw(f);t.value=t.dataset.k==="t"?p[0]:p[1];return}
+ if(t.dataset.k==="t")setPoint(f,i,v,p[1]);else setPoint(f,i,p[0],v);
+ redraw(f);t.value=t.dataset.k==="t"?p[0]:p[1];refreshEditor()});
+document.addEventListener("click",e=>{const b=e.target.closest("button");if(!b||!ed)return;
+ if(b.dataset.edapply)applyFans([b.dataset.edapply]);
+ else if(b.id==="edall")applyFans(FANS.map(x=>x[0]));
+ else if(b.id==="edreload"){loadFromStored();fullRedraw();$("out").textContent="Edits discarded; showing saved curves for "+edProf+"."}
+ else if(b.id==="edpload"){const v=$("edpsel").value,k=v.slice(2),src=v[0]==="c"?presetData.custom[k]:presetData.builtin[k];
+  if(!src)return;for(const [f] of FANS)ed[f]=fromPwm(src[f]);fullRedraw();
+  $("out").textContent="Loaded preset '"+k+"' into the editor. Nothing was applied."}
+ else if(b.id==="edpdel"){const v=$("edpsel").value;if(!v.startsWith("c:"))return;
+  if(confirm("Delete custom preset '"+v.slice(2)+"'?"))act("delete-preset",{name:v.slice(2)})}
+ else if(b.id==="edpsave"){const n=$("edpname").value.trim();
+  if(!/^[A-Za-z0-9 _-]{1,32}$/.test(n)){$("out").textContent="Error: preset name must be 1-32 characters: letters, digits, space, dash, underscore.";return}
+  if(!FANS.every(([f])=>checkSend(f)))return;
+  act("save-preset",{name:n,curves:edCurves()})}});
+poll();setInterval(poll,2000);
+</script></body></html>

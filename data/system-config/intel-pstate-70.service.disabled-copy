@@ -1,0 +1,12 @@
+[Unit]
+Description=Limit Intel CPU maximum performance to 55 percent
+ConditionPathExists=/sys/devices/system/cpu/intel_pstate/max_perf_pct
+After=power-profiles-daemon.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'echo 0 > /sys/devices/system/cpu/intel_pstate/no_turbo; echo 55 > /sys/devices/system/cpu/intel_pstate/max_perf_pct'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=graphical.target

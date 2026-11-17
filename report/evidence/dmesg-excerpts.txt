@@ -1,0 +1,32 @@
+Kernel messages, boot of 2026-11-16 10:09 (kernel 7.3.3-300.fc45.x86_64). Hostname replaced.
+
+--- xHCI probe ---
+[    1.845377] host kernel: xhci_hcd 0000:00:14.0: xHCI Host Controller
+[    1.845415] host kernel: xhci_hcd 0000:00:14.0: new USB bus registered, assigned bus number 1
+[    1.845456] host kernel: xhci_hcd 0000:00:14.0: hcc params 0x20007fc1 hci version 0x120 quirks 0x0000000200009810
+[    1.845495] host kernel: xhci_hcd 0000:00:14.0: xHCI Host Controller
+[    1.845533] host kernel: xhci_hcd 0000:00:14.0: new USB bus registered, assigned bus number 2
+[    1.845571] host kernel: xhci_hcd 0000:00:14.0: Host supports USB 3.2 Enhanced SuperSpeed
+
+--- HD-audio FIFO errors while playing silence on hw:0,0 (rate-limited by the kernel) ---
+Nov 16 10:46:51 host kernel: snd_hda_intel 0000:00:1f.3: stream 7 dma error: 0x28
+Nov 16 10:46:51 host kernel: snd_hda_intel 0000:00:1f.3: stream 7 dma error: 0x28
+Nov 16 10:46:51 host kernel: snd_hda_intel 0000:00:1f.3: stream 7 dma error: 0x28
+Nov 16 10:46:51 host kernel: snd_hda_intel 0000:00:1f.3: stream 7 dma error: 0x28
+Nov 16 10:46:51 host kernel: snd_hda_intel 0000:00:1f.3: stream 7 dma error: 0x28
+Nov 16 10:46:51 host kernel: snd_hda_intel 0000:00:1f.3: stream 7 dma error: 0x28
+Nov 16 10:46:51 host kernel: snd_hda_intel 0000:00:1f.3: stream 7 dma error: 0x28
+Nov 16 10:46:51 host kernel: snd_hda_intel 0000:00:1f.3: stream 7 dma error: 0x28
+Nov 16 10:46:51 host kernel: snd_hda_intel 0000:00:1f.3: stream 7 dma error: 0x28
+Nov 16 10:46:51 host kernel: snd_hda_intel 0000:00:1f.3: stream 7 dma error: 0x28
+Nov 16 10:46:56 host kernel: snd_hdac_bus_handle_stream_irq: 312 callbacks suppressed
+Nov 16 10:46:56 host kernel: snd_hda_intel 0000:00:1f.3: stream 7 dma error: 0x28
+Nov 16 10:46:56 host kernel: snd_hda_intel 0000:00:1f.3: stream 7 dma error: 0x28
+Nov 16 10:46:56 host kernel: snd_hda_intel 0000:00:1f.3: stream 7 dma error: 0x28
+[...]
+total 'dma error' lines that boot: 4013; suppressed (sum of 'callbacks suppressed'): 107690
+
+--- xHCI warnings, seen once (10:48:49, while the audio interface's profile was being switched) ---
+Nov 16 10:48:49 host kernel: xhci_hcd 0000:00:14.0: WARN: buffer overrun event for slot 11 ep 4 on endpoint   (x8)
+Nov 16 10:48:49 host kernel: xhci_hcd 0000:00:14.0: Event dma <addr> for ep 1 status 1 not part of TD at <addr> - <addr>   (x10)
+Nov 16 10:48:49 host kernel: xhci_hcd 0000:00:14.0: ERROR Unknown event condition 198 for slot 15 ep 1 , HC probably busted

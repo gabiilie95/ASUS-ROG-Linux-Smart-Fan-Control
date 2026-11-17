@@ -1,0 +1,36 @@
+1350 samples over 2700s. errors/s min=-0.4 mean=0.4 max=15.1
+  SEN3 board temp    range 54..88   r=+0.12
+  CPU package temp   range 57..99   r=-0.00
+  GPU temp           range 49.17..85.27   r=+0.10
+  GPU watts          range 19.05..168.0   r=-0.04
+  GPU util           range 5.0..100.0   r=+0.03
+  throttle events    range 0.0..121.5   r=-0.07
+mean errors/s by SEN3 temperature:
+  54°C:  -0.2/s  (4 samples)
+  55°C:  -0.0/s  (4 samples)
+  56°C:  -0.0/s  (4 samples)
+  57°C:  -0.0/s  (8 samples)
+  58°C:  -0.0/s  (4 samples)
+  60°C:  -0.2/s  (2 samples)
+  62°C:   0.1/s  (1 samples)
+  64°C:  -0.2/s  (2 samples)
+  66°C:   0.1/s  (2 samples)
+  68°C:  -0.2/s  (2 samples)
+  70°C:  -0.0/s  (4 samples)
+  72°C:  -0.0/s  (4 samples)
+  73°C:  -0.0/s  (4 samples)
+  74°C:  -0.0/s  (4 samples)
+  75°C:  -0.0/s  (17 samples)
+  76°C:  -0.0/s  (37 samples)
+  77°C:  -0.1/s  (50 samples)
+  78°C:  -0.0/s  (88 samples)
+  79°C:   0.8/s  (261 samples)
+  80°C:  -0.0/s  (92 samples)
+  81°C:   0.1/s  (54 samples)
+  82°C:   0.1/s  (60 samples)
+  83°C:   0.0/s  (149 samples)
+  84°C:   0.0/s  (261 samples)
+  85°C:   0.1/s  (160 samples)
+  86°C:   0.5/s  (48 samples)
+  87°C:   8.8/s  (22 samples)
+  88°C:  10.3/s  (2 samples)

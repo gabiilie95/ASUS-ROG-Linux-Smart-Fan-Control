@@ -1,0 +1,30 @@
+All figures from 2026-11-16, game running (GPU 130-160 W). "Stalls/s" = HD-audio FIFO error
+interrupts per second on 00:1f.3 while aplay sends silence to hw:0,0 (IRQ count minus period IRQs).
+"Board" = ACPI thermal zone SEN3. Fan speeds are CPU / GPU / middle fan in rpm.
+
+USB capture (usbmon, 30 s, Volt 2 playback endpoint, board 87-90 C, fans 5500/4900/7400):
+  239,990 isochronous OUT packets; about 22,700 (9.5 %) completed with -EXDEV and length 0
+  2,522 separate events = 84 per second; median 9 consecutive packets (about 1.1 ms) per event
+  time between events: min 3.9 ms, median 10.1 ms, 90th percentile 22 ms (looks random above 4 ms)
+  feedback endpoint: 114 of 29,999 packets -EXDEV
+  HD-audio stalls measured one minute earlier under the same conditions: about 75 per second
+
+Airflow, GPU power held roughly constant:
+  fans 5500 / 5400 / 4300 (vendor curve)         board 88-91 C   75-90 stalls/s
+  fans slowed to 4300 / 4500 / 4300              board 89-91 C   rises to 90+ within 20 s
+  fans 6200 / 6900 / 7400                        board 81-83 C   0 within about 70 s
+  fans 5500 / 4900 / 7400                        board 79-85 C   0 at 128 W; about 16/s at 153 W, board 87 C
+  fans 4270 / 6090 / 6100                        board 79 C      about 5/s and rising
+  fans 4270 / 6090 / 7400                        board 79-84 C   0 (also at 154 W)
+
+No effect on the stall rate (each tested for 8-15 s against a baseline of 64-87/s):
+  intel_pstate max_perf_pct 55 / 70 / 100; no_turbo=1; governor performance vs powersave
+  uncore frequency pinned (min=max) at 4.9 GHz and at 3.0 GHz
+  PCM format S16 vs S32, period 128 to 4096 frames (direct ALSA, no PipeWire)
+  about 112,000 split-lock operations per second from a test program
+  pausing all sensor polling (nvidia-smi, KDE system monitor)
+  synthetic CPU, memory-copy and NVMe-read load
+  SMI count (MSR 0x34): 0 per second during stalls
+  CPU package thermal throttling reduced from 98 to 17 events/s: stall rate unchanged
+
+Same silent-playback test on the NVIDIA HDMI audio controller (01:00.1): no errors.

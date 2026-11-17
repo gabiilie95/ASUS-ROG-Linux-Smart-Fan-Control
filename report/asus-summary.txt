@@ -1,0 +1,19 @@
+Subject: ROG Strix G18 G814JZ: audio crackle on USB and internal speakers under gaming load; stops when the middle fan runs faster
+
+Model: ROG Strix G18 G814JZ, i9-13980HX, RTX 4080, BIOS G814JZ.334. OS: Linux (Fedora 45), fan control through the standard ASUS WMI fan-curve interface.
+
+Problem
+After roughly 15-20 minutes of gaming, audio crackles on a USB audio interface and on the internal speakers. Audio over HDMI from the NVIDIA card is not affected.
+
+What I measured
+- The chipset's USB controller fails to send about 9.5 % of the audio packets (it reports them as having missed their time slot), in bursts of about 1 ms, around 84 times per second.
+- The chipset's own audio controller reports data underruns at the same rate at the same time.
+- The rate follows board temperature and fan speed, not CPU or GPU load. With the default Performance fan curve the fans top out at 84 % (CPU), 69 % (GPU) and 43 % (middle fan), and a board temperature sensor (ACPI thermal zone SEN3) reaches 87-91 C. Its own trip points are 65, 75 and 80 C.
+- Running the middle fan at 100 % (7400 rpm instead of 4300) and the GPU fan at 100 % above 80 C stops the problem completely, with the same game and the same GPU power.
+
+Questions
+1. Is the chipset on this model expected to throttle or stall when that area of the board reaches these temperatures?
+2. Is the default Performance curve for the middle fan intended to stop at 43 %? Could a BIOS update raise it?
+3. Is there a known issue with thermal pads or cooling around the chipset on this model?
+
+I can provide logs and a USB capture if useful.

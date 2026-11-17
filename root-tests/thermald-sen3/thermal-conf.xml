@@ -1,0 +1,44 @@
+<?xml version="1.0"?>
+<!--
+  thermald rule for the ROG Strix G18 (G814JZ): when the board sensor SEN3 passes 78 C, lower the
+  CPU's power (RAPL power limit first, then the intel_pstate frequency cap) until it drops again.
+  Purpose: CPU heat raises SEN3 (about +3 C per +10 C on the CPU package), and above roughly
+  84-85 C on SEN3 the chipset stalls and USB / internal audio crackles.
+
+  Only used when thermald runs WITHOUT the adaptive option (adaptive mode disables this file).
+  Installed by root-tests/thermald-sen3/install.sh, removed by "install.sh undo".
+-->
+<ThermalConfiguration>
+  <Platform>
+    <Name>ROG Strix G18 G814JZ board-sensor rule</Name>
+    <ProductName>ROG Strix G814JZ*</ProductName>
+    <!-- QUIET: use only passive (performance-throttling) cooling devices; fans stay with asusd. -->
+    <Preference>QUIET</Preference>
+    <ThermalZones>
+      <ThermalZone>
+        <Type>SEN3</Type>
+        <TripPoints>
+          <TripPoint>
+            <!-- SEN3 is an existing kernel thermal zone, referenced by its type. -->
+            <SensorType>SEN3</SensorType>
+            <Temperature>78000</Temperature>
+            <type>passive</type>
+            <ControlType>SEQUENTIAL</ControlType>
+            <CoolingDevice>
+              <index>1</index>
+              <type>rapl_controller</type>
+              <influence>100</influence>
+              <SamplingPeriod>5</SamplingPeriod>
+            </CoolingDevice>
+            <CoolingDevice>
+              <index>2</index>
+              <type>intel_pstate</type>
+              <influence>50</influence>
+              <SamplingPeriod>5</SamplingPeriod>
+            </CoolingDevice>
+          </TripPoint>
+        </TripPoints>
+      </ThermalZone>
+    </ThermalZones>
+  </Platform>
+</ThermalConfiguration>

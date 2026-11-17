@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=ROG Settings Panel
+Comment=Local fan, CPU and Jellyfin settings panel
+Exec=python3 "/home/gabe/Documents/Projects/ROG Audio Stutter Fedora/ui/rog-panel.py"
+Icon=preferences-system
+Terminal=false
+Categories=Utility;
