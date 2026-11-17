@@ -3,6 +3,7 @@
 import argparse
 from collections import deque
 import csv
+import fcntl
 from datetime import datetime, timezone
 import io
 import json
@@ -198,6 +199,7 @@ class Policy:
         row = next(row for row in reversed(self.cfg["table"])
                    if row["min_gpu_w"] <= (self.gpu or 0))
         key = str(row["min_gpu_w"])
+        margin = self.margins[key] if gpu is not None else 0
         auto = mode == "auto"
         self.bad_samples = self.bad_samples + 1 if active and drops and auto else 0
         boosted = self.bad_samples >= 2
@@ -217,7 +219,9 @@ class Policy:
             self.clean_since = self.clean_bin = None
 
         if auto:
-            margin = self.margins[key] if gpu is not None else 0
+            # A boost adds 10/10/20 to the previous baseline; learn the new baseline for later.
+            if not boosted and gpu is not None:
+                margin = self.margins[key]
             target = [v + margin for v in row["floors"]]
         else:
             target = list(PRESETS[mode.removeprefix("preset:")])
@@ -254,3 +258,228 @@ def replay(path, cfg):
 
 def rounded(value):
     return None if value is None else round(value, 2)
+
+
+def write_curves(curves, restoring=False, previous=None):
+    # Recheck before *each* command: a profile switch can interrupt a three-fan update.
+    args = [["--fan", fan, "--data", ",".join(f"{t}c:{p}" for t, p in curves[fan])]
+            for fan in FANS if previous is None or curves[fan] != previous[fan]]
+    args.append(["--enable-fan-curves", "true"])
+    failures = []
+    for suffix in args:
+        if read(PROFILE) != "performance":
+            logging.warning("Performance profile inactive; curve write deferred")
+            return False
+        try:
+            subprocess.run(["/usr/bin/asusctl", "fan-curve", "--mod-profile", "performance",
+                            *suffix], check=True, timeout=10)
+        except (OSError, subprocess.SubprocessError) as exc:
+            if not restoring:
+                raise
+            failures.append(str(exc))
+    if failures:
+        raise RuntimeError("base restore incomplete: " + ", ".join(failures))
+    return True
+
+
+class Actuator:
+    """The root-only receipt survives partial writes, process death and profile changes."""
+    def __init__(self):
+        self.receipt = STATE / "restore.json"
+        self.last = None
+
+    def restore(self):
+        try:
+            base = read_json(self.receipt)
+        except FileNotFoundError:
+            return True
+        validate_base(base)
+        if not write_curves(base, restoring=True):
+            return False
+        self.receipt.unlink()
+        self.last = build_curves(base, ZERO)
+        logging.info("restored exact base curve")
+        return True
+
+    def apply(self, base, floors):
+        curves = build_curves(base, floors)
+        if curves == self.last:
+            return True
+        if not self.receipt.exists():
+            atomic_write(self.receipt, json.dumps(base))
+        previous = self.last
+        self.last = None
+        if not write_curves(curves, previous=previous):
+            return False
+        self.last = curves
+        if not any(floors):
+            self.receipt.unlink()
+        return True
+
+
+class SampleCsv:
+    """Publish each minute's bounded CSV atomically, including the current partial minute."""
+    def __init__(self):
+        self.minute = self.path = self.buffer = self.writer = None
+
+    def add(self, timestamp, sensors, floors, usb):
+        minute = timestamp[:16]
+        if self.minute != minute:
+            self.minute = minute
+            self.path = LOG / (timestamp.replace(":", "-") + ".csv")
+            self.buffer = io.StringIO()
+            self.writer = csv.writer(self.buffer)
+            self.writer.writerow(["t", *sensors, "cpu_floor", "gpu_floor", "mid_floor",
+                                  "audio_active", "skipped"])
+        self.writer.writerow([timestamp[11:19], *sensors.values(), *floors, usb["audio_active"],
+                              sum(d["skipped"] for d in usb["devices"])])
+        atomic_write(self.path, self.buffer.getvalue())
+
+
+def init_mode(cfg):
+    user = cfg["control_user"]
+    owner = pwd.getpwnam(user) if user else None
+    # The directory stays root-owned. Only this bounded, non-executable file is user-writable.
+    atomic_write(RUN / "mode", "auto\n", 0o644, owner)
+
+
+def run_service(dry, duration):
+    cfg = config(installed=not dry)
+    actuator = None if dry else Actuator()
+    saved = {}
+    if not dry:
+        try:
+            saved = read_json(STATE / "state.json")["margins"]
+        except FileNotFoundError:
+            pass
+        init_mode(cfg)
+    policy = Policy(cfg, saved)
+    sensors = Sensors()
+    stop = threading.Event()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, lambda *_: stop.set())
+    usbmon = UsbMonitor(stop)
+    samples = SampleCsv() if cfg["log_csv"] and not dry else None
+    events = deque(maxlen=12)
+    mode, last_mode_error = "auto", None
+    last_profile = last_problems = last_decision = None
+    needs_recovery = bool(actuator and actuator.receipt.exists())
+
+    def event(message):
+        events.append({"t": timestamp, "message": message})
+        logging.info("%s", message)
+
+    start = time.monotonic()
+    until = start + duration if duration else math.inf
+    try:
+        usbmon.start()
+        while not stop.is_set() and time.monotonic() < until:
+            now = time.monotonic()
+            timestamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+            values = sensors.sample(now)
+            usb = usbmon.snapshot(time.monotonic())
+            profile = values["profile"]
+            if profile != last_profile:
+                event(f"platform profile: {profile}")
+                last_profile = profile
+            if not dry:
+                try:
+                    selected = read_mode(RUN / "mode")
+                    last_mode_error = None
+                    if mode != selected:
+                        event(f"mode: {selected}")
+                    mode = selected
+                except (OSError, ValueError) as exc:
+                    # Never put user-supplied bytes into the journal.
+                    if last_mode_error != type(exc):
+                        event("invalid mode file; keeping " + mode)
+                    last_mode_error = type(exc)
+            problems = [("RAPL CPU W unreadable or awaiting delta" if k == "cpu_w"
+                         else f"{k} unavailable") for k, v in values.items() if v is None]
+            if usb["error"]:
+                problems.append(usb["error"])
+            if problems != last_problems:
+                event(", ".join(problems) if problems else "all sensors available")
+                last_problems = problems
+            before = policy.margins.copy()
+            floors, boost = policy.step(
+                now, values["gpu_w"], values["cpu_w"], active=usb["audio_active"],
+                traffic=bool(usb["devices"]), drops=sum(d["skipped"] for d in usb["devices"]),
+                degraded=bool(problems), mode=mode, performance=profile == "performance")
+            if boost:
+                event(boost)
+            if before != policy.margins:
+                event(f"GPU-bin margins: {policy.margins}")
+                if not dry:
+                    atomic_write(STATE / "state.json", json.dumps({"margins": policy.margins}))
+            applied = False
+            if actuator:
+                if profile != "performance":
+                    actuator.last = None
+                    needs_recovery = actuator.receipt.exists()
+                else:
+                    if needs_recovery:
+                        needs_recovery = not actuator.restore()
+                    if not needs_recovery:
+                        applied = actuator.apply(cfg["base_curve"], floors)
+                        needs_recovery = not applied
+            decision = floors if profile == "performance" else None
+            if decision != last_decision:
+                event(f"{'planned' if dry else 'requested'} floors (% cpu/gpu/mid): {decision}")
+                last_decision = decision
+            status = dict(version=VERSION, t=timestamp, elapsed_s=round(now-start, 2),
+                          dry_run=dry, mode=mode, invalid_mode=last_mode_error is not None,
+                          sensors=values, unavailable=problems, heat_w=rounded(policy.heat),
+                          smoothed_gpu_w=rounded(policy.gpu), floors=dict(zip(FANS, floors)),
+                          applied=applied, margins=policy.margins, usb=usb, events=list(events))
+            if dry:
+                print(json.dumps(status), flush=True)
+            else:
+                atomic_write(RUN / "status.json", json.dumps(status) + "\n", 0o644)
+            if samples:
+                samples.add(timestamp, values, floors, usb)
+            stop.wait(max(0, min(now + 2, until) - time.monotonic()))
+    finally:
+        stop.set()
+        try:
+            if actuator and not actuator.restore():
+                logging.warning("restore pending; select Performance and run --restore")
+        finally:
+            if usbmon.thread.is_alive():
+                usbmon.thread.join(timeout=2)
+            sensors.gpu.close()
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--dry-run", action="store_true", help="read sensors and print JSON only")
+    modes.add_argument("--replay", type=Path, metavar="CSV", help="replay recorded GPU decisions")
+    modes.add_argument("--restore", action="store_true", help="finish a pending base restore")
+    parser.add_argument("--seconds", type=int, help="end the dry run after this many seconds")
+    args = parser.parse_args(argv)
+    if args.seconds is not None and (not args.dry_run or args.seconds <= 0):
+        parser.error("--seconds requires --dry-run and a positive duration")
+    if args.replay:
+        for row in replay(args.replay, config()):
+            print(json.dumps(row))
+    elif args.dry_run:
+        run_service(True, args.seconds)
+    elif os.geteuid() != 0:
+        parser.error("live control requires root; use --dry-run or --replay")
+    else:
+        # Serialize manual restore, service startup, and systemd stop-post recovery.
+        lock = os.open(STATE, os.O_DIRECTORY)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if args.restore:
+                return 0 if Actuator().restore() else 1
+            run_service(False, None)
+        finally:
+            os.close(lock)
+    return 0
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    sys.exit(main())
