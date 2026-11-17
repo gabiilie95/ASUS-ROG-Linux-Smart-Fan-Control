@@ -552,6 +552,16 @@ def update_command(tag):
     return ["pkexec", "/usr/bin/python3", "-IB", str(UPDATER_INSTALLED), "install", tag]
 
 
+def performance_profile_command():
+    """Switch the platform profile back to Performance. asusd does it over D-Bus, so no root is needed."""
+    return ["asusctl", "profile", "set", "Performance"]
+
+
+def profile_name(profile):
+    """A platform profile as people read it: quiet -> Quiet, low-power -> Low power, None -> unknown."""
+    return profile.replace("-", " ").capitalize() if profile else "unknown"
+
+
 def manual_fan_problem(holding_lease=False):
     state, s = fan_service()
     if state in ("Not installed", "Stopped", "Dry run"):

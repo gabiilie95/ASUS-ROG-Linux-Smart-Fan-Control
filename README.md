@@ -380,13 +380,19 @@ the red logo (`asus_notif_red`), as does the window when the tray icon is off:
 | White | Service not installed or state unknown |
 
 - **Tooltip:** floors, GPU power, board temperature and USB drops, plus the stall monitor's rate while it runs.
+  Outside Performance it reads "Paused: Quiet profile" (or Balanced), because rog-fand stands down there.
 - **Menu:** open or hide the panel, fan mode, start or stop the stall monitor, update check and
   install, the Settings tab's switches (except the tray icon itself), **Settings…** and Quit.
+  While the service is paused by another profile, **Switch to Performance profile** runs
+  `asusctl profile set Performance` (asusd does this for the desktop user, no password).
 - **Notifications:** each kind at most once per 5 minutes, for:
   - a USB drop boost, with the drop rate;
   - the service stopped, stale or unreadable for two polls in a row, running again, or restarted;
   - the sensor fallback starting or ending;
-  - a mode change made outside this panel.
+  - a mode change made outside this panel;
+  - the power profile leaving Performance (Fn+F5 or the desktop's power settings), and its return.
+    A Quiet profile caps the fans, which brought the crackle back under load. A paused notice
+    right after a resumed one always shows, so the last profile notice never says all is well.
 - **Background:** closing the window hides it to the tray. While hidden, only a 2 s read of
   `/run/rog-fand/status.json` keeps running. Use **Quit** in the tray menu to exit. If the stall
   monitor is running, hiding the window says so, because the monitor keeps the internal speakers
