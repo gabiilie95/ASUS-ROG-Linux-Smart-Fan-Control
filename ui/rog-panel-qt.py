@@ -583,7 +583,8 @@ class MainWindow(QMainWindow):
         row.addWidget(self.add_action_button("Undo CPU profile", lambda: self.act("cpu-undo")))
         row.addStretch(1)
         lay.addLayout(row)
-        lay.addWidget(note_label("Asks for your password in a system dialog (pkexec)."))
+        lay.addWidget(note_label("Saved for every power mode and reapplied after reboot. "
+                                 "Asks for your password in a system dialog (pkexec)."))
         lay.addStretch(1)
         g.addWidget(box, 1, 3)
         # stall test

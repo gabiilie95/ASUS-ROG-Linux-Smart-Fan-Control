@@ -397,11 +397,28 @@ and switches the settings that already exist as scripts.
 
 - Fan preset: runs `tools/fans-original.sh`, `fans-ramped.sh`, `fans-mid-max.sh` or `fans-max.sh`; the panel says which one matches the live curve.
 - Jellyfin software interface on/off: `tools/jellyfin-software-ui.sh`; applies at Jellyfin's next start (it is not restarted).
-- CPU cap (40-100) and "Undo CPU profile": run `root-tests/setup-cool-performance.sh` through `pkexec`, so a system dialog asks for the password.
+- CPU cap (40-100) and "Undo CPU profile": run `root-tests/setup-cool-performance.sh` through `pkexec`, so a system dialog asks for the password. The cap is saved for all mapped power modes, including battery overrides, and reapplied by TuneD after reboot. Each mode keeps its existing governor, energy preference and platform settings; an existing stricter CPU limit remains in effect. Applying a cap keeps the currently selected mode. Undo restores the previous mappings, which may include an older Performance-only cap.
+
 - Fan curve editor: pick a profile (defaults to the active one), drag the 8 points per fan on the chart or type temperature (C) and speed (%), then "Apply to <profile>" per fan or "Apply all three". Runs `asusctl fan-curve --mod-profile ... --fan ... --data ...` plus `--enable-fan-curves true`; the server rejects bad curves (8 points, temps 30-100 C strictly increasing, speed non-decreasing, last point at least 40 %). Shows non-blocking warnings (middle fan below 100 % from 70 C, GPU fan below 100 % from 80 C, profile not active). Built-in and custom presets can be loaded into the editor without applying; custom ones are saved in `ui/custom-presets.json` (up to 20). Stored curves are read from `/etc/asusd/fan_curves.ron`.
 - Stall test: 10 s `tools/stall-counter.py`, shows stalls per second; refuses with "internal sound device busy" if the device is in use.
 
 The server listens on 127.0.0.1 only, POSTs need a per-run token, and only the whitelisted commands above can run.
+
+
+The all-mode cap helper is `root-tests/cpu_cap_profiles.py`; keep it beside the shell script when
+running from a checkout. The installer copies both files. It resolves inherited settings using
+the installed TuneD library and generates small profiles containing just the CPU percentage
+limits. Reapplying a different cap explicitly reloads the active profile, including when its name
+has not changed. Legacy Performance-only installations can still use Undo before applying an
+all-mode cap. The helper enables `tuned` and `tuned-ppd` for boot; Undo leaves these standard
+services enabled.
+
+CPU-cap regression checks use temporary files and mocked service commands, including simulated
+startup, mode changes, battery selection, reapply, failures and both undo paths:
+
+```bash
+/usr/bin/python3 -IB root-tests/test_cpu_cap.py
+```
 
 The native **Auto** tab shows the service mode, each fan's live speed (read from the fan sensors,
 so it shows without the service too, as rpm and percent of that fan's full speed) beside its
@@ -416,6 +433,39 @@ and set Auto to **Off · base curve** first. The calibration tool holds control 
 of the saved Performance curves and their enable flags. You can cancel a run, inspect per-step
 mean and peak stalls, and export the complete or partial sample CSV. Quitting the panel during a
 run waits for cleanup; closing the window only hides it to the tray. In panel dry-run mode, the start button previews the command.
+
+Calibration also reports temperature trends for the board, CPU and GPU, actual fan-speed
+stabilization, and estimated cooling onset. Hover over the **Thermal response** or **Assessment**
+cell for details. Cooling onset is an approximate window-based observation after fan speeds
+stabilize, not a universal temperature threshold or proof that one fan caused the change.
+Audio stalls remain an independent result: temperatures can fall while audio still stalls.
+
+Keep both CPU and GPU workload steady during each step. Fresh CPU package power comes from the
+fan service's status (at most six seconds old); missing CPU power, changing workload, sensor gaps,
+or unstable fan speeds make the comparison inconclusive. Older CSVs still show temperature slopes
+and audio results, but cannot establish a cooling response without CPU power. The CSV now includes
+monotonic step time, CPU power and sample age, requested fan percentages (blank means saved curve),
+and whether the run was Observe.
+
+The first analysis uses conservative heuristics: sustained fan-speed stability, 60-second thermal
+trends, two consecutive 30-second cooling windows, and at least 90 seconds of history after fan
+stabilization before declaring temperatures approximately steady. These thresholds need live
+validation. A stepped session can extend in 30-second increments by up to 120 seconds when load
+and RPM are steady, audio has no detected stall above 1/s, and temperatures are still changing.
+Extra settling is skipped if recent CPU or GPU readings reach the shipped base curve's full-speed
+temperatures (88 C CPU / 86 C GPU).
+Observe never extends. Set `--settle-extra 0` to retain fixed durations (maximum allowed extra time:
+600 seconds). Cancellation and exact curve restoration also cover the extended portion.
+
+Analyze an exported calibration without applying fan settings:
+
+```bash
+python3 -IB tools/fan-calibrate.py --analyze data/logs/10-fan-calibration-light.csv
+```
+
+This prints per-step JSON. Analysis does not generate or apply a new Auto model, rank fan mixes by
+noise, or change the service's existing policy. Those steps need repeated comparisons at matching
+loads, listening preferences, and independent validation of the proposed settings.
 
 **Tray icon** (`ui/fan_tray.py`). The panel puts the ROG logo that asusctl installs in the
 system tray. The logo is loaded by icon name and not copied here. Its colour shows the service
