@@ -254,6 +254,7 @@ class LifecycleTest(unittest.TestCase):
         status = self.path / "status.json"
         self.assertEqual(status.stat().st_mode & 0o777, 0o644)
         self.assertEqual(fand.read_json(status)["floors"]["mid"], 90)
+        self.assertEqual(fand.read_json(status)["table"], CFG["table"])
         self.assertFalse(self.actuator.receipt.exists())
         self.assertEqual(self.command.call_args_list[-4].args[0][-1],
                          ",".join(f"{t}c:{p}" for t,p in BASE["cpu"]))
@@ -367,6 +368,40 @@ class LifecycleTest(unittest.TestCase):
         fand.atomic_write(model, '{"table":[]}')
         with self.assertRaises(ValueError):
             fand.config(installed=True)
+
+    def test_write_model_validates_installs_and_restarts(self):
+        table = [{"min_gpu_w": 0, "floors": [0, 0, 0]}, {"min_gpu_w": 75, "floors": [35, 40, 70]}]
+        fand.write_model(json.dumps(table))
+        model = self.path / "model.json"
+        self.assertEqual(model.stat().st_mode & 0o777, 0o644)
+        self.assertEqual(fand.read_json(model)["table"], table)
+        self.assertEqual(fand.read_json(model)["source"], "auto-tune")
+        self.assertEqual(self.command.call_args.args[0],
+                         ["/usr/bin/systemctl", "try-restart", "rog-fand.service"])
+        fand.atomic_write(self.path / "config.json", "{}")
+        self.assertEqual(fand.config(installed=True)["table"], table)
+        row = lambda w, f: {"min_gpu_w": w, "floors": f}
+        bad = ["[]", "{}", "not json", json.dumps([row(0, [0.5, 0, 0])]), json.dumps([row(0.0, [0, 0, 0])]),
+               json.dumps([row(0, [True, 0, 0])]), json.dumps([dict(row(0, [0, 0, 0]), note="x")]),
+               json.dumps([row(5, [0, 0, 0])]), json.dumps([row(0, [0, 0, 0]), row(0, [1, 1, 1])]),
+               json.dumps([row(0, [0, 0, 101])]), json.dumps([row(0, [0, 0])]),
+               json.dumps([row(i * 10, [0, 0, 0]) for i in range(17)]), " " * 4097]
+        for text in bad:
+            with self.subTest(text=text[:60]), self.assertRaises(ValueError):
+                fand.write_model(text)
+        self.assertEqual(fand.read_json(model)["table"], table)
+        self.assertEqual(self.command.call_count, 1)
+
+    def test_write_model_needs_root_and_reports_invalid_input(self):
+        with patch.object(fand.os, "geteuid", return_value=1000), \
+                contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            fand.main(["--write-model", "[]"])
+        err = io.StringIO()
+        with patch.object(fand.os, "geteuid", return_value=0), contextlib.redirect_stderr(err):
+            self.assertEqual(fand.main(["--write-model", "[]"]), 1)
+        self.assertIn("invalid model", err.getvalue())
+        self.assertFalse((self.path / "model.json").exists())
+        self.command.assert_not_called()
 
 
 QUIET_OUTPUT = """

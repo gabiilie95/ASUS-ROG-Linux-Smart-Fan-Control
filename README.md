@@ -379,6 +379,30 @@ of the saved Performance curves and their enable flags. You can cancel a run, in
 mean and peak stalls, and export the complete or partial sample CSV. Quitting the panel during a
 run waits for cleanup; closing the window only hides it to the tray. In panel dry-run mode, the start button previews the command.
 
+**Auto-tune** (Calibrate tab, or `tools/autotune.py`; about 60-90 minutes, loud). It generates heat
+itself and replaces manual calibration runs. Levels run hottest first, at GPU 160, 120, 80 and 40 W
+plus 4, 3, 2 and 2 CPU threads. At each level the fan floors step from loud to quiet along a fixed
+ladder: 180 s per step, judged on the last 120 s. The descent stops at the first step that stalls
+(more than 1 stall/s on the internal counter, or any USB drop in the service's status). The fans
+then go straight back to the last clean step, and the next level starts there. Silence plays to the
+Volt 2 through PipeWire so the USB link stays busy. Hard stops: CPU 95 C, GPU 85 C, board 90 C,
+battery power, or the profile leaving Performance; any stop or cancel ends the load and restores
+the exact saved curves. The log goes to `data/logs/autotune-<time>.csv` (installed panel:
+`~/.local/share/rog-fand/logs/`), the proposal beside it as `.model.json`. The panel shows the
+proposed table next to the current one. **Write model…** installs it through pkexec
+(`rog_fand.py --write-model`, strictly validated) as `/etc/rog-fand/model.json` and restarts the
+service. Delete that file as root to go back to the default table.
+
+GPU load comes from `tools/gpuload.py`, not `stress-ng --gpu`, because Fedora's stress-ng is
+built without EGL/GBM and skips that stressor. gpuload runs a PTX kernel through the NVIDIA
+driver's own `libcuda.so.1` (no toolkit needed). It only sees the NVIDIA GPU, and a duty cycle
+holds a target power. Checked on 2026-11-17: `nvidia-smi` read 40.4, 79.7, 120.3 and 160.0 W
+for 40/80/120/160 W targets. CPU: `loadgen` at 4 threads about 57 W, 8 threads about 105-110 W.
+
+    python3 tools/autotune.py --plan            # print levels, ladder and limits; changes nothing
+    python3 tools/autotune.py --check-load 30   # hold each level 30 s, fans untouched
+    python3 -B tools/test_autotune.py
+
 **Tray icon** (`ui/fan_tray.py`). The panel puts the ROG logo that asusctl installs in the
 system tray. The logo is loaded by icon name and not copied here. Its colour shows the service
 state, and the window icon follows the same colour. The menu launcher and the login entry use
