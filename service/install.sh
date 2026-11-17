@@ -41,9 +41,15 @@ case "${1:-}" in
 import json, os, pwd, sys
 with open(sys.argv[1]) as src:
     cfg = json.load(src)
+# sudo sets SUDO_USER; pkexec sets PKEXEC_UID. Either names the desktop user who controls the mode.
 user = os.environ.get("SUDO_USER")
+if not user and os.environ.get("PKEXEC_UID", "").isdigit():
+    user = pwd.getpwuid(int(os.environ["PKEXEC_UID"])).pw_name
 if user and pwd.getpwnam(user).pw_uid != 0:
     cfg["control_user"] = user
+else:
+    print("note: no desktop user found (run with sudo or pkexec); the panel cannot change the mode",
+          file=sys.stderr)
 print(json.dumps(cfg, indent=2))
 PY
                 mv -fT -- "$tmp" "$etc/config.json"

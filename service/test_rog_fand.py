@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -309,7 +310,10 @@ class LifecycleTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "end of simulation"):
                 fand.run_service(True, 120)
         status = json.loads(output.getvalue())
-        self.assertEqual(tuple(status["floors"].values()), (60, 60, 80))
+        # RAPL and usbmon are unavailable to the user; they are reported but must not force the
+        # fallback (review fix 2026-11-17). 81 W selects the 50-110 W row.
+        self.assertEqual(tuple(status["floors"].values()), (35, 40, 70))
+        self.assertFalse(status["degraded"])
         self.assertFalse(status["applied"])
         self.assertIn("usbmon requires root", status["unavailable"])
         self.command.assert_not_called()
@@ -355,6 +359,111 @@ class ReplayTest(unittest.TestCase):
             rows = list(fand.replay(path, CFG))
             self.assertEqual(tuple(rows[0]["floors"].values()), (35,40,70))
             self.assertEqual(tuple(rows[1]["floors"].values()), (60,60,80))
+
+
+class ReviewFixesTest(unittest.TestCase):
+    """Regressions from the 2026-11-17 review: start-up fallback, reader, stream warm-up, config."""
+
+    def idle(self, **missing):
+        values = dict(cpu_w=8.0, gpu_w=15.0, gpu_c=45, cpu_c=52.0, board_c=50.0,
+                      cpu_rpm=2100, gpu_rpm=2500, mid_rpm=3100, profile="performance")
+        values.update(missing)
+        return values
+
+    def test_startup_gap_does_not_force_fallback(self):
+        # First sample after a start: RAPL has no delta and usbmon is still starting.
+        gaps, policy = fand.Gaps(), fand.Policy(CFG)
+        gpu, degraded = gaps.update(self.idle(cpu_w=None))
+        self.assertFalse(degraded)
+        self.assertEqual(policy.step(0, gpu, None, degraded=degraded)[0], (0, 0, 0))
+        for t in range(2, 400, 2):
+            gpu, degraded = gaps.update(self.idle())
+            self.assertEqual(policy.step(t, gpu, 8.0, degraded=degraded)[0], (0, 0, 0))
+
+    def test_rapl_and_usbmon_never_degrade(self):
+        gaps = fand.Gaps()
+        for _ in range(10):
+            self.assertFalse(gaps.update(self.idle(cpu_w=None))[1])
+
+    def test_short_gpu_gap_holds_last_value_then_falls_back(self):
+        gaps = fand.Gaps()
+        self.assertEqual(gaps.update(self.idle(gpu_w=120.0)), (120.0, False))
+        self.assertEqual(gaps.update(self.idle(gpu_w=None)), (120.0, False))
+        self.assertEqual(gaps.update(self.idle(gpu_w=None)), (120.0, False))
+        self.assertEqual(gaps.update(self.idle(gpu_w=None)), (None, True))
+        self.assertEqual(gaps.update(self.idle(gpu_w=130.0)), (130.0, False))
+
+    def test_persistent_missing_temperature_degrades(self):
+        gaps = fand.Gaps()
+        results = [gaps.update(self.idle(board_c=None))[1] for _ in range(4)]
+        self.assertEqual(results, [False, False, True, True])
+        self.assertFalse(gaps.update(self.idle())[1])
+
+    def test_stream_warmup_skips_are_separated(self):
+        counts = sensors.UsbCounts()
+        dev = (1, 12)
+        counts.add((dev, 1_000_000, 8, 3), 0)       # stream starts: skip inside warm-up
+        counts.add((dev, 1_900_000, 8, 2), 0)       # still inside the first second
+        counts.add((dev, 2_100_000, 8, 4), 0)       # after warm-up: a real skip
+        interval, warmup = counts.take()
+        self.assertEqual(interval[dev][:2], [24, 9])
+        self.assertEqual(warmup[dev], 5)
+        counts.add((dev, 5_000_000, 8, 1), 0)       # 2.9 s gap: a new stream, warm-up again
+        self.assertEqual(counts.take()[1][dev], 1)
+        counts.add((dev, 5_500_000, 8, 0), 0)
+        counts.add((dev, 6_200_000, 8, 2), 0)       # 1.2 s into the stream: counted
+        self.assertEqual(counts.take()[1].get(dev, 0), 0)
+
+    def test_policy_ignores_warmup_skips_in_snapshot(self):
+        u = sensors.UsbMonitor(threading.Event())
+        u.error, u.sample_at = None, 0
+        u.counts.add(((1, 12), 1_000_000, 8, 4), 1)
+        with patch.object(sensors, "usb_names", return_value={}):
+            device = u.snapshot(2)["devices"][0]
+        self.assertEqual((device["skipped"], device["warmup_skipped"]), (4, 4))
+
+    def test_reader_blocks_and_counts_from_a_stream(self):
+        lines = [
+            "aa 1000000 S Zo:1:012:1 -115:1:1 7 -18:0:48 -18:48:48 -18:96:48 -18:144:48 -18:192:48 336 = 00",
+            "aa 1000100 C Zi:1:012:1 0:8:2:0 1 0:0:4 4 = 00",
+            "aa 2500000 C Zo:1:012:1 0:1:1:0 7 0:0:48 0:48:48 0:96:48 0:144:48 0:192:48 336 >",
+            "aa 2600000 C Zo:1:012:1 0:1:8:0 6 -18:0:0 -18:48:0 -18:96:0 -18:144:0 -18:192:0 288 >",
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            fifo = Path(tmp) / "0u"
+            os.mkfifo(fifo)
+            stop = threading.Event()
+            u = sensors.UsbMonitor(stop)
+            with patch.object(sensors, "USBMON", str(fifo)):
+                reader = threading.Thread(target=u.run, daemon=True)
+                reader.start()
+                with open(fifo, "w") as out:
+                    # Two events in one write and one split across writes.
+                    out.write(lines[0] + "\n" + lines[1] + "\n" + lines[2][:30])
+                    out.flush()
+                    out.write(lines[2][30:] + "\n" + lines[3] + "\n")
+                # Let the reader drain the pipe before stopping it (closing the writer gives EOF).
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    with u.lock:
+                        if u.counts.interval.get((1, 12), [0])[0] >= 13:
+                            break
+                    time.sleep(0.01)
+                stop.set()
+                reader.join(timeout=5)
+        interval, _ = u.counts.take()
+        self.assertEqual(dict(interval), {(1, 12): [13, 6, 1]})
+
+    def test_unknown_control_user_is_a_clear_config_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            etc = Path(tmp)
+            fand.atomic_write(etc / "config.json", json.dumps({"control_user": "no-such-user-xyz"}))
+            with patch.object(fand, "ETC", etc):
+                with self.assertRaisesRegex(ValueError, "does not exist"):
+                    fand.config(installed=True)
+                fand.atomic_write(etc / "config.json", json.dumps({"control_user": 5}))
+                with self.assertRaisesRegex(ValueError, "user name or null"):
+                    fand.config(installed=True)
 
 
 if __name__ == "__main__":

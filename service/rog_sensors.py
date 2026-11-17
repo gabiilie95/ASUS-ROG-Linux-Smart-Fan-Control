@@ -145,24 +145,48 @@ def parse_usbmon(line):
         return None
 
 
+# usbmon timestamps are microseconds. A device whose isochronous OUT stream has been silent for
+# STREAM_GAP_US starts a new stream; skips in its first WARMUP_US are counted separately because a
+# stream that is just starting often misses its first slots without any chipset stall.
+STREAM_GAP_US = 2_000_000
+WARMUP_US = 1_000_000
+
+
 class UsbCounts:
     """One writer and one sampler. Keep stall grouping across interval boundaries."""
     def __init__(self):
         self.interval = defaultdict(lambda: [0, 0, 0])
+        self.warmup = defaultdict(int)
         self.last_bad = {}
+        self.last_ts = {}
+        self.stream_start = {}
         self.active_at = -math.inf
 
     def add(self, packet, now):
         device, ts, count, skipped = packet
+        last = self.last_ts.get(device)
+        # A long gap, or a timestamp far behind the last one (the 32-bit counter wrapped), starts a
+        # new stream.
+        if last is None or ts - last > STREAM_GAP_US or ts < last - STREAM_GAP_US:
+            self.stream_start[device] = ts
+        self.last_ts[device] = ts
         row = self.interval[device]
         row[0] += count
         row[1] += skipped
         if skipped:
+            if 0 <= ts - self.stream_start[device] < WARMUP_US:
+                self.warmup[device] += skipped
             previous = self.last_bad.get(device)
             if previous is None or ts - previous > 1500 or ts < previous:
                 row[2] += 1
             self.last_bad[device] = ts
         self.active_at = now
+
+    def take(self):
+        """Return and reset this interval's counts and warm-up skips."""
+        interval, warmup = self.interval, self.warmup
+        self.interval, self.warmup = defaultdict(lambda: [0, 0, 0]), defaultdict(int)
+        return interval, warmup
 
 
 def usb_names():
@@ -192,23 +216,30 @@ class UsbMonitor:
     def run(self):
         while not self.stop.is_set():
             try:
-                fd = os.open(USBMON, os.O_RDONLY | os.O_NONBLOCK)
+                # Blocking reads: the reader wakes as soon as an event arrives. Sleeping while the
+                # queue is empty let the kernel's small per-reader text buffer overflow under load.
+                # The thread is a daemon, so a read blocked at shutdown does not delay exit.
+                fd = os.open(USBMON, os.O_RDONLY)
                 try:
                     with self.lock:
                         self.error = None
+                    pending = b""
                     while not self.stop.is_set():
-                        try:
-                            raw = os.read(fd, 65536)
-                        except BlockingIOError:
-                            self.stop.wait(0.01)
-                            continue
+                        raw = os.read(fd, 65536)
                         if not raw:
                             raise OSError("usbmon closed")
-                        # The kernel text interface returns one event per read.
-                        event = parse_usbmon(raw.decode("ascii", errors="replace"))
-                        if event:
-                            with self.lock:
-                                self.counts.add(event, time.monotonic())
+                        # usbmon returns one event per read; still split lines so a partial or
+                        # combined read cannot be misparsed.
+                        pending += raw
+                        *lines, pending = pending.split(b"\n")
+                        for line in lines:
+                            # Cheap filter before decoding: only isochronous OUT completions count.
+                            if b" C Zo:" not in line:
+                                continue
+                            event = parse_usbmon(line.decode("ascii", errors="replace"))
+                            if event:
+                                with self.lock:
+                                    self.counts.add(event, time.monotonic())
                 finally:
                     os.close(fd)
             except OSError as exc:
@@ -218,8 +249,7 @@ class UsbMonitor:
 
     def snapshot(self, now):
         with self.lock:
-            counts = self.counts.interval
-            self.counts.interval = defaultdict(lambda: [0, 0, 0])
+            counts, warmup = self.counts.take()
             active = now - self.counts.active_at <= 5
             error = self.error
         elapsed = max(now - self.sample_at, 0.001)
@@ -231,6 +261,7 @@ class UsbMonitor:
         for (bus, dev), (packets, skipped, events) in sorted(counts.items()):
             path, name = self.names.get((bus, dev), (None, None))
             devices.append(dict(bus=bus, dev=dev, path=path, name=name, packets=packets,
-                                skipped=skipped, events=events, drops_per_s=round(skipped/elapsed, 2),
+                                skipped=skipped, warmup_skipped=warmup.get((bus, dev), 0),
+                                events=events, drops_per_s=round(skipped/elapsed, 2),
                                 events_per_s=round(events/elapsed, 2)))
         return dict(audio_active=active and error is None, devices=devices, error=error)
