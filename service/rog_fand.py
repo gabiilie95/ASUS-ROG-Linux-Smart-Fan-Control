@@ -46,6 +46,9 @@ ESSENTIAL = ("gpu_w", "cpu_c", "board_c", "cpu_rpm", "gpu_rpm", "mid_rpm")
 # gap at start-up or a momentary NVML error would otherwise jump to the fallback and, through the
 # 60 s hold and 5-point steps, keep the fans loud for about six minutes.
 MISSING_LIMIT = 3
+# Timing defaults before 2026-11-17. An installed config.json was generated as a full copy of the
+# example, so values equal to these are treated as unset and pick up the current defaults.
+OLD_TIMING_DEFAULTS = {"fall_s": 60, "hold_s": 60, "down_step_s": 20, "clean_s": 1800}
 
 
 def atomic_write(path, text, mode=0o600, owner=None):
@@ -113,7 +116,7 @@ def config(installed=False):
         overrides = read_json(ETC / "config.json")
         if not isinstance(overrides, dict) or overrides.keys() - cfg.keys():
             raise ValueError("invalid config keys")
-        cfg.update(overrides)
+        cfg.update(migrate_timing(overrides))
         try:
             cfg["table"] = read_json(ETC / "model.json")["table"]
         except FileNotFoundError:
@@ -121,8 +124,12 @@ def config(installed=False):
     validate_base(cfg["base_curve"])
     triple(cfg["fallback"])
     triple(cfg["noise_weights"], 0, 100)
-    for k in ("rise_s", "fall_s", "hold_s", "down_step_s", "clean_s"):
+    for k in ("rise_s", "fall_s", "hold_s", "down_step_s", "hot_down_step_s", "clean_s"):
         number(cfg[k], 0.001, 86400)
+    number(cfg["max_down_step"], 5, 100)
+    number(cfg["max_up_step"], 5, 100)
+    number(cfg["hot_board_c"], 30, 110)
+    number(cfg["quick_boost_drops"], 1, 1e6)
     if type(cfg["log_csv"]) != bool:
         raise ValueError("log_csv must be a boolean")
     profiles = cfg["profiles"]
@@ -147,6 +154,11 @@ def config(installed=False):
     if last == -1:
         raise ValueError("empty GPU table")
     return cfg
+
+
+def migrate_timing(overrides):
+    """Drop timing values that are just the old defaults, so updates bring the new ones."""
+    return {k: v for k, v in overrides.items() if OLD_TIMING_DEFAULTS.get(k, object()) != v}
 
 
 def parse_mode(raw):
@@ -194,23 +206,31 @@ def smooth(previous, value, dt, cfg):
 
 
 class Ramp:
+    """Up quickly (at most max_up_step points per sample, so a game starting is a quick ramp, not a
+    jump); down after a hold, in steps. Steps cover a third of the gap (5 to
+    max_down_step points) every down_step_s, so large gaps close quickly and the last points
+    gently. While the board is heat-soaked (hot_board_c and above) it keeps the cautious pace of
+    5 points every hot_down_step_s. A mode the user picks skips the hold."""
     def __init__(self):
         self.floors = ZERO
         self.down_at = [None] * 3
 
-    def step(self, target, now, cfg):
+    def step(self, target, now, cfg, board=None, skip_hold=False):
+        hot = board is not None and board >= cfg["hot_board_c"]
         levels = list(self.floors)
         for i, (old, wanted) in enumerate(zip(self.floors, target)):
-            if wanted <= old - 5:
-                if self.down_at[i] is None:
-                    self.down_at[i] = now + cfg["hold_s"]
+            # Start going down only past the 5-point dead band; once going, finish at the target.
+            if wanted <= old - 5 or (wanted < old and self.down_at[i] is not None):
+                if self.down_at[i] is None or skip_hold:
+                    self.down_at[i] = min(self.down_at[i] or math.inf, now if skip_hold else now + cfg["hold_s"])
                 if now >= self.down_at[i]:
-                    levels[i] = old - 5
-                    self.down_at[i] = now + cfg["down_step_s"]
+                    step = 5 if hot else min(cfg["max_down_step"], max(5, math.ceil((old - wanted) / 3)))
+                    levels[i] = max(wanted, old - step)
+                    self.down_at[i] = now + (cfg["hot_down_step_s"] if hot else cfg["down_step_s"])
             else:
                 self.down_at[i] = None
                 if wanted >= old + 5:
-                    levels[i] = wanted
+                    levels[i] = min(wanted, old + cfg["max_up_step"])
         self.floors = tuple(levels)
         return self.floors
 
@@ -226,12 +246,13 @@ class Policy:
         self.reset_control()
 
     def reset_control(self):
+        self.mode = None
         self.ramp = Ramp()
         self.bad_samples = 0
         self.clean_since = self.clean_bin = None
 
     def step(self, now, gpu, cpu, *, active=False, traffic=False, drops=0, degraded=False,
-             mode="auto", controlled=True):
+             mode="auto", controlled=True, board=None):
         dt = 0 if self.last is None else max(0, now - self.last)
         self.last = now
         self.gpu = smooth(self.gpu, gpu, dt, self.cfg)
@@ -246,8 +267,12 @@ class Policy:
         key = str(row["min_gpu_w"])
         margin = self.margins[key] if gpu is not None else 0
         auto = mode == "auto"
+        # The user picking another mode is a decision, not a load dip: no hold before stepping down.
+        mode_changed = self.mode is not None and mode != self.mode
+        self.mode = mode
         self.bad_samples = self.bad_samples + 1 if active and drops and auto else 0
-        boosted = self.bad_samples >= 2
+        # Two drop samples in a row, or one large burst (real stalls skip hundreds of packets).
+        boosted = self.bad_samples >= 2 or (active and auto and drops >= self.cfg["quick_boost_drops"])
         event = None
         if boosted:
             if gpu is not None:
@@ -274,7 +299,7 @@ class Policy:
             target = [max(v, floor) for v, floor in zip(target, self.cfg["fallback"])]
         if boosted:
             target = [v + extra for v, extra in zip(target, (10, 10, 20))]
-        return self.ramp.step([min(100, v) for v in target], now, self.cfg), event
+        return self.ramp.step([min(100, v) for v in target], now, self.cfg, board, mode_changed), event
 
 
 def replay(path, cfg):
@@ -560,7 +585,7 @@ def run_service(dry, duration):
                 traffic=bool(usb["devices"]),
                 # Skips in a stream's first second are start-up artefacts, not chipset stalls.
                 drops=sum(d["skipped"] - d.get("warmup_skipped", 0) for d in usb["devices"]),
-                degraded=degraded, mode=mode, controlled=controlled)
+                degraded=degraded, mode=mode, controlled=controlled, board=values.get("board_c"))
             if boost:
                 event(boost)
             if before != policy.margins:
