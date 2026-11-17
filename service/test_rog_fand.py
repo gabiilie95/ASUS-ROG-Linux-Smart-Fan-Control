@@ -264,7 +264,11 @@ class LifecycleTest(unittest.TestCase):
         path = self.path / "mode"
         fand.atomic_write(path, "off\n")
         fand.init_mode({**CFG, "control_user": owner.pw_name})
-        self.assertEqual(fand.read_mode(path), "off")
+        self.assertEqual(path.read_text(), "off\n")
+        control = self.path / "control"
+        fand.atomic_write(control / "mode", "preset:heavy\n")
+        self.assertEqual(fand.read_mode(fand.init_mode({"control_user": owner.pw_name})), "preset:heavy")
+        self.assertEqual(control.stat().st_uid, owner.pw_uid)
         self.assertEqual(path.stat().st_uid, owner.pw_uid)
 
     def test_live_rejects_invalid_mode_and_suspends_when_inactive(self):
@@ -319,6 +323,40 @@ class LifecycleTest(unittest.TestCase):
         self.command.assert_not_called()
         writer.assert_not_called()
         thread.assert_not_called()
+
+    def test_calibration_lease_and_mode_resume(self):
+        control = self.path / "control"
+        control.mkdir()
+        fd = os.open(control, os.O_DIRECTORY)
+        self.addCleanup(os.close, fd)
+        fand.fcntl.flock(fd, fand.fcntl.LOCK_EX)
+        records = []
+        original_write = fand.atomic_write
+        def publish(path, text, *args, **kwargs):
+            original_write(path, text, *args, **kwargs)
+            if path.name == "status.json":
+                records.append(json.loads(text))
+                if len(records) == 1:
+                    self.assertEqual(self.command.call_count, 0)
+                    fand.fcntl.flock(fd, fand.fcntl.LOCK_UN)
+        sample = dict(cpu_w=20, gpu_w=10, profile="performance")
+        with contextlib.ExitStack() as stack:
+            sensor = stack.enter_context(patch.object(fand, "Sensors")).return_value
+            sensor.sample.side_effect = [sample, sample, sample, RuntimeError("end")]
+            monitor = stack.enter_context(patch.object(fand, "UsbMonitor")).return_value
+            monitor.snapshot.return_value = dict(audio_active=False, devices=[], error=None)
+            stack.enter_context(patch.object(fand, "config", return_value=CFG))
+            stack.enter_context(patch.object(fand.signal, "signal"))
+            stack.enter_context(patch.object(fand, "atomic_write", side_effect=publish))
+            stack.enter_context(patch.object(fand, "read_mode", side_effect=["off", "off", "auto"]))
+            stack.enter_context(patch.object(threading.Event, "wait", return_value=False))
+            with self.assertRaisesRegex(RuntimeError, "end"):
+                fand.run_service(False, None)
+        self.assertTrue(records[0]["manual_control"])
+        self.assertFalse(records[0]["applied"])
+        self.assertTrue(records[1]["applied"])
+        # Off -> Auto must reassert the curves even if both decisions request a zero floor.
+        self.assertEqual(self.command.call_count, 8)
 
     def test_model_override_and_invalid_config(self):
         fand.atomic_write(self.path / "config.json", "{}")

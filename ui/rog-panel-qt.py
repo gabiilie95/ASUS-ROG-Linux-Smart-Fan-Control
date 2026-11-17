@@ -12,6 +12,8 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import rogcore as core  # noqa: E402
+from fan_auto import AutoTab, heading
+from fan_calibration import CalibrateTab
 
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, Qt, Signal, QPointF, QRectF  # noqa: E402
 from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPen, QPolygonF  # noqa: E402
@@ -384,19 +386,56 @@ class MainWindow(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
-        self.banner = QLabel("Loading...")
-        root.addWidget(self.banner)
+        root.setContentsMargins(16, 10, 16, 12)
+        root.setSpacing(8)
+        masthead = QFrame()
+        masthead.setObjectName("masthead")
+        header = QHBoxLayout(masthead)
+        header.setContentsMargins(16, 10, 16, 10)
+        header.setSpacing(16)
+        header.addWidget(heading("ROG Settings Panel"))
+        header.addWidget(QLabel("Strix G18  ·  G814JZ"))
+        header.addStretch()
+        self.banner = QLabel("Loading…")
+        header.addWidget(self.banner)
+        root.addWidget(masthead)
         self.tabs = QTabWidget()
         root.addWidget(self.tabs, 1)
+        self.auto_tab = AutoTab(dry_run)
+        self.cal_tab = CalibrateTab(dry_run, lambda: self.acting)
+        self.close_after_calibration = False
+        self.cal_tab.runningChanged.connect(self.calibration_changed)
+        self.tabs.addTab(self._scroll(self.auto_tab), "Auto")
         self.tabs.addTab(self._scroll(self._build_status_tab()), "Status")
         self.tabs.addTab(self._build_editor_tab(), "Fan curves")
         self.tabs.addTab(self._scroll(self._build_monitor_tab()), "Monitor")
+        self.tabs.addTab(self._scroll(self.cal_tab), "Calibrate")
         gb, lay = card("Last result")
         self.out = QPlainTextEdit("Nothing run yet.")
         self.out.setReadOnly(True)
         self.out.setMaximumHeight(100)
         lay.addWidget(self.out)
         root.addWidget(gb)
+        self.tabs.currentChanged.connect(lambda i: gb.setVisible(self.tabs.tabText(i) not in ("Auto", "Calibrate")))
+        gb.hide()
+        self.setStyleSheet("""
+            QFrame#masthead {background: #192e40; border-radius: 7px;}
+            QFrame#masthead QLabel {color: #edf6fc;}
+            QTabWidget::pane {border: 0;}
+            QTabBar::tab {padding: 7px 16px; margin-right: 3px; color: palette(window-text);
+                          border-bottom: 3px solid transparent;}
+            QTabBar::tab:selected {border-color: #388ab9; font-weight: bold;}
+            QGroupBox {background: palette(base); border: 1px solid palette(midlight);
+                       border-radius: 6px; margin-top: 11px; padding: 8px 4px 3px;}
+            QGroupBox::title {subcontrol-origin: margin; left: 10px; padding: 0 4px;}
+            QPushButton, QComboBox, QSpinBox, QLineEdit {padding: 3px 6px;}
+            QProgressBar {border: 1px solid palette(midlight); border-radius: 4px;
+                          text-align: center; background: palette(alternate-base);}
+            QProgressBar::chunk {background: #3684ad; border-radius: 3px;}
+            QPushButton#primaryAction:enabled {color: white; background: #236b92;
+                                              border: 0; border-radius: 4px; min-width: 88px; padding: 5px 13px;}
+            QPushButton#primaryAction:pressed {background: #195576;}
+        """)
         self._set_banner()
         self.resize(1280, 800)
 
@@ -416,10 +455,10 @@ class MainWindow(QMainWindow):
 
     def _set_banner(self):
         if self.dry_run:
-            self.banner.setText("DRY RUN: actions only show the command they would run.")
-            self.banner.setStyleSheet(WARN_CSS + "padding:4px 8px;")
+            self.banner.setText("DRY RUN  ·  Hardware controls preview only")
+            self.banner.setStyleSheet("background:#365060;color:#f1f8fc;border-radius:4px;padding:4px 8px;")
         else:
-            self.banner.setText("Live: actions run for real.")
+            self.banner.setText("Live controls")
             self.banner.setStyleSheet("")
 
     def launch(self, make_job, on_done):
@@ -690,6 +729,10 @@ class MainWindow(QMainWindow):
     def monitor_start(self):
         if self.mon_proc is not None:
             return
+        if self.cal_tab.process:
+            self.mon_btn.setChecked(False)
+            self.mon_msg.setText("Calibration is using the stall counter.")
+            return
         if core.sound_device_busy():
             self.mon_btn.setChecked(False)
             self.mon_msg.setText("internal sound device busy")
@@ -790,7 +833,19 @@ class MainWindow(QMainWindow):
                         it.setForeground(GOOD)
                 self.usb_table.setItem(r, c, it)
 
+    def calibration_changed(self, running):
+        self.auto_tab.calibrating = running
+        self.auto_tab.refresh()
+        if not running and self.close_after_calibration:
+            QTimer.singleShot(0, self.close)
+
     def closeEvent(self, e):
+        if self.cal_tab.process:
+            self.close_after_calibration = True
+            self.cal_tab.stop()
+            e.ignore()
+            return
+        self.auto_tab.shutdown()
         self.monitor_stop("Stopped.")
         super().closeEvent(e)
 
@@ -826,7 +881,7 @@ class MainWindow(QMainWindow):
         t = s["temps"]
         self._fill("temps", [
             ("CPU package", fmt(t["cpu_c"], " C"), False),
-            ("Board sensor (SEN3)", fmt(t["board_c"], " C") + ("  >= 85 C, crackle zone" if t["board_hot"] else ""), t["board_hot"])])
+            ("Board sensor (SEN3)", fmt(t["board_c"], " °C"), t["board_hot"])])
         f, c = s["fans"], s["curves"]["fans"]
         rows = [(n + " fan", fmt(f[k + "_rpm"], " rpm") + " (curve top " + fmt(c[k]["top_pct"], " %") + ")", False)
                 for k, n in FAN_LABELS]
@@ -887,6 +942,9 @@ class MainWindow(QMainWindow):
 
     def act_many(self, jobs):
         if self.acting:
+            return
+        if self.cal_tab.process and any(j[0] in ("fan-curve", "fan-preset", "stall-test") for j in jobs):
+            self.show_error("Finish the calibration session first.")
             return
         self.set_busy(True)
         self.out.setPlainText("Running %s..." % ", ".join(j[2] or j[0] for j in jobs))
@@ -958,10 +1016,11 @@ class MainWindow(QMainWindow):
         w = []
         if not self.ed:
             return w
-        if any(p[0] >= 70 and p[1] < 100 for p in self.ed["mid"]):
-            w.append("Middle fan is below 100 % at 70 C or above. Crackle returned at 6100 rpm (83 %) under gaming load.")
-        if any(p[0] >= 80 and p[1] < 100 for p in self.ed["gpu"]):
-            w.append("GPU fan is below 100 % at 80 C or above. It needed full speed above about 80 C.")
+        if self.ed_prof == "performance":
+            if any(62 <= p[0] <= 70 and p[1] < 70 for p in self.ed["mid"]):
+                w.append("The calibrated light-load curve uses 70% middle fan from 62 °C.")
+            if any(p[0] >= 72 and p[1] < 80 for fan in core.FANS for p in self.ed[fan]):
+                w.append("The calibrated heavy-load curve reaches 80% on all three fans at 72 °C.")
         if self.ed_prof != self.active_prof:
             w.append("Editing %s, which is not the active profile (%s). The change takes effect when %s is selected."
                      % (self.ed_prof, na(self.active_prof), self.ed_prof))
@@ -1149,7 +1208,7 @@ def main():
     atexit.register(lambda: win.mon_proc is not None and win.mon_proc.poll() is None and win.mon_proc.kill())
     app.aboutToQuit.connect(lambda: win.monitor_stop("Stopped."))
     for sg in (signal.SIGINT, signal.SIGTERM):
-        signal.signal(sg, lambda *_: app.quit())
+        signal.signal(sg, lambda *_: win.close())
     sigtimer = QTimer()          # lets Python run the signal handlers while Qt's loop is busy
     sigtimer.timeout.connect(lambda: None)
     sigtimer.start(300)

@@ -10,12 +10,22 @@ period of 8192 frames. If the settings panel's monitor already holds the device 
 reused; otherwise this script starts its own silent player (the laptop speakers are then busy).
 No root needed: fan curves are set with asusctl for the Performance profile.
 """
-import argparse, csv, os, signal, subprocess, sys, time
-import os as _os
-# The laptop's own sound chip is ALSA card "PCH"; its number changes between boots
-# (it was card 0 until 2026-11-16, then card 1), so look it up instead of assuming card 0.
-HDA_LABEL = "snd_hda_intel:" + (_os.path.basename(_os.readlink("/proc/asound/PCH"))
-                                if _os.path.islink("/proc/asound/PCH") else "card0")
+import argparse
+import contextlib
+import csv
+import fcntl
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ui"))
+import rogcore as core
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PCM = "/proc/asound/PCH/pcm0p/sub0"
@@ -59,7 +69,7 @@ def zone(t):
 def hda_irqs():
     with open("/proc/interrupts") as f:
         for line in f:
-            if HDA_LABEL in line:
+            if core.HDA_LABEL and core.HDA_LABEL in line:
                 return sum(int(x) for x in line.split()[1:] if x.isdigit())
     return None
 
@@ -86,127 +96,187 @@ def data(points):
 class Fans:
     def __init__(self, dry):
         self.dry = dry
-    def set(self, fan, points):
-        cmd = ["asusctl", "fan-curve", "--mod-profile", "performance", "--fan", fan, "--data", data(points)]
+
+    def command(self, *args):
+        cmd = ["asusctl", "fan-curve", "--mod-profile", "performance", *args]
         if self.dry:
-            print("    dry run:", " ".join(cmd)); return
-        subprocess.run(cmd, capture_output=True, timeout=20)
-    def enable(self):
-        cmd = ["asusctl", "fan-curve", "--mod-profile", "performance", "--enable-fan-curves", "true"]
-        if not self.dry:
-            subprocess.run(cmd, capture_output=True, timeout=20)
+            print("dry run:", " ".join(cmd))
+        else:
+            subprocess.run(cmd, check=True, timeout=20, stdout=subprocess.DEVNULL)
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--step", type=int, default=180, help="seconds per step (default 180)")
-    ap.add_argument("--dry-run", action="store_true")
-    ap.add_argument("--out", default=os.path.join(ROOT, "data/logs/10-fan-calibration-light.csv"))
-    ap.add_argument("--steps", help='custom steps, e.g. "mid=60,cpu=70,gpu=70; mid=50,cpu=70,gpu=70" '
-                                    "(percent per fan; fans not named stay on their saved curve)")
-    ap.add_argument("--observe", type=int, metavar="SECONDS",
-                    help="change nothing: log stalls with the current curve for SECONDS, then print a per-minute summary")
-    a = ap.parse_args()
-    global STEPS
-    if a.observe:
-        STEPS = [("observe current curve", {})]
-        a.step = a.observe
-    elif a.steps:
-        custom = []
-        for part in a.steps.split(";"):
-            spec = {}
-            for kv in part.split(","):
-                if not kv.strip():
-                    continue
-                k, v = kv.split("=")
-                k, v = k.strip(), int(v)
-                if k not in FANS or not 0 <= v <= 100:
-                    sys.exit("bad step entry: %r (fans: cpu, gpu, mid; percent 0-100)" % kv)
-                spec[k] = v
-            if spec:
-                custom.append((" + ".join("%s %d %%" % (f, spec[f]) for f in FANS if f in spec), spec))
-        STEPS = custom
+    def set(self, fan, points):
+        self.command("--fan", fan, "--data", data(points))
 
-    hc, hf = hwmon("asus_custom_fan_curve"), hwmon("asus")
-    if not hc or not hf:
-        sys.exit("ASUS fan interfaces not found")
-    saved = read_curves(hc)
-    fans = Fans(a.dry_run)
-    player = None
 
-    def restore(*_):
-        for f in FANS:
-            fans.set(f, saved[f])
-        fans.enable()
-        if player and player.poll() is None:
-            player.terminate()
+def snapshot():
+    profiles = core.read_stored_curves()
+    if not profiles:
+        raise ValueError("Cannot read saved Performance curves and enable flags")
+    record = profiles["performance"]
+    points = {f: [tuple(p) for p in record[f]["points"]] for f in FANS}
+    hc = hwmon("asus_custom_fan_curve")
+    if hc and rd("/sys/firmware/acpi/platform_profile") == "performance":
+        try:
+            points = read_curves(hc)
+        except (TypeError, ValueError, OSError):
+            pass  # Saved asusd curves are available to the desktop user.
+    return points, {f: record[f]["enabled"] for f in FANS}
+
+
+def restore(fans, saved):
+    points, enabled = saved
+    errors = []
+    for fan in FANS:
+        commands = (("--fan", fan, "--data", data(points[fan])),
+                    ("--fan", fan, "--enable-fan-curve", str(enabled[fan]).lower()))
+        for command in commands:
             try:
-                player.wait(3)
-            except subprocess.TimeoutExpired:
-                player.kill()
-        if not a.dry_run:
-            ok = read_curves(hc) == saved
-            print("\nYour fan curves are restored%s." % ("" if ok else " (CHECK: live curve differs!)"), flush=True)
+                fans.command(*command)
+            except (OSError, subprocess.SubprocessError) as exc:
+                errors.append(str(exc))
+    if errors or (not fans.dry and snapshot() != saved):
+        raise RuntimeError("Performance curve restore failed. Check saved curves. " + " ".join(errors))
 
-    def on_signal(sig, _frm):
-        print("\nInterrupted.", flush=True)
-        raise KeyboardInterrupt
 
-    signal.signal(signal.SIGTERM, on_signal)
-    print("Saved your current Performance curves:")
-    for f in FANS:
-        print("  %-3s %s" % (f, data(saved[f])))
-
-    if not counter_ready():
-        if "RUNNING" in rd(PCM + "/status", ""):
-            sys.exit("The internal sound device is in use by something else; cannot count stalls.")
-        player = subprocess.Popen(APLAY, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        time.sleep(3)
-        print("Started a silent player for the stall counter (pid %d)." % player.pid)
-    else:
-        print("Using the settings panel's running stall monitor.")
-
-    rows, summary = [], []
+@contextlib.contextmanager
+def calibration_lease():
+    # Persist through restore, including if a mode request arrives during the run.
+    problem = core.manual_fan_problem()
+    if problem:
+        raise ValueError(problem)
     try:
-        with open(a.out, "w", newline="") as fh:
-            w = csv.writer(fh)
-            w.writerow(["t", "step", "label", "stalls_per_s", "board_c", "cpu_c", "gpu_c", "gpu_w",
-                        "cpu_rpm", "gpu_rpm", "mid_rpm", "counter_ok"])
-            for si, (label, spec) in enumerate(STEPS, 1):
-                print("\nStep %d/%d: %s  (%d s)" % (si, len(STEPS), label, a.step), flush=True)
-                for f in FANS:
-                    pct = spec.get(f)
-                    pts = saved[f] if pct is None else [(t, round(pct * 255 / 100)) for t in FLAT_TEMPS]
-                    fans.set(f, pts)
-                fans.enable()
-                t0 = time.time(); last_i, last_t = hda_irqs(), time.monotonic(); step_rows = []
-                while time.time() - t0 < a.step:
-                    time.sleep(2)
+        fd = os.open(core.FAND_RUN / "control", os.O_DIRECTORY)
+    except FileNotFoundError:
+        if core.fan_service()[0] == "Running":
+            raise ValueError("Update the fan service to use calibration from the panel")
+        yield
+        return
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise ValueError("Fan control is busy. Retry after the current operation.") from exc
+        problem = core.manual_fan_problem(holding_lease=True)
+        if problem:
+            raise ValueError(problem)
+        yield
+    finally:
+        os.close(fd)
+
+
+COLUMNS = ("t", "step", "label", "stalls_per_s", "board_c", "cpu_c", "gpu_c", "gpu_w",
+           "cpu_rpm", "gpu_rpm", "mid_rpm", "counter_ok")
+
+
+def run(a, steps, stop):
+    def report(kind, message, **values):
+        if a.panel_json:
+            print(json.dumps(dict(kind=kind, message=message, **values)), flush=True)
+        else:
+            print(message, flush=True)
+
+    if not core.HDA_LABEL:
+        raise ValueError("The internal PCH sound device is unavailable")
+    busy = "RUNNING" in rd(PCM + "/status", "")
+    if busy and not counter_ready():
+        raise ValueError("The internal sound device is busy")
+    fans = Fans(a.dry_run)
+    summary = []
+    player = None
+    changed = False
+    out = Path(a.out)
+    # Keep partial samples private until the CSV can be published atomically.
+    with contextlib.ExitStack() as stack:
+        if not a.observe and not a.dry_run:
+            stack.enter_context(calibration_lease())
+        if not a.observe and rd("/sys/firmware/acpi/platform_profile") != "performance":
+            raise ValueError("Select the Performance profile for fan calibration")
+        saved = snapshot() if not a.observe else None
+        fh = stack.enter_context(tempfile.NamedTemporaryFile(mode="w", newline="", dir=out.parent,
+                                                              delete=False))
+        tmp = Path(fh.name)
+        writer = csv.writer(fh)
+        writer.writerow(COLUMNS)
+        try:
+            if not counter_ready():
+                player = subprocess.Popen(APLAY, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                stop.wait(3)
+                if not stop.is_set() and (player.poll() is not None or not counter_ready()):
+                    raise ValueError("Could not start the PCH stall counter")
+            for index, (name, spec) in enumerate(steps, 1):
+                if stop.is_set():
+                    break
+                report("step", name, index=index, total=len(steps))
+                if not a.observe:
+                    for fan in FANS:
+                        if stop.is_set():
+                            break
+                        if rd("/sys/firmware/acpi/platform_profile") != "performance":
+                            raise ValueError("Performance profile changed")
+                        changed = True
+                        pct = spec.get(fan)
+                        pts = saved[0][fan] if pct is None else [(t, round(pct*255/100)) for t in FLAT_TEMPS]
+                        fans.set(fan, pts)
+                    if stop.is_set():
+                        break
+                    fans.command("--enable-fan-curves", "true")
+                start = last_t = time.monotonic()
+                last_i = hda_irqs()
+                readings = []
+                while time.monotonic() - start < a.step and not stop.wait(2):
+                    if not a.observe and rd("/sys/firmware/acpi/platform_profile") != "performance":
+                        raise ValueError("Performance profile changed")
                     i, now = hda_irqs(), time.monotonic()
-                    ok = counter_ready()
-                    rate = max(0.0, (i - last_i) / (now - last_t) - NORMAL) if (ok and i is not None and last_i is not None) else None
+                    ok = counter_ready() and (player is None or player.poll() is None)
+                    if not ok:
+                        raise ValueError("Lost the PCH stall counter")
+                    rate = (max(0, (i-last_i)/(now-last_t)-NORMAL)
+                            if i is not None and last_i is not None else None)
                     last_i, last_t = i, now
                     gt, gw = gpu()
-                    r = [time.strftime("%H:%M:%S"), si, label, None if rate is None else round(rate, 2),
-                         zone("SEN3"), zone("x86_pkg_temp"), gt, gw,
-                         rd(hf + "/fan1_input"), rd(hf + "/fan2_input"), rd(hf + "/fan3_input"), int(ok)]
-                    w.writerow(r); fh.flush(); step_rows.append(r)
-                    left = a.step - (time.time() - t0)
-                    print("\r  %3.0f s left | stalls %5s/s | board %s C cpu %s C gpu %s W | fans %s/%s/%s rpm   "
-                          % (max(0, left), "--" if rate is None else "%.1f" % rate, r[4], r[5],
-                             "--" if gw is None else "%.0f" % gw, r[8], r[9], r[10]), end="", flush=True)
-                # judge each step only after its first minute (the stalls lag airflow by ~40 s)
-                tail = [x for x in step_rows if x[3] is not None][-int(max(1, (a.step - 60) / 2)):]
-                vals = [x[3] for x in tail]
-                summary.append((si, label, (sum(vals) / len(vals)) if vals else None, max(vals) if vals else None,
-                                tail[-1][8:11] if tail else ("?",) * 3,
-                                (sum(x[7] for x in tail if x[7]) / max(1, sum(1 for x in tail if x[7]))) if tail else None,
-                                tail[-1][4] if tail else None))
-                print()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        restore()
+                    rpm = core.read_fans()
+                    row = dict(zip(COLUMNS, [time.strftime("%H:%M:%S"), index, name,
+                               None if rate is None else round(rate, 2), zone("SEN3"),
+                               zone("x86_pkg_temp"), gt, gw, *[rpm[f+"_rpm"] for f in FANS], int(ok)]))
+                    writer.writerow(row.values())
+                    elapsed = time.monotonic()-start
+                    readings.append((elapsed, row))
+                    report("sample", f"{name} · {elapsed:.0f} s · {row['stalls_per_s']} stalls/s",
+                           row=row, elapsed=elapsed)
+                tail = [r for t, r in readings if t >= 60] or [r for _, r in readings]
+                rates = [r["stalls_per_s"] for r in tail if r["stalls_per_s"] is not None]
+                watts = [r["gpu_w"] for r in tail if r["gpu_w"] is not None]
+                avg = sum(rates)/len(rates) if rates else None
+                peak = max(rates) if rates else None
+                mean_w = sum(watts)/len(watts) if watts else None
+                summary.append((index, name, avg, peak, tail[-1]["board_c"] if tail else None,
+                                mean_w, tuple(tail[-1][f+"_rpm"] for f in FANS) if tail else (None,)*3))
+                report("result", f"{name} · mean {avg} · peak {peak} stalls/s", index=index,
+                       name=name, samples=len(readings), mean=avg, peak=peak, watts=mean_w)
+        finally:
+            try:
+                if changed:
+                    restore(fans, saved)
+                    report("restore", "Saved Performance curves and enable flags restored.")
+            finally:
+                try:
+                    if player and player.poll() is None:
+                        player.terminate()
+                        try:
+                            player.wait(3)
+                        except subprocess.TimeoutExpired:
+                            player.kill()
+                            player.wait()
+                finally:
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                    fh.close()
+                    os.replace(tmp, out)
+        report("done", "Cancelled." if stop.is_set() else "Completed.", cancelled=stop.is_set())
+    return summary
 
+
+def print_summary(a, summary):
     if a.observe:
         print("\nPer minute:")
         print("  minute  stalls/s avg (max)   GPU W   CPU C  GPU C  board C   fans cpu/gpu/mid rpm")
@@ -224,7 +294,6 @@ def main():
             print("  %5d   %6.1f (%5.1f)       %5.0f   %5.0f  %5.0f  %6.0f    %s/%s/%s" % (
                 m // 30 + 1, avg(v), max(v) if v else float("nan"), avg(w), avg(num("cpu_c")), avg(num("gpu_c")),
                 avg(num("board_c")), chunk[-1]["cpu_rpm"], chunk[-1]["gpu_rpm"], chunk[-1]["mid_rpm"]))
-        print("\nLog: " + a.out)
         return
     print("\nSummary (average of each step after its first minute):")
     print("  step  stalls/s (max)   fans cpu/gpu/mid rpm   GPU W  board C   setting")
@@ -232,7 +301,36 @@ def main():
         print("  %d     %5s (%5s)     %5s/%5s/%5s     %5s   %5s     %s" % (
             si, "--" if avg is None else "%.1f" % avg, "--" if mx is None else "%.1f" % mx,
             rpm[0], rpm[1], rpm[2], "--" if gw is None else "%.0f" % gw, board, label))
-    print("\nLog: " + a.out)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--step", type=int, default=180)
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--out", default=os.path.join(ROOT, "data/logs/10-fan-calibration-light.csv"))
+    ap.add_argument("--steps", help="semicolon-separated settings such as mid=70;cpu=80,gpu=80,mid=80")
+    ap.add_argument("--observe", type=int, metavar="SECONDS")
+    ap.add_argument("--panel-json", action="store_true", help="emit progress as JSON lines")
+    a = ap.parse_args()
+    steps = STEPS
+    if a.observe is not None:
+        a.step = a.observe
+        steps = [("Observe current curve", {})]
+    elif a.steps is not None:
+        steps = core.calibration_steps(a.steps)
+    if a.step <= 0:
+        ap.error("duration must be positive")
+    stop = threading.Event()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, lambda *_: stop.set())
+    summary = run(a, steps, stop)
+    if not a.panel_json:
+        print_summary(a, summary)
+        print("Log:", a.out)
+
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
+        sys.exit(str(exc))

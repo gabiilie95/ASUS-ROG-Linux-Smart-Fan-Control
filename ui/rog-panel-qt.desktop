@@ -2,8 +2,8 @@
 [Desktop Entry]
 Type=Application
 Name=ROG Settings Panel
-Comment=Native Qt fan, CPU and Jellyfin settings panel
-Exec=python3 "/home/gabe/Documents/Projects/ROG Audio Stutter Fedora/ui/rog-panel-qt.py"
+Comment=Smart fan control, calibration and system settings for the ROG G18
+Exec=/usr/bin/python3 -IB /usr/local/lib/rog-fand/ui/rog-panel-qt.py
 Icon=preferences-system
 Terminal=false
 Categories=Utility;

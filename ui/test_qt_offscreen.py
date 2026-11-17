@@ -4,19 +4,33 @@ import importlib.util
 import os
 import sys
 import time
+import tempfile
+from pathlib import Path
+from unittest.mock import patch
+import json
+from datetime import datetime, timezone
 
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import rogcore as core  # noqa: E402
-from PySide6.QtCore import Qt, QPoint, QTimer  # noqa: E402
+from PySide6.QtCore import Qt, QPoint, QTimer, QSaveFile, QIODevice  # noqa: E402
 from PySide6.QtGui import QGuiApplication  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication, QPushButton  # noqa: E402
 
-OUT = "/tmp/claude-1000/rog-qt-shots"
-os.makedirs(OUT, exist_ok=True)
+OUT = tempfile.mkdtemp(prefix="rog-qt-offscreen-")
+core.PRESET_FILE = os.path.join(OUT, "custom-presets.json")
+core.FAND_RUN = Path(OUT) / "run"
+core.FAND_UNIT = Path(OUT) / "rog-fand.service"
 fails = []
+
+
+def screenshot(w, name):
+    QApplication.processEvents()
+    dst = QSaveFile(os.path.join(OUT, name))
+    assert dst.open(QIODevice.WriteOnly) and w.grab().save(dst, "PNG") and dst.commit()
+
 
 
 def check(cond, msg):
@@ -41,6 +55,121 @@ def wait_for(cond, ms=15000):
     return cond()
 
 
+def publish(path, text):
+    with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False) as out:
+        out.write(text)
+    os.replace(out.name, path)
+
+
+def service_tabs(w, q):
+    auto, cal = w.auto_tab, w.cal_tab
+    check(auto.state == "Not installed" and not auto.apply.isEnabled(), "new installation state")
+    auto.preview_btn.click()
+    check(wait_for(lambda: bool(auto.preview_sample)), "read-only preview receives actual service JSON")
+    check(auto.state == "Dry run" and not auto.apply.isEnabled(), "preview cannot change mode")
+    auto.preview_btn.click()
+    check(wait_for(lambda: auto.preview is None), "preview child exits on request")
+
+    control = core.FAND_RUN / "control"
+    control.mkdir(parents=True)
+    mode = control / "mode"
+    public = core.FAND_RUN / "mode"
+    public.symlink_to("control/mode")
+    publish(mode, "auto\n")
+    publish(core.FAND_UNIT, "")
+    auto.refresh()
+    check(auto.state == "Stopped", "installed service with no status")
+    path = core.FAND_RUN / "status.json"
+    publish(path, "{")
+    auto.refresh()
+    check(auto.state == "Unreadable", "malformed status disables controls")
+    now = time.time()
+    stamp = lambda t: datetime.fromtimestamp(t, timezone.utc).isoformat()
+    s = dict(version=1, t=stamp(now-200), dry_run=False, mode="auto", applied=True, invalid_mode=False,
+             sensors=dict(profile="performance", cpu_rpm=5100, gpu_rpm=5500, mid_rpm=6200,
+                          cpu_w=42, gpu_w=146, board_c=78),
+             floors=dict(cpu=80, gpu=80, mid=80), heat_w=188, smoothed_gpu_w=145,
+             unavailable=[], margins={"0":0,"50":5,"110":0,"140":0},
+             usb=dict(audio_active=True, devices=[dict(name="USB interface", drops_per_s=1.5)], error=None),
+             events=[dict(t=stamp(now), message="USB drop boost")])
+    publish(path, json.dumps(s))
+    auto.refresh()
+    check(auto.state == "Stale" and not auto.chart.samples, "stale samples excluded")
+    for i in range(101):
+        s["t"] = stamp(now-200+2*i)
+        s["floors"] = dict(cpu=35 if i<40 else 80, gpu=40 if i<40 else 80, mid=70 if i<40 else 80)
+        auto.display("Running", s)
+    publish(path, json.dumps(s))
+    auto.refresh()
+    check(len(auto.chart.samples) == 101 and auto.bars["mid"].value()==80, "timestamped graph deduplicates samples")
+    check("1.5 drops/s" in auto.usb.text() and "+5 pp" in auto.margin.text(), "USB rates and learned margins")
+    check("boost" in auto.events.toPlainText() and not auto.apply.isEnabled(), "dry panel reads live events without control")
+    auto.change_mode()
+    check(mode.read_text() == "auto\n", "panel dry run leaves mode file alone")
+    auto.dry_run = False  # Everything from this point targets the fixture directory.
+    auto.refresh()
+    auto.mode.setCurrentIndex(auto.mode.findData("off"))
+    auto.apply.click()
+    check(mode.read_text()=="off\n" and auto.pending is not None and core.manual_fan_problem(),
+          "mode published atomically, manual fan editor waits for service acknowledgement")
+    s["mode"] = "off"
+    s["t"] = stamp(time.time())
+    publish(path, json.dumps(s))
+    auto.refresh()
+    check(auto.pending is None and "confirmed" in auto.feedback.text() and not core.manual_fan_problem(),
+          "applied Off acknowledged by service and manual editing released")
+    s["mode"] = "auto"
+    publish(path, json.dumps(s))
+    auto.refresh()
+    screenshot(w, "auto.png")
+
+    w.tabs.setCurrentIndex(4)
+    cal.preset.setCurrentText("Custom")
+    cal.custom.setText("mid=101")
+    cal.start.click()
+    check("percentage" in cal.message.text() and cal.process is None, "custom step validation")
+    cal.custom.setText("mid=70;cpu=80,gpu=80,mid=80")
+    cal.start.click()
+    check("--steps" in cal.message.text() and cal.process is None, "calibration dry run starts no hardware process")
+    cal.dry_run=False
+    cal.preset.setCurrentText("Observe")
+    with patch.object(core, "sound_device_busy", return_value=True):
+        cal.start.click()
+    check("busy" in cal.message.text() and cal.process is None, "busy internal device warning")
+    # Drive the real QProcess lifecycle using a child that has no device access or commands.
+    from textwrap import dedent
+    child = dedent("""
+        import json, os, signal, sys, time
+        def cancel(*_):
+            print(json.dumps(dict(kind='done',message='Cancelled.',cancelled=True)),flush=True)
+            sys.exit(0)
+        signal.signal(signal.SIGTERM,cancel)
+        path=sys.argv[1]
+        with open(path+'.part','w') as f:
+            f.write('t,stalls_per_s\\n12:00:00,0\\n')
+        os.replace(path+'.part',path)
+        for event in [dict(kind='step',message='Observe',index=1,total=1),
+                      dict(kind='sample',message='Reading',row={},elapsed=30),
+                      dict(kind='result',name='Observe',samples=15,mean=0,peak=0,watts=70)]:
+            print(json.dumps(event),flush=True)
+        time.sleep(30)
+    """)
+    with patch.object(core, "calibration_args", side_effect=lambda p,s,c,o: ["-Ic",child,str(o)]), \
+         patch.object(core, "sound_device_busy", return_value=False):
+        cal.start.click()
+        check(wait_for(lambda: cal.results.rowCount()==1), "streaming calibration progress and results")
+        check(auto.calibrating and cal.progress.value()==25, "active calibration holds UI controls")
+        cal.cancel.click()
+        check(wait_for(lambda: cal.process is None) and "Cancelled" in cal.message.text(), "cancel waits for owned child")
+    dest = Path(OUT) / "export.csv"
+    cal.export_csv(dest)
+    check(cal.export.isEnabled() and dest.read_text()==cal.output_path.read_text(), "exact atomic CSV export")
+    screenshot(w, "calibrate.png")
+    cal.dry_run = auto.dry_run = True
+    path.unlink()
+    core.FAND_UNIT.unlink()
+
+
 def main():
     app = QApplication([])
     check(QGuiApplication.platformName() == "offscreen", "platform is offscreen")
@@ -57,6 +186,7 @@ def main():
     if not w.ed_built:
         return finish(w)
     pump(300)
+    service_tabs(w, q)
 
     # ---- monitor: synthetic IRQ counts, no aplay ----
     wu = q.core.StallRate()
@@ -90,9 +220,9 @@ def main():
     check(core.parse_usbdrop("garbage\n") == {"devices": [], "none": False, "error": None}, "garbage gives no lines")
     w.show_usb(p)
     check(w.usb_table.rowCount() == 2, "usb table has 2 rows")
-    w.tabs.setCurrentIndex(2)
+    w.tabs.setCurrentIndex(3)
     pump(200)
-    w.grab().save(OUT + "/3-monitor.png")
+    screenshot(w, "3-monitor.png")
     w.show_usb(core.parse_usbdrop("USBDROP none\n"))
     check(w.usb_table.rowCount() == 0 and "No USB audio" in w.usb_msg.text(), "none case shown")
     w.show_usb(p)
@@ -109,12 +239,12 @@ def main():
         check(w.mon_proc is None and "aplay" in w.out.toPlainText(), "dry-run monitor start only shows the aplay command")
 
     # ---- screenshots of status and editor ----
-    w.tabs.setCurrentIndex(0)
-    pump(200)
-    w.grab().save(OUT + "/1-status.png")
     w.tabs.setCurrentIndex(1)
     pump(200)
-    w.grab().save(OUT + "/2-fan-curves.png")
+    screenshot(w, "1-status.png")
+    w.tabs.setCurrentIndex(2)
+    pump(200)
+    screenshot(w, "2-fan-curves.png")
 
     # ---- drag a point on the CPU chart ----
     ch = w.charts["cpu"]
@@ -151,26 +281,26 @@ def main():
     sv = w.stored[w.ed_prof]["mid"]["points"]
     check(w.send_pts("mid") == [list(x) for x in sv], "unchanged curve sends the exact stored pwm values")
     check(not w.dirty_lbl["cpu"].isVisibleTo(w), "reload clears unsaved marker")
-    w.grab().save(OUT + "/2b-fan-curves-after-reload.png")
+    screenshot(w, "2b-fan-curves-after-reload.png")
 
     # ---- fan preset click ----
-    w.tabs.setCurrentIndex(0)
+    w.tabs.setCurrentIndex(1)
     btn = w.preset_buttons["max"]
     btn.click()
     check(not btn.isEnabled() or w.acting or True, "buttons disabled while running (best effort)")
     check(wait_for(lambda: "fans-max.sh" in w.out.toPlainText() and not w.acting), "preset click shows fans-max.sh dry-run command")
     check("dry run, not executed" in w.out.toPlainText(), "preset result says dry run")
-    w.grab().save(OUT + "/4-after-preset.png")
+    screenshot(w, "4-after-preset.png")
 
     # ---- per-fan apply ----
-    w.tabs.setCurrentIndex(1)
+    w.tabs.setCurrentIndex(2)
     w.apply_btns["cpu"].click()
     exp = ",".join("%dc:%d" % tuple(p) for p in sv and w.stored[w.ed_prof]["cpu"]["points"])
     check(wait_for(lambda: "asusctl fan-curve" in w.out.toPlainText() and not w.acting), "apply result shows asusctl")
     txt = w.out.toPlainText()
     check(("--fan cpu --data " + exp) in txt, "apply sends exact stored cpu curve: " + exp)
     check("--mod-profile %s" % w.ed_prof in txt and "--enable-fan-curves true" in txt, "apply includes profile and enable command")
-    w.grab().save(OUT + "/5-after-apply.png")
+    screenshot(w, "5-after-apply.png")
 
     # ---- custom preset save/delete through the shared code path (writes then removes ui/custom-presets.json)
     existed = os.path.exists(core.PRESET_FILE)
@@ -187,6 +317,7 @@ def main():
 def finish(w):
     w.close()
     pump(100)
+    print("Screenshots:", OUT)
     print("\n%d failure(s)" % len(fails), flush=True)
     return 1 if fails else 0
 
