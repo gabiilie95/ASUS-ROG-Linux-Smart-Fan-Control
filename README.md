@@ -292,8 +292,8 @@ Click counting in recordings (mono 16-bit 48 kHz WAV, high-passed at 17.5 kHz fi
 
 ## Smart fan service
 
-`rog-fand` samples the G814JZ every two seconds. In Performance, smoothed GPU watts select
-minimum CPU/GPU/middle fan levels. Each point keeps the higher of the calibrated balanced PWM
+`rog-fand` samples the G814JZ every two seconds. Smoothed GPU watts select minimum
+CPU/GPU/middle fan levels. Each point keeps the higher of the calibrated balanced PWM
 and the requested floor. Two consecutive USB drop samples trigger a boost and raise the margin
 for that power range. Status reports missing sensors. The conservative floor of at least 60/60/80 applies only when
 GPU power, a temperature or a fan speed has been missing for three consecutive samples (6 s);
@@ -301,6 +301,18 @@ a single gap holds the last GPU reading. CPU power (RAPL) and usbmon are reporte
 but never force the fallback, because they only feed the heat display and the feedback.
 USB skips in the first second of a stream (after 2 s without traffic) are reported as
 `warmup_skipped` and do not count as drops.
+
+**Profiles.** The service protects the platform profiles listed in `profiles` in
+`/etc/rog-fand/config.json`. By default that is all three: Performance, Balanced and Quiet. It used to
+act only in Performance. Then on 2026-11-17 one switch to Quiet (Fn+F5 or a power-profile click)
+silently removed the protection mid-game, and the USB interface lost 14 % of its packets.
+- **Performance** always runs the configured base curve raised to the floors.
+- **Balanced and Quiet** keep the laptop's own curves while their floors are zero, so they stay as
+  quiet as before at idle. When load or USB drops call for airflow, the service saves that profile's
+  own curves and enable flags in `/var/lib/rog-fand/restore-<profile>.json`, then writes the base
+  curve raised to the floors. When the floors are back at zero (or in `off`), it restores them
+  exactly, which normally just switches custom curves off again.
+- Remove a profile from `profiles` to leave it alone entirely.
 
 ```sh
 python3 -IB service/rog_fand.py --replay data/logs/10-fan-calibration-light.csv
@@ -323,8 +335,10 @@ Set `log_csv` to true for per-minute sample files in `/var/log/rog-fand/`.
 
 `service/install.sh status` shows unit status. `sudo service/install.sh undo` stops the service,
 restores its base, and removes the installation, learned margins and sample logs. If a profile
-switch interrupts restoration, the service saves the exact base in `/var/lib/rog-fand/restore.json`.
-Return to Performance for recovery on the next service run, or repeat undo there.
+switch interrupts restoration, the receipt stays in `/var/lib/rog-fand/` (`restore.json` for
+Performance, `restore-<profile>.json` for the others). A profile's curves can only be written while it
+is active, so return to the profile that `--restore` or undo names, and the next service run (or a
+repeated undo) finishes the restoration.
 
 Things to know once it is installed:
 - In `auto` and the presets, the Performance curve is the configured base (in

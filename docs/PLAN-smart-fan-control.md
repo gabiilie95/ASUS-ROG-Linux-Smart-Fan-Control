@@ -85,8 +85,11 @@ Applying (fail-safe by construction):
 - Never write a flat "fixed speed" curve. Write `curve_f(T) = max(base_f(T), floor_f)` for each of the
   8 points, where `base` is the balanced curve. If the service dies, the EC still ramps every fan to
   100 % by temperature.
-- Only touch the Performance profile, and only while `platform_profile` is `performance`. If the owner
-  switches profile, stop overriding and log it.
+- Only touch a profile while `platform_profile` is that profile. (Originally Performance only; since
+  2026-11-17 every profile in the `profiles` config list, default all three. Balanced and Quiet
+  are touched only while their floors are above zero, with their own curves and enable flags saved
+  in a per-profile receipt and restored exactly afterwards.) If the owner switches profile, finish
+  or defer the write and log it.
 - Write only when a floor changes by at least 5 points. Up: immediately. Down: after a 60 s hold, at
   most 5 points per 20 s (no surging).
 - On stop (SIGTERM, `ExecStopPost`) and on any unhandled error: restore the base curve exactly.

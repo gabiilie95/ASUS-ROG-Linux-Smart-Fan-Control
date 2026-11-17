@@ -84,10 +84,10 @@ PY
             if [[ -f $unit ]]; then
                 systemctl stop rog-fand.service
             fi
-            # Retry a stop-time restore before removing the only copy of its base curve.
-            if [[ -f $state/restore.json ]]; then
+            # Retry a stop-time restore before removing the only copy of a profile's own curves.
+            if compgen -G "$state/restore*.json" > /dev/null; then
                 /usr/bin/python3 -IB "$app/rog_fand.py" --restore || {
-                    echo "Restore pending. Select Performance and repeat undo." >&2
+                    echo "Restore pending. Select the profile named above and repeat undo." >&2
                     exit 1
                 }
             fi
