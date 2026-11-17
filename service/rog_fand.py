@@ -659,6 +659,8 @@ def main(argv=None):
     modes.add_argument("--dry-run", action="store_true", help="read sensors and print JSON only")
     modes.add_argument("--replay", type=Path, metavar="CSV", help="replay recorded GPU decisions")
     modes.add_argument("--restore", action="store_true", help="finish a pending base restore")
+    modes.add_argument("--restore-on-stop", action="store_true",
+                       help="systemd cleanup: keep inactive-profile receipts for later recovery")
     parser.add_argument("--seconds", type=int, help="end the dry run after this many seconds")
     args = parser.parse_args(argv)
     if args.seconds is not None and (not args.dry_run or args.seconds <= 0):
@@ -675,13 +677,15 @@ def main(argv=None):
         lock = os.open(STATE, os.O_DIRECTORY)
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            if args.restore:
+            if args.restore or args.restore_on_stop:
                 actuator = Actuator()
                 if actuator.restore():
                     return 0
                 print("restore pending for " + ", ".join(actuator.pending()) + "; select that profile "
                       "and run --restore again", file=sys.stderr)
-                return 1
+                # Deferred profiles remain recoverable on their next activation. Actual command
+                # or receipt errors still raise, so systemd reports failed cleanup.
+                return 0 if args.restore_on_stop else 1
             run_service(False, None)
         finally:
             os.close(lock)
