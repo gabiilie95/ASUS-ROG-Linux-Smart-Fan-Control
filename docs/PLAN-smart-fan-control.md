@@ -140,12 +140,45 @@ In `ui/rog-panel-qt.py` (shared logic in `ui/rogcore.py`):
 - Output `model.json`: per heat level the cheapest clean combination plus fitted per-fan cooling
   effect; and a static fallback curve derived from it.
 
+### 4. Learning as it goes (Phase 4, after the load test)
+
+Goal: the service learns, from normal use, which fan mix keeps the chipset area cool enough at the
+lowest noise, instead of relying only on the fixed table.
+
+Approach: small, explainable models in the standard library, not deep learning.
+- **Thermal response model.** Recursive least squares, updated every sample, predicting the board
+  sensor and CPU/GPU temperatures from CPU W, GPU W and the three fan speeds. It learns "how much each
+  fan cools per 1000 rpm at this heat" from ordinary variation, with no deliberate experiments.
+- **Stall-risk model.** Logistic regression predicting USB drops in the next 30 s from heat, fan
+  speeds and temperatures. Bootstrap it from the calibration logs (`data/logs/10-13`, about 2000
+  labelled samples across loads and fan mixes) and the Phase 3 load test; refine it with the
+  service's own drop observations.
+- **Choice.** Each decision picks the quietest fan mix (cost weighted per fan, middle fan highest,
+  steeper above about 6000 rpm) whose predicted drop risk is below a threshold. The existing table is
+  the fallback whenever the model is unsure (few samples in this heat range, or poor recent
+  accuracy).
+- **Exploration, kept safe.** Never jump: try a quieter mix only one 5-point step at a time, only
+  when the model is confident, at most every 10 minutes, and revert at once on any drop event. The
+  existing drop boost and per-bin margins stay as the safety net.
+- **Your ear in the loop.** An "it's too loud" / "crackle heard" button in the panel's Auto tab adds
+  labels the sensors can't: noise tolerance and stalls on the internal speakers.
+
+Guard rails: never below the base curve (already true); floors only within [table floor - 15,
+100]; model and learned data in `/var/lib/rog-fand/learned.json` with a version and a reset
+button; the panel shows what was learned (for example "middle fan: -2.1 C per 1000 rpm at
+heavy load") and the model's recent accuracy. Enable `log_csv` with rotation to keep training data.
+
+Done when: offline, the model trained on logs 10-12 predicts the stalls in log 13 better than the
+table; live, a week of normal use shows equal or fewer drop events than the table with lower
+average fan speed, and the owner prefers it.
+
 ## Phases and acceptance
 
 | Phase | Done when |
 |---|---|
 | 1 service | Replay tests over `data/logs/10-13*.csv` give sensible floors (light-load log: middle >= 70 %; heavy: about 80/80/80). Dry run on the real machine for 10 minutes of gaming prints plausible decisions and writes nothing. Install/undo script reviewed. Owner then installs it; stop restores the base curve exactly; no writes while the profile is not Performance; a real session shows zero USB drops or a logged boost. |
 | 2 panel | Offscreen self-test extended and passing; owner checks the tabs on screen. |
+| 4 learning | Offline: beats the table on log 13 when trained on logs 10-12. Live: a week of normal use with no more drop events than the table and lower average fan speed. |
 | 3 load test | Generator levels verified; one unattended run produces `model.json`; a 20-minute validation in two games shows 0 stalls with the model active and the highest fan speed reported. |
 
 ## Rules for whoever builds it
