@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """Shared logic for the ROG G18 settings panels (web and Qt): readers, presets, validation, whitelisted actions. Standard library only."""
 import glob, json, os, re, subprocess, threading, time
+import math
+from datetime import datetime
+from pathlib import Path
+import tempfile
 import os as _os
 # The laptop's own sound chip is ALSA card "PCH"; its number changes between boots
 # (it was card 0 until 2026-11-16, then card 1), so look it up instead of assuming card 0.
-HDA_LABEL = "snd_hda_intel:" + (_os.path.basename(_os.readlink("/proc/asound/PCH"))
-                                if _os.path.islink("/proc/asound/PCH") else "card0")
+HDA_LABEL = ("snd_hda_intel:" + _os.path.basename(_os.readlink("/proc/asound/PCH"))
+             if _os.path.islink("/proc/asound/PCH") else None)
 
 UI = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(UI)
@@ -46,7 +50,12 @@ FAN_NAMES = {1: "cpu", 2: "gpu", 3: "mid"}
 FANS = ("cpu", "gpu", "mid")
 PROFILES = ("performance", "balanced", "quiet")
 FAN_RON = "/etc/asusd/fan_curves.ron"
+FAND_PROGRAM = Path(ROOT) / "service" / "rog_fand.py"
 PRESET_FILE = os.path.join(UI, "custom-presets.json")
+if (Path(ROOT) / "rog_fand.py").is_file():  # Installed layout beside the root-owned service.
+    FAND_PROGRAM = Path(ROOT) / "rog_fand.py"
+    config_home = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+    PRESET_FILE = str(config_home / "rog-settings-panel" / "custom-presets.json")
 MAX_PRESETS = 20
 NAME_RE = re.compile(r"[A-Za-z0-9 _-]{1,32}")
 
@@ -114,6 +123,7 @@ def load_custom_presets():
         return {}
 
 def store_custom_presets(d):
+    Path(PRESET_FILE).parent.mkdir(parents=True, exist_ok=True)
     tmp = PRESET_FILE + ".tmp"
     with open(tmp, "w") as f:
         json.dump(d, f, indent=1)
@@ -334,6 +344,10 @@ def preset_action(name, body):
     return {"ok": True, "output": "Deleted preset '%s'." % pn}
 
 def execute(name, argv, timeout):
+    if name == "fan-preset" or (name == "fan-curve" and "performance" in argv):
+        reason = manual_fan_problem()
+        if reason:
+            return {"ok": False, "output": reason}
     if name == "stall-test":
         st = rd(STALL_STATUS)
         if st is not None and "RUNNING" in st:
@@ -371,7 +385,7 @@ def sound_device_busy():
 def parse_irq_total(text, label=HDA_LABEL):
     """Sum of the per-CPU counts on the /proc/interrupts line for label; None if absent."""
     for line in (text or "").splitlines():
-        if label in line:
+        if label and label in line:
             total, seen = 0, False
             for tok in line.split(":", 1)[1].split():
                 if not tok.isdigit():
@@ -427,3 +441,133 @@ def parse_usbdrop(text):
             except (KeyError, ValueError):
                 continue
     return out
+
+
+# The root service owns status. Modes are the desktop user's only control input.
+FAND_RUN = Path("/run/rog-fand")
+FAND_UNIT = Path("/etc/systemd/system/rog-fand.service")
+FAND_MODES = {"auto": "Automatic", "off": "Off · base curve", "preset:light": "Light",
+              "preset:heavy": "Heavy", "preset:max": "Maximum"}
+
+
+def validate_fand_sample(s):
+    if not isinstance(s, dict) or s.get("version") != 1:
+        raise ValueError("Unsupported service status version")
+    if s.get("mode") not in FAND_MODES or not isinstance(s.get("dry_run"), bool):
+        raise ValueError("Invalid service mode")
+    stamp = datetime.fromisoformat(s["t"])
+    if stamp.tzinfo is None:
+        raise ValueError("Missing status timezone")
+    def metric(v):
+        if v is not None and (type(v) not in (float, int) or not math.isfinite(v)):
+            raise ValueError("Invalid sensor value")
+    sensors = s["sensors"]
+    if sensors.get("profile") is not None and not isinstance(sensors["profile"], str):
+        raise ValueError("Invalid platform profile")
+    for key in ("cpu_w", "gpu_w", "board_c"):
+        metric(sensors.get(key))
+    for fan in FANS:
+        metric(sensors.get(fan + "_rpm"))
+        floor = s["floors"][fan]
+        metric(floor)
+        if floor is None or not 0 <= floor <= 100:
+            raise ValueError("Invalid fan floor")
+    metric(s["heat_w"])
+    metric(s["smoothed_gpu_w"])
+    for key, value in s["margins"].items():
+        if not math.isfinite(float(key)):
+            raise ValueError("Invalid GPU power bin")
+        metric(value)
+        if value is None:
+            raise ValueError("Missing GPU-bin margin")
+    usb = s["usb"]
+    if not isinstance(usb["devices"], list) or not isinstance(s["events"], list):
+        raise ValueError("Invalid service history")
+    for device in usb["devices"]:
+        metric(device["drops_per_s"])
+        if device["drops_per_s"] is None:
+            raise ValueError("Missing USB drop rate")
+    for event in s["events"]:
+        if not all(isinstance(event[k], str) for k in ("t", "message")):
+            raise ValueError("Invalid service event")
+    if not isinstance(s["unavailable"], list) or not all(isinstance(x, str) for x in s["unavailable"]):
+        raise ValueError("Invalid sensor status")
+    return stamp.timestamp()
+
+
+def fan_service():
+    try:
+        s = json.loads((FAND_RUN / "status.json").read_text())
+        stamp = validate_fand_sample(s)
+        if not -5 <= time.time() - stamp <= 8:
+            return "Stale", None
+        return ("Dry run" if s["dry_run"] else "Running"), s
+    except FileNotFoundError:
+        return ("Stopped" if FAND_UNIT.exists() else "Not installed"), None
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError):
+        return "Unreadable", None
+
+
+def request_fan_mode(mode):
+    if mode not in FAND_MODES:
+        raise ValueError("Unknown fan mode")
+    if fan_service()[0] != "Running":
+        raise ValueError("A fresh service sample is needed to change mode")
+    directory = FAND_RUN / "control"
+    with tempfile.NamedTemporaryFile(dir=directory, mode="w", delete=False) as out:
+        tmp = Path(out.name)
+        try:
+            out.write(mode + "\n")
+            out.flush()
+            os.fsync(out.fileno())
+            os.replace(tmp, directory / "mode")
+        finally:
+            tmp.unlink(missing_ok=True)
+
+
+def manual_fan_problem(holding_lease=False):
+    state, s = fan_service()
+    if state in ("Not installed", "Stopped", "Dry run"):
+        return None
+    if s and s["mode"] == "off" and not s.get("invalid_mode") and (s.get("applied") or holding_lease):
+        path = FAND_RUN / "control/mode" if (FAND_RUN / "control").is_dir() else FAND_RUN / "mode"
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            try:
+                if os.read(fd, 64) in (b"off", b"off\n"):
+                    return None
+            finally:
+                os.close(fd)
+        except OSError:
+            pass
+    return "Set the fan service to Off in Auto and wait for the base curve before editing Performance."
+
+
+HEAVY_STEPS = "cpu=100,gpu=100,mid=100;cpu=80,gpu=80,mid=80;mid=100;cpu=70,gpu=70,mid=70"
+
+
+def calibration_steps(text):
+    steps = []
+    for part in text.split(";"):
+        spec = {}
+        for item in part.split(","):
+            match = re.fullmatch(r"\s*(cpu|gpu|mid)\s*=\s*(\d{1,3})\s*", item)
+            if not match or match[1] in spec or int(match[2]) > 100:
+                raise ValueError("Use cpu, gpu or mid once per step with a percentage from 0 to 100")
+            spec[match[1]] = int(match[2])
+        steps.append((" + ".join(f"{fan} {v} %" for fan, v in spec.items()), spec))
+    return steps
+
+
+def calibration_args(preset, seconds, custom, output):
+    if preset not in ("Light", "Heavy", "Custom", "Observe") or type(seconds) != int or seconds < 1:
+        raise ValueError("Invalid calibration preset or duration")
+    args = ["-IB", os.path.join(TOOLS, "fan-calibrate.py"), "--panel-json", "--out", str(output)]
+    if preset == "Observe":
+        return args + ["--observe", str(seconds)]
+    args += ["--step", str(seconds)]
+    if preset != "Light":
+        steps = HEAVY_STEPS if preset == "Heavy" else custom
+        calibration_steps(steps)
+        args += ["--steps", steps]
+    return args
