@@ -171,7 +171,7 @@ def calibration_lease():
 
 COLUMNS = ("t", "step", "label", "stalls_per_s", "board_c", "cpu_c", "gpu_c", "gpu_w",
            "cpu_rpm", "gpu_rpm", "mid_rpm", "counter_ok", "elapsed_s", "cpu_w", "cpu_w_age_s",
-           "cpu_pct", "gpu_pct", "mid_pct", "observe", "noise_db")
+           "cpu_pct", "gpu_pct", "mid_pct", "observe", "noise_db", *core.BOARD_TEMPS)
 
 
 def cpu_power():
@@ -313,7 +313,7 @@ def run(a, steps, stop):
                                None if rate is None else round(rate, 2), zone("SEN3"),
                                zone("x86_pkg_temp"), gt, gw, *[rpm[f+"_rpm"] for f in FANS], int(ok),
                                round(elapsed, 3), cw, cpu_age, *[spec.get(f) for f in FANS], int(bool(a.observe)),
-                               meter.level() if meter else None]))
+                               meter.level() if meter else None, *core.board_temps().values()]))
                     writer.writerow(row.values())
                     readings.append((elapsed, row))
                     report("sample", f"{name} · {elapsed:.0f} s · {row['stalls_per_s']} stalls/s",

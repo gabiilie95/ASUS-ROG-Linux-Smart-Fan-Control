@@ -241,6 +241,45 @@ class CurveTest(unittest.TestCase):
 
 
 class SensorTest(unittest.TestCase):
+    def test_board_temps_by_stable_names(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "hwmon"
+            devices = Path(tmp) / "devices"
+            def hwmon(index, name, millic, device):
+                h = root / f"hwmon{index}"
+                h.mkdir(parents=True)
+                (h / "name").write_text(name + "\n")
+                if millic is not None:
+                    (h / "temp1_input").write_text(f"{millic}\n")
+                (devices / device).mkdir(parents=True, exist_ok=True)
+                (h / "device").symlink_to(devices / device)
+            # Numbering in reverse of the device order: names must follow the devices.
+            hwmon(1, "spd5118", 54000, "12-0052")
+            hwmon(2, "spd5118", 52500, "12-0050")
+            hwmon(3, "nvme", 43900, "nvme1")
+            hwmon(4, "nvme", 41900, "nvme0")
+            hwmon(5, "r8169_0_6c00:00", 50000, "r8169-0-6c00:00")
+            hwmon(6, "iwlwifi_1", 999999, "thermal_zone5")
+            hwmon(7, "coretemp", 70000, "coretemp.0")
+            temps = sensors.board_temps(root)
+        self.assertEqual(temps, dict(dimm_a_c=52.5, dimm_b_c=54.0, lan_c=50.0, ssd1_c=41.9, ssd2_c=43.9,
+                                     wifi_c=None))
+        self.assertEqual(tuple(temps), sensors.BOARD_TEMPS)
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(sensors.board_temps(Path(tmp)), dict.fromkeys(sensors.BOARD_TEMPS))
+
+    def test_sample_csv_has_board_columns(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(fand, "LOG", Path(tmp)):
+            log = fand.SampleCsv()
+            usb = dict(audio_active=True, devices=[dict(skipped=3)])
+            log.add("2026-11-19T12:00:00.000+00:00", dict(gpu_w=100, board_c=60), (35, 40, 70), usb,
+                    dict(sensors.BOARD_TEMPS and {k: 50.0 for k in sensors.BOARD_TEMPS}, lan_c=51.5))
+            log.add("2026-11-19T12:00:02.000+00:00", dict(gpu_w=100, board_c=60), (35, 40, 70), usb)
+            header, first, second = next(Path(tmp).glob("*.csv")).read_text().splitlines()
+        self.assertTrue(header.endswith(",".join(sensors.BOARD_TEMPS)))
+        self.assertIn("51.5", first.split(","))
+        self.assertTrue(second.endswith("," * len(sensors.BOARD_TEMPS)), "absent readings are empty")
+
     def test_reference_capture(self):
         counts = sensors.UsbCounts()
         with gzip.open(ROOT / "data/fixtures/usbmon-volt-isoc-out-completions-30s.txt.gz", "rt") as src:
@@ -380,6 +419,7 @@ class LifecycleTest(unittest.TestCase):
         status = self.path / "status.json"
         self.assertEqual(status.stat().st_mode & 0o777, 0o644)
         self.assertEqual(fand.read_json(status)["floors"]["mid"], 90)
+        self.assertEqual(set(fand.read_json(status)["board_temps"]), set(sensors.BOARD_TEMPS))
         self.assertEqual(fand.read_json(status)["table"], CFG["table"])
         self.assertFalse(self.actuator.receipt.exists())
         self.assertEqual(self.command.call_args_list[-4].args[0][-1],

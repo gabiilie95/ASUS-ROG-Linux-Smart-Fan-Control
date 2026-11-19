@@ -75,7 +75,7 @@ MISSING_LIMIT = 3       # consecutive samples without a temperature before stopp
 STATUS_POLL = 0.5       # seconds between reads of the service status while waiting
 COLUMNS = ("t", "level", "target_gpu_w", "cpu_threads", "step", "cpu_floor", "gpu_floor", "mid_floor",
            "phase", "elapsed_s", "stalls_per_s", "usb_drops", "cpu_w", "gpu_w", "cpu_c", "gpu_c",
-           "board_c", "cpu_rpm", "gpu_rpm", "mid_rpm", "noise_db")
+           "board_c", "cpu_rpm", "gpu_rpm", "mid_rpm", "noise_db", *core.BOARD_TEMPS)
 
 
 class Cancelled(Exception):
@@ -262,7 +262,8 @@ class Tuner:
                    usb_drops=s["usb_drops"],
                    **{k: None if s.get(k) is None else round(s[k], 1)
                       for k in ("cpu_w", "gpu_w", "cpu_c", "gpu_c", "board_c")},
-                   **{f + "_rpm": s.get(f + "_rpm") for f in FANS}, noise_db=s.get("noise_db"))
+                   **{f + "_rpm": s.get(f + "_rpm") for f in FANS}, noise_db=s.get("noise_db"),
+                   **{k: s.get(k) for k in core.BOARD_TEMPS})
         self.writer.writerow([row[c] for c in COLUMNS])
         within = min(0.95, (max(0, self.level_steps - 1) + min(1, elapsed / self.step_s)) / 4)
         drops = "--" if s["usb_drops"] is None else s["usb_drops"]
@@ -623,7 +624,7 @@ class Hardware:
         return dict(stalls_per_s=rate, usb_drops=drops if self.usb_name else None, cpu_w=self.cpu_w,
                     gpu_w=gpu_w, gpu_c=gpu_c, cpu_c=cal.zone("x86_pkg_temp"), board_c=cal.zone("SEN3"),
                     profile=cal.rd(PROFILE), ac=mains_online(), **{f + "_rpm": rpm[f + "_rpm"] for f in FANS},
-                    noise_db=self.meter.level() if self.meter is not None else None)
+                    noise_db=self.meter.level() if self.meter is not None else None, **core.board_temps())
 
 
 def end(proc):

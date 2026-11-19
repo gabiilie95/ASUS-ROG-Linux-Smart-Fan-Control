@@ -277,6 +277,16 @@ class QuieterMixTest(unittest.TestCase):
             at.main(["--plan", "--mic", "alsa_input.usb-Mic-00.mono"])
         self.assertIn("measured from alsa_input.usb-Mic-00.mono", out.getvalue())
 
+    def test_board_temperatures_in_the_log(self):
+        m = FakeMachine({80: 215})
+        m.override = lambda machine: {"lan_c": 61.5, "dimm_a_c": 58.0}
+        t = tuner(m, "80:2")
+        t.run()
+        rows = list(csv.DictReader(io.StringIO(",".join(at.COLUMNS) + "\n" + t.csv.getvalue())))
+        self.assertTrue(rows and all(r["lan_c"] == "61.5" and r["dimm_a_c"] == "58.0" and r["ssd1_c"] == ""
+                                     for r in rows))
+        self.assertEqual(at.COLUMNS[-len(at.core.BOARD_TEMPS):], at.core.BOARD_TEMPS)
+
     def test_switch_off(self):
         m = MiddleHeavyMachine({120: 270})
         t = tuner(m, "120:3")

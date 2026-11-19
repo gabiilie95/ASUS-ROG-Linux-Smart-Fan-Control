@@ -202,6 +202,13 @@ to the design below:
 - Output `model.json`: per heat level the cheapest clean combination plus fitted per-fan cooling
   effect; and a static fallback curve derived from it.
 
+**Board sensors (added 2026-11-19).** Calibration and auto-tune CSVs, the service status and its
+per-minute logs record six motherboard-area temperatures besides SEN3: memory modules, Ethernet
+chip, SSDs and Wi-Fi. The chipset has no readable sensor. Use the first auto-tune data to rank them
+by how well they separate stalled from clean steps and how early they rise. The best one can then
+replace SEN3 in the heat-soak guard, trigger an early raise when it climbs fast, and allow a
+quicker ramp-down once it has cooled.
+
 ### 4. Learning as it goes (Phase 4, after the load test)
 
 Goal: the service learns, from normal use, which fan mix keeps the chipset area cool enough at the
