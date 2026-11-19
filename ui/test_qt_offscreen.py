@@ -242,7 +242,7 @@ def autotune_tests(w):
     w.tabs.setCurrentIndex(4)
     cal.preset.setCurrentText(fan_calibration.AUTOTUNE)
     check(not cal.form.isRowVisible(cal.seconds) and not cal.form.isRowVisible(cal.custom)
-          and "60-90" in cal.description.text(), "auto-tune hides step settings and explains the run")
+          and "60-110" in cal.description.text(), "auto-tune hides step settings and explains the run")
     with patch.object(core, "log_dir", return_value=logs):
         cal.start.click()
     check("autotune.py" in cal.message.text() and "--panel-json" in cal.message.text() and cal.process is None,

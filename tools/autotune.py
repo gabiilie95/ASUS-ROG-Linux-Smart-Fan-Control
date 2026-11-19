@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Fan auto-tune: find the quietest fan floors that keep audio clean at several heat levels and
-propose a GPU-power table for rog-fand. Unattended, about 60-90 minutes, loud.
+propose a GPU-power table for rog-fand. Unattended, about 60-110 minutes, loud.
 
     python3 tools/autotune.py                    # full run, log in data/logs/autotune-<time>.csv
     python3 tools/autotune.py --plan             # print the plan and change nothing
@@ -61,6 +61,12 @@ LEVELS = "160:4,120:3,80:2,40:2"
 LADDER = ((100, 100, 100), (90, 90, 90), (80, 80, 80), (75, 75, 75), (70, 70, 75), (60, 60, 70),
           (50, 50, 70), (35, 40, 70), (25, 30, 60), (0, 0, 50), (0, 0, 0))
 LIMITS = {"cpu_c": 95, "gpu_c": 85, "board_c": 90}
+# Quieter-mix search. Total airflow is what keeps the chipset area clean (calibration 2026-11-16:
+# middle 60 % plus another fan at full was as clean as middle 70 %), and the middle fan is the
+# whiny one. After a level's quietest clean ladder step, move these many points from the middle fan
+# to the CPU and GPU fans, in order, keeping only mixes that score quieter; stop at the first stall.
+REBALANCE = (10, 20)
+NOISE_EXPONENT = 5      # fan sound power grows roughly with speed^5 (fan affinity laws)
 STALL_LIMIT = 1.0       # stalls per second on the internal counter, mean of the judged window
 PERIOD = 2              # seconds between samples
 MISSING_LIMIT = 3       # consecutive samples without a temperature before stopping
@@ -137,6 +143,38 @@ def safety_reason(s, limits=LIMITS, performance=True):
     return None
 
 
+def load_noise_weights():
+    """rog-fand's noise_weights (cpu, gpu, middle): the repository or the installed example config."""
+    for path in (HERE.parent / "service" / "config.example.json", HERE.parent / "config.example.json"):
+        try:
+            weights = tuple(json.loads(path.read_text())["noise_weights"])
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+        if len(weights) == 3 and all(isinstance(w, (int, float)) and w >= 0 for w in weights):
+            return weights
+    return (1, 1, 2)
+
+
+NOISE_WEIGHTS = load_noise_weights()
+
+
+def noise_cost(floors, weights=NOISE_WEIGHTS):
+    """Relative noise of a floor mix. Floors stand in for fan speeds; sound power grows roughly with
+    speed^5, so one fast fan is louder than two medium ones, and the weights count the middle fan's
+    whine extra."""
+    return sum(w * (p / 100) ** NOISE_EXPONENT for w, p in zip(weights, floors))
+
+
+def rebalanced(floors, shift, weights=NOISE_WEIGHTS):
+    """`floors` with `shift` points moved from the middle fan to the CPU and GPU fans, or None when
+    that would not be quieter (or changes nothing)."""
+    c, g, m = floors
+    mix = (min(100, c + shift), min(100, g + shift), max(0, m - shift))
+    if mix == tuple(floors) or noise_cost(mix, weights) >= noise_cost(floors, weights):
+        return None
+    return mix
+
+
 def judge(window, threshold=STALL_LIMIT):
     rates = [r["stalls_per_s"] for r in window if r["stalls_per_s"] is not None]
     drops = sum(r["usb_drops"] or 0 for r in window)
@@ -180,13 +218,14 @@ class Tuner:
 
     def __init__(self, machine, levels, ladder, report, writer, *, step_s=180, judge_s=120,
                  warmup_s=120, period=PERIOD, threshold=STALL_LIMIT, limits=LIMITS, max_s=None,
-                 clock=lambda: time.strftime("%H:%M:%S")):
+                 clock=lambda: time.strftime("%H:%M:%S"), rebalance=REBALANCE, weights=NOISE_WEIGHTS):
         if not period <= judge_s <= step_s:
             raise ValueError("The judged part must be at least one sample and at most the step")
         self.machine, self.levels, self.ladder = machine, levels, check_ladder(ladder)
         self.report, self.writer, self.clock = report, writer, clock
         self.step_s, self.judge_s, self.warmup_s, self.period = step_s, judge_s, warmup_s, period
         self.threshold, self.limits, self.max_s = threshold, limits, max_s
+        self.rebalance, self.weights = tuple(rebalance or ()), weights
         self.results, self.steps = [], []
         self.missing = self.step_no = 0
         self.started = None
@@ -243,11 +282,13 @@ class Tuner:
             if elapsed >= seconds:
                 return
 
-    def step(self, level, rung, watts):
-        floors = self.ladder[rung]
+    def step(self, level, rung, watts, floors=None):
+        """Judge one fan mix: a ladder rung, or `floors` (a quieter mix tried after that rung)."""
+        mix = floors is not None
+        floors = tuple(floors) if mix else self.ladder[rung]
         self.step_no += 1
         self.level_steps += 1
-        label = "%d/%d/%d %%" % floors
+        label = ("quieter mix %d/%d/%d %%" if mix else "%d/%d/%d %%") % floors
         self.report("step", "%s · fans %s" % (self.level_label(level), label), level=self.level_index,
                     index=self.step_no, rung=rung, floors=list(floors))
         self.machine.set_floors(floors)
@@ -270,7 +311,7 @@ class Tuner:
                 break
         verdict = judge(window, self.threshold)
         verdict.update(name="Level %d · %s" % (self.level_index, label), level=self.level_index,
-                       step=self.step_no, rung=rung, floors=list(floors), early=early,
+                       step=self.step_no, rung=rung, floors=list(floors), early=early, mix=mix,
                        watts=mean(r.get("gpu_w") for r in window), cpu_w=mean(r.get("cpu_w") for r in window),
                        board_c=window[-1].get("board_c") if window else None)
         self.steps.append(verdict)
@@ -303,17 +344,36 @@ class Tuner:
                     clean = rung
                     break
         floors = self.ladder[clean] if clean is not None else (100, 100, 100)
-        # The safe curve between levels: back to the last clean combination at once.
-        self.machine.set_floors(floors)
+        chosen, tried = floors, []
+        if clean is not None:
+            # Same heat, same rules: shift airflow off the whiny middle fan while it stays clean.
+            for shift in self.rebalance:
+                candidate = rebalanced(floors, shift, self.weights)
+                if candidate is None or noise_cost(candidate, self.weights) >= noise_cost(chosen, self.weights):
+                    continue
+                stalled = self.step(level, clean, watts, candidate)["stalled"]
+                tried.append((shift, candidate, stalled))
+                if stalled:
+                    break
+                chosen = candidate
+        # The safe curve between levels: back to the quietest clean combination at once.
+        self.machine.set_floors(chosen)
         self.machine.stop_load()
         measured = mean(watts)
         result = dict(level=self.level_index, target_gpu_w=level.gpu_w, cpu_threads=level.cpu_threads,
                       gpu_w=round(measured if measured is not None else level.gpu_w, 1),
-                      floors=list(floors), rung=clean, clean=clean is not None, steps=self.level_steps)
+                      floors=list(chosen), ladder_floors=list(floors), rebalanced=chosen != floors,
+                      tried=[dict(shift=s, floors=list(f), stalled=st) for s, f, st in tried],
+                      noise=round(noise_cost(chosen, self.weights), 4),
+                      rung=clean, clean=clean is not None, steps=self.level_steps)
         self.results.append(result)
-        self.report("level-result", "%s: %s" % (
-            self.level_label(level), "quietest clean fans %d/%d/%d %%" % floors if clean is not None
-            else "not clean even at the loudest combination tried; table uses 100/100/100 %"), **result)
+        if clean is None:
+            text = "not clean even at the loudest combination tried; table uses 100/100/100 %"
+        elif chosen != floors:
+            text = "quietest clean fans %d/%d/%d %% (moved from %d/%d/%d %%)" % (chosen + floors)
+        else:
+            text = "quietest clean fans %d/%d/%d %%" % floors
+        self.report("level-result", "%s: %s" % (self.level_label(level), text), **result)
         return result
 
     def run(self):
@@ -601,6 +661,7 @@ def run(a, levels, ladder, stop):
         writer = csv.writer(fh)
         writer.writerow(COLUMNS)
         tuner = Tuner(hw, levels, ladder, report, writer, step_s=a.step, judge_s=a.judge,
+                      rebalance=() if getattr(a, "no_rebalance", False) else REBALANCE,
                       warmup_s=a.warmup, max_s=a.max_minutes * 60)
         try:
             hw.start()
@@ -688,6 +749,13 @@ def plan(a, levels, ladder):
           % LIMITS)
     print("Stall rule: mean above %.1f/s on the internal counter, or any USB drop%s." % (
         STALL_LIMIT, "" if a.usb else " (USB not measured: --no-usb)"))
+    if a.no_rebalance:
+        print("Quieter-mix search: off (--no-rebalance).")
+    else:
+        print("Quieter-mix search: after each level's quietest clean step, move %s points from the middle "
+              "fan to the CPU and GPU fans while that scores quieter and stays clean (noise weights "
+              "cpu/gpu/middle %g/%g/%g, sound ~ speed^%d); up to %d extra steps per level."
+              % (" then ".join(map(str, REBALANCE)), *NOISE_WEIGHTS, NOISE_EXPONENT, len(REBALANCE)))
     print("Log: %s" % a.out)
 
 
@@ -704,6 +772,8 @@ def main(argv=None):
     ap.add_argument("--out", default=str(core.log_dir() / time.strftime("autotune-%Y%m%d-%H%M.csv")))
     ap.add_argument("--model-out", help="proposal JSON (default: beside the CSV, .model.json)")
     ap.add_argument("--panel-json", action="store_true", help="emit progress as JSON lines")
+    ap.add_argument("--no-rebalance", action="store_true",
+                    help="skip the quieter-mix search (ladder steps only)")
     mode = ap.add_mutually_exclusive_group()
     mode.add_argument("--plan", "--dry-run", action="store_true", help="print the plan; change nothing")
     mode.add_argument("--check-load", type=int, metavar="SECONDS", help="hold each level; fans untouched")

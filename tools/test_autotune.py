@@ -67,6 +67,7 @@ class FakeMachine:
 
 def tuner(machine, levels="160:4,120:3,80:2,40:2", events=None, **kw):
     events = events if events is not None else []
+    kw.setdefault("rebalance", ())     # the ladder alone; QuieterMixTest turns the search on
     out = io.StringIO()
     t = at.Tuner(machine, at.parse_levels(levels), at.LADDER,
                  lambda kind, message, **v: events.append(dict(kind=kind, message=message, **v)),
@@ -170,6 +171,92 @@ class SteppingTest(unittest.TestCase):
         m.cancel_at = 50
         with self.assertRaises(at.Cancelled):
             tuner(m, "160:4").run()
+
+
+class MiddleHeavyMachine(FakeMachine):
+    """Like FakeMachine, but the middle fan moves more air over the chipset (counts three times),
+    so moving airflow from it to the CPU and GPU fans can stall, as it might on the laptop."""
+
+    def sample(self):
+        s = super().sample()
+        if self.level is not None:
+            c, g, m = self.floors
+            clean = c + g + 3 * m >= self.need[self.level.gpu_w]
+            s["stalls_per_s"] = 0.0 if clean else 8.0
+        return s
+
+
+class QuieterMixTest(unittest.TestCase):
+    def test_noise_score(self):
+        self.assertEqual(at.NOISE_WEIGHTS, (1, 1, 2), "taken from the service's noise_weights")
+        self.assertLess(at.noise_cost((45, 50, 60)), at.noise_cost((35, 40, 70)))
+        self.assertLess(at.noise_cost((60, 60, 60)), at.noise_cost((50, 50, 70)))
+        self.assertEqual(at.rebalanced((35, 40, 70), 10), (45, 50, 60))
+        self.assertEqual(at.rebalanced((35, 40, 70), 20), (55, 60, 50))
+        self.assertIsNone(at.rebalanced((80, 80, 80), 10), "spreading an even mix is louder")
+        self.assertIsNone(at.rebalanced((60, 60, 70), 10), "an equal score is not quieter")
+        self.assertIsNone(at.rebalanced((0, 0, 0), 10))
+        self.assertEqual(at.rebalanced((95, 100, 70), 10, weights=(1, 1, 10)), (100, 100, 60), "capped at 100 %")
+
+    def test_keeps_the_quietest_clean_mix_and_stops_at_a_stall(self):
+        # 160 W needs 280: ladder clean at 35/40/70 (285), 25/30/60 stalls (235).
+        #   10 points -> 45/50/60 (275): stalls, keep 35/40/70.
+        # 120 W needs 270: same ladder result; 45/50/60 (275) clean, 55/60/50 (265) stalls.
+        # 40 W needs 0: the ladder reaches 0/0/0 and nothing quieter exists.
+        m = MiddleHeavyMachine({160: 280, 120: 270, 40: 0})
+        events = []
+        t = tuner(m, "160:4,120:3,40:2", events=events, rebalance=at.REBALANCE)
+        table = t.run()
+        r160, r120, r40 = t.results
+        self.assertEqual((r160["floors"], r160["rebalanced"]), ([35, 40, 70], False))
+        self.assertEqual([x["stalled"] for x in r160["tried"]], [True])
+        self.assertEqual((r120["floors"], r120["ladder_floors"], r120["rebalanced"]),
+                         ([45, 50, 60], [35, 40, 70], True))
+        self.assertEqual([(x["floors"], x["stalled"]) for x in r120["tried"]],
+                         [([45, 50, 60], False), ([55, 60, 50], True)])
+        self.assertEqual((r40["floors"], r40["tried"]), ([0, 0, 0], []))
+        self.assertLess(r120["noise"], at.noise_cost((35, 40, 70)))
+        # The table uses the chosen mixes. Floors still never fall as power rises, so the 160 W row
+        # takes the higher of each fan from the 120 W mix and its own (never less airflow).
+        self.assertEqual(table, [{"min_gpu_w": 0, "floors": [0, 0, 0]},
+                                 {"min_gpu_w": 35, "floors": [45, 50, 60]},
+                                 {"min_gpu_w": 115, "floors": [45, 50, 70]}])
+        fand.validate_table(table)
+        # A cooler level still starts from the hotter level's clean ladder rung.
+        self.assertEqual([s["rung"] for s in t.steps if s["level"] == 2][0], r160["rung"])
+        mixes = [s for s in t.steps if s["mix"]]
+        self.assertEqual(len(mixes), 3)
+        self.assertTrue(all(s["name"].startswith("Level") and "quieter mix" in s["name"] for s in mixes))
+        self.assertIn("moved from 35/40/70", [e for e in events if e["kind"] == "level-result"][1]["message"])
+
+    def test_safe_curve_is_the_chosen_mix(self):
+        m = MiddleHeavyMachine({120: 270, 40: 0})
+        t = tuner(m, "120:3,40:2", rebalance=at.REBALANCE)
+        t.run()
+        stall = m.log.index(("floors", (55, 60, 50)))
+        self.assertEqual(m.log[stall + 1:stall + 3], [("floors", (45, 50, 60)), ("stop",)])
+
+    def test_even_airflow_model_keeps_shifting(self):
+        # With the plain model (middle counts twice) a shift keeps airflow equal, so both are clean.
+        m = FakeMachine({80: 215})
+        t = tuner(m, "80:2", rebalance=at.REBALANCE)
+        t.run()
+        self.assertEqual(t.results[0]["ladder_floors"], [35, 40, 70])
+        self.assertEqual(t.results[0]["floors"], [55, 60, 50])
+
+    def test_switch_off(self):
+        m = MiddleHeavyMachine({120: 270})
+        t = tuner(m, "120:3")
+        t.run()
+        self.assertEqual((t.results[0]["floors"], t.results[0]["tried"]), ([35, 40, 70], []))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(at.main(["--plan", "--no-rebalance"]), 0)
+        self.assertIn("Quieter-mix search: off", out.getvalue())
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(at.main(["--plan"]), 0)
+        self.assertIn("move 10 then 20 points from the middle fan", out.getvalue())
 
 
 class SafetyTest(unittest.TestCase):

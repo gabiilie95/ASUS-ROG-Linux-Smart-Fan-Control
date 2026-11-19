@@ -467,7 +467,7 @@ This prints per-step JSON. On its own, analysis does not generate or apply an Au
 mixes by noise, or change the service's policy. Auto-tune (below) proposes a table from generated
 load, and you review it before anything is written.
 
-**Auto-tune** (Calibrate tab, or `tools/autotune.py`; about 60-90 minutes, loud). It generates heat
+**Auto-tune** (Calibrate tab, or `tools/autotune.py`; about 60-110 minutes, loud). It generates heat
 itself and replaces manual calibration runs. Levels run hottest first, at GPU 160, 120, 80 and 40 W
 plus 4, 3, 2 and 2 CPU threads. At each level the fan floors step from loud to quiet along a fixed
 ladder: 180 s per step, judged on the last 120 s. The descent stops at the first step that stalls
@@ -480,6 +480,21 @@ the exact saved curves. The log goes to `data/logs/autotune-<time>.csv` (install
 proposed table next to the current one. **Write model…** installs it through pkexec
 (`rog_fand.py --write-model`, strictly validated) as `/etc/rog-fand/model.json` and restarts the
 service. Delete that file as root to go back to the default table.
+
+**Quieter-mix search.** After a level's quietest clean ladder step, auto-tune moves 10, then 20
+points of airflow from the middle fan to the CPU and GPU fans, at the same heat and under the same
+stall rules. It keeps the quietest mix that stays clean. Background:
+- **Why:** calibration showed that total airflow keeps the chipset area clean, not the middle fan
+  alone (middle 60 % plus another fan at full was as clean as middle 70 %), and the middle fan is
+  the whiny one.
+- **Noise score:** sound power grows roughly with fan speed to the fifth power, so two fans at
+  medium speed are quieter than one fast one. The middle fan's whine counts double, using the
+  service's `noise_weights`. A mix is only tried if it scores quieter, so an even mix like 80/80/80
+  is left alone.
+- **Cost:** at most two extra 3-minute steps per level, 0–24 minutes in a run. `--no-rebalance`
+  skips the search.
+- **The table:** the proposal uses the chosen mixes. Floors still never fall as GPU power rises,
+  so a hotter row takes the higher of each fan from the cooler row's mix and its own.
 
 GPU load comes from `tools/gpuload.py`, not `stress-ng --gpu`, because Fedora's stress-ng is
 built without EGL/GBM and skips that stressor. gpuload runs a PTX kernel through the NVIDIA

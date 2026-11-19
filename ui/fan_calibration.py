@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QFileDialog, QFormL
 import rogcore as core
 from fan_auto import heading, label
 
-AUTOTUNE = "Auto-tune (about 60-90 min, loud)"
+AUTOTUNE = "Auto-tune (about 60-110 min, loud)"
 SAFETY_EXIT = 3     # autotune.py stopped at a safety limit; the reason is in its progress
 STEP_COLUMNS = ["Step", "Samples", "Mean stalls/s", "Peak stalls/s", "GPU power (W)"]
 AUTOTUNE_COLUMNS = STEP_COLUMNS + ["USB drops", "Verdict"]
@@ -140,7 +140,7 @@ class CalibrateTab(QWidget):
             "Heavy": "Four heavy-load steps, starting with all fans at full speed.",
             "Custom": "Separate steps with a semicolon. Omitted fans follow their saved curves.",
             AUTOTUNE: "Unattended: heats the GPU (160, 120, 80 and 40 W) and CPU, and at each level steps "
-                      "the fans from loud to quiet to find the quietest mix with clean audio. About 60-90 "
+                      "the fans from loud to quiet to find the quietest mix with clean audio. About 60-110 "
                       "minutes with loud fans; the laptop speakers stay blocked. Needs Performance, Auto set "
                       "to Off, the power adapter and the USB audio interface. Nothing is written until you "
                       "review the proposed table.",
@@ -180,7 +180,7 @@ class CalibrateTab(QWidget):
                     return
                 answer = QMessageBox.question(
                     self, "Start auto-tune?",
-                    "Auto-tune heats the laptop and runs the fans loud for about 60-90 minutes. The "
+                    "Auto-tune heats the laptop and runs the fans loud for about 60-110 minutes. The "
                     "laptop speakers stay blocked meanwhile. You can cancel at any time; the saved fan "
                     "curves are restored at the end.")
                 if answer != QMessageBox.Yes:
