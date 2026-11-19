@@ -17,6 +17,7 @@ SAFETY_EXIT = 3     # autotune.py stopped at a safety limit; the reason is in it
 STEP_COLUMNS = ["Step", "Samples", "Mean stalls/s", "Peak stalls/s", "GPU power (W)"]
 AUTOTUNE_COLUMNS = STEP_COLUMNS + ["USB drops", "Verdict"]
 CALIBRATE_COLUMNS = STEP_COLUMNS + ["Thermal response", "Assessment"]
+NOISE_COLUMN = "Noise dB(A)"
 TABLE_COLUMNS = ["From GPU W", "CPU %", "GPU %", "Middle %"]
 
 
@@ -50,6 +51,7 @@ class CalibrateTab(QWidget):
         self.writer = None
         self.proposal = None
         self.autotune = False
+        self.noise = False
         self.index = self.total = 0
         self.step_duration = self.elapsed = 0
         self.outcome = ""
@@ -73,6 +75,20 @@ class CalibrateTab(QWidget):
         form.addRow("Fan steps", self.custom)
         self.description = label()
         form.addRow(self.description)
+        mic_row = QHBoxLayout()
+        self.mic = QComboBox()
+        self.mic.setAccessibleName("Microphone for noise measurement")
+        mic_row.addWidget(self.mic, 1)
+        self.mic_refresh = QPushButton("Refresh")
+        self.mic_refresh.clicked.connect(self.load_mics)
+        mic_row.addWidget(self.mic_refresh)
+        form.addRow("Microphone (optional)", mic_row)
+        self.mic_note = label("Measures fan noise as one A-weighted level per second; no audio is "
+                              "recorded or saved. Place the microphone where you sit and keep the room "
+                              "quiet. Auto-tune then keeps a quieter fan mix only if it measures quieter.")
+        self.mic_note.setEnabled(False)
+        form.addRow(self.mic_note)
+        self.load_mics()
         self.preset.currentTextChanged.connect(self.preset_changed)
         self.form = form
         self.preset_changed(self.preset.currentText())
@@ -148,6 +164,22 @@ class CalibrateTab(QWidget):
         self.description.setText(self.description.text() + (" Thermal trends need a stable workload."
             if preset == "Observe" else " Keep the workload steady. A step may extend by up to 120 s to check thermal settling."))
 
+    def load_mics(self):
+        """Off, then the PipeWire inputs; built-in ones are shown but cannot be chosen."""
+        current = self.mic.currentData() if self.mic.count() else None
+        self.mic.clear()
+        self.mic.addItem("Off", None)
+        for source in core.mic_sources():
+            label_text = source["description"]
+            if not source["usable"]:
+                label_text += " (built-in: shares the stall counter's sound chip)"
+            self.mic.addItem(label_text, source["name"])
+            if not source["usable"]:
+                item = self.mic.model().item(self.mic.count() - 1)
+                item.setEnabled(False)
+        index = self.mic.findData(current)
+        self.mic.setCurrentIndex(index if index >= 0 else 0)
+
     def begin(self):
         if self.process:
             return
@@ -160,9 +192,10 @@ class CalibrateTab(QWidget):
         try:
             if auto:
                 output = core.log_dir() / time.strftime("autotune-%Y%m%d-%H%M%S.csv")
-                args = core.autotune_args(output)
+                args = core.autotune_args(output, self.mic.currentData())
             else:
-                args = core.calibration_args(preset, self.seconds.value(), self.custom.text(), "samples.csv")
+                args = core.calibration_args(preset, self.seconds.value(), self.custom.text(), "samples.csv",
+                                             self.mic.currentData())
             if self.dry_run:
                 self.message.setText("Dry run · " + " ".join(args))
                 return
@@ -198,8 +231,10 @@ class CalibrateTab(QWidget):
             self.output_path = output
         else:
             self.output_path = Path(new_workspace.name) / "samples.csv"
-            args = core.calibration_args(preset, self.seconds.value(), self.custom.text(), self.output_path)
+            args = core.calibration_args(preset, self.seconds.value(), self.custom.text(), self.output_path,
+                                         self.mic.currentData())
         self.autotune = auto
+        self.noise = bool(self.mic.currentData())
         self.discard_proposal()
         self.process = QProcess(self)
         self.process.readyReadStandardOutput.connect(self.read_progress)
@@ -209,7 +244,7 @@ class CalibrateTab(QWidget):
         self.stderr = self.outcome = ""
         self.index = self.total = 0
         self.results.setColumnCount(0)
-        columns = AUTOTUNE_COLUMNS if auto else CALIBRATE_COLUMNS
+        columns = (AUTOTUNE_COLUMNS if auto else CALIBRATE_COLUMNS) + ([NOISE_COLUMN] if self.noise else [])
         self.results.setColumnCount(len(columns))
         self.results.setHorizontalHeaderLabels(columns)
         self.results.setRowCount(0)
@@ -220,7 +255,7 @@ class CalibrateTab(QWidget):
         self.process.start(sys.executable, args)
 
     def set_running(self, running):
-        for w in (self.preset, self.seconds, self.custom, self.start):
+        for w in (self.preset, self.seconds, self.custom, self.start, self.mic, self.mic_refresh):
             w.setEnabled(not running)
         self.cancel.setEnabled(running)
         self.export.setEnabled(not running and bool(self.output_path and self.output_path.is_file()))
@@ -270,6 +305,10 @@ class CalibrateTab(QWidget):
                 self.results.setItem(row, col, QTableWidgetItem(text))
             if not self.autotune:      # auto-tune steps carry their own verdict columns
                 self.show_analysis(row, event)
+            if self.noise:
+                db = event.get("noise_db")
+                self.results.setItem(row, self.results.columnCount() - 1,
+                                     QTableWidgetItem("—" if db is None else f"{db:.1f}"))
         elif kind == "proposal":
             self.show_proposal(event["table"], event.get("path"))
         elif kind in ("done", "restore", "safety"):

@@ -75,6 +75,46 @@ class SessionTest(unittest.TestCase):
         self.assertFalse(events[-1]["cancelled"])
         self.assertEqual(events[2]["analysis"]["status"], "short")
 
+    def test_microphone_levels_in_samples_and_step_result(self):
+        closed = []
+        class FakeMeter:
+            def __init__(self, source):
+                self.source = source
+            def alive(self):
+                return True
+            def wait_signal(self, stop):
+                return True
+            def level(self):
+                return -42.3
+            def close(self):
+                closed.append(self.source)
+        self.args.mic = "alsa_input.usb-Mic-00.mono"
+        with patch.object(cal.noise_meter, "NoiseMeter", FakeMeter):
+            self.session()
+        self.restored()
+        with self.out.open() as f:
+            rows = list(csv.DictReader(f))
+        self.assertEqual(rows[0]["noise_db"], "-42.3")
+        events = [json.loads(line) for line in self.output.getvalue().splitlines()]
+        result = next(e for e in events if e["kind"] == "result")
+        self.assertEqual(result["noise_db"], -42.3)
+        self.assertIn("noise -42.3 dB(A)", result["message"])
+        self.assertEqual(closed, ["alsa_input.usb-Mic-00.mono"])
+
+    def test_built_in_microphone_is_refused_before_fans_change(self):
+        self.args.mic = "alsa_input.pci-0000_00_1f.3.analog-stereo"
+        with self.assertRaisesRegex(ValueError, "built-in"):
+            self.session()
+        self.assertFalse(any(c.args[1:2] == ("--fan",) for c in self.command.call_args_list))
+
+    def test_without_microphone_the_column_is_empty(self):
+        self.session()
+        with self.out.open() as f:
+            rows = list(csv.DictReader(f))
+        self.assertEqual(rows[0]["noise_db"], "")
+        events = [json.loads(line) for line in self.output.getvalue().splitlines()]
+        self.assertIsNone(next(e for e in events if e["kind"] == "result")["noise_db"])
+
     def test_bounded_extension_and_restore(self):
         self.args.step = 4
         self.args.settle_extra = 6

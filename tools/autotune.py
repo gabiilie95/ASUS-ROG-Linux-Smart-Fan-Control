@@ -47,6 +47,7 @@ HERE = Path(__file__).resolve().parent
 _spec = importlib.util.spec_from_file_location("fan_calibrate", HERE / "fan-calibrate.py")
 cal = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(cal)
+import noise_meter  # noqa: E402  (fan-calibrate put this directory on the path)
 core = cal.core
 FANS = cal.FANS
 PROFILE = "/sys/firmware/acpi/platform_profile"
@@ -67,13 +68,14 @@ LIMITS = {"cpu_c": 95, "gpu_c": 85, "board_c": 90}
 # to the CPU and GPU fans, in order, keeping only mixes that score quieter; stop at the first stall.
 REBALANCE = (10, 20)
 NOISE_EXPONENT = 5      # fan sound power grows roughly with speed^5 (fan affinity laws)
+MIC_MARGIN_DB = 0.5     # with a microphone, a mix must measure this much quieter to replace another
 STALL_LIMIT = 1.0       # stalls per second on the internal counter, mean of the judged window
 PERIOD = 2              # seconds between samples
 MISSING_LIMIT = 3       # consecutive samples without a temperature before stopping
 STATUS_POLL = 0.5       # seconds between reads of the service status while waiting
 COLUMNS = ("t", "level", "target_gpu_w", "cpu_threads", "step", "cpu_floor", "gpu_floor", "mid_floor",
            "phase", "elapsed_s", "stalls_per_s", "usb_drops", "cpu_w", "gpu_w", "cpu_c", "gpu_c",
-           "board_c", "cpu_rpm", "gpu_rpm", "mid_rpm")
+           "board_c", "cpu_rpm", "gpu_rpm", "mid_rpm", "noise_db")
 
 
 class Cancelled(Exception):
@@ -180,7 +182,8 @@ def judge(window, threshold=STALL_LIMIT):
     drops = sum(r["usb_drops"] or 0 for r in window)
     mean = sum(rates) / len(rates) if rates else None
     return dict(samples=len(window), mean=mean, peak=max(rates) if rates else None, usb_drops=drops,
-                stalled=bool(drops) or (mean is not None and mean > threshold))
+                stalled=bool(drops) or (mean is not None and mean > threshold),
+                noise_db=noise_meter.summarize([r.get("noise_db") for r in window]))
 
 
 def stall_certain(window, expected, threshold=STALL_LIMIT):
@@ -259,7 +262,7 @@ class Tuner:
                    usb_drops=s["usb_drops"],
                    **{k: None if s.get(k) is None else round(s[k], 1)
                       for k in ("cpu_w", "gpu_w", "cpu_c", "gpu_c", "board_c")},
-                   **{f + "_rpm": s.get(f + "_rpm") for f in FANS})
+                   **{f + "_rpm": s.get(f + "_rpm") for f in FANS}, noise_db=s.get("noise_db"))
         self.writer.writerow([row[c] for c in COLUMNS])
         within = min(0.95, (max(0, self.level_steps - 1) + min(1, elapsed / self.step_s)) / 4)
         drops = "--" if s["usb_drops"] is None else s["usb_drops"]
@@ -315,9 +318,10 @@ class Tuner:
                        watts=mean(r.get("gpu_w") for r in window), cpu_w=mean(r.get("cpu_w") for r in window),
                        board_c=window[-1].get("board_c") if window else None)
         self.steps.append(verdict)
-        self.report("result", "%s · %s · mean %s · peak %s stalls/s · %s USB drops%s" % (
+        self.report("result", "%s · %s · mean %s · peak %s stalls/s · %s USB drops%s%s" % (
             verdict["name"], "stalls" if verdict["stalled"] else "clean",
             fmt(verdict["mean"]), fmt(verdict["peak"]), verdict["usb_drops"],
+            "" if verdict["noise_db"] is None else " · noise %.1f dB(A)" % verdict["noise_db"],
             " (decided early)" if early else ""), **verdict)
         return verdict
 
@@ -345,17 +349,26 @@ class Tuner:
                     break
         floors = self.ladder[clean] if clean is not None else (100, 100, 100)
         chosen, tried = floors, []
+        # The clean ladder step's own measurement, when a microphone is in use.
+        chosen_db = next((s["noise_db"] for s in reversed(self.steps) if s["level"] == self.level_index
+                          and s["rung"] == clean and not s["mix"] and not s["stalled"]), None)
         if clean is not None:
             # Same heat, same rules: shift airflow off the whiny middle fan while it stays clean.
+            # The noise model picks which mixes are worth trying; with a microphone, the measurement
+            # decides whether a clean mix is really quieter.
             for shift in self.rebalance:
                 candidate = rebalanced(floors, shift, self.weights)
                 if candidate is None or noise_cost(candidate, self.weights) >= noise_cost(chosen, self.weights):
                     continue
-                stalled = self.step(level, clean, watts, candidate)["stalled"]
-                tried.append((shift, candidate, stalled))
-                if stalled:
+                verdict = self.step(level, clean, watts, candidate)
+                quieter = (verdict["noise_db"] is None or chosen_db is None
+                           or verdict["noise_db"] <= chosen_db - MIC_MARGIN_DB)
+                tried.append((shift, candidate, verdict["stalled"], verdict["noise_db"],
+                              not verdict["stalled"] and quieter))
+                if verdict["stalled"]:
                     break
-                chosen = candidate
+                if quieter:
+                    chosen, chosen_db = candidate, verdict["noise_db"]
         # The safe curve between levels: back to the quietest clean combination at once.
         self.machine.set_floors(chosen)
         self.machine.stop_load()
@@ -363,8 +376,9 @@ class Tuner:
         result = dict(level=self.level_index, target_gpu_w=level.gpu_w, cpu_threads=level.cpu_threads,
                       gpu_w=round(measured if measured is not None else level.gpu_w, 1),
                       floors=list(chosen), ladder_floors=list(floors), rebalanced=chosen != floors,
-                      tried=[dict(shift=s, floors=list(f), stalled=st) for s, f, st in tried],
-                      noise=round(noise_cost(chosen, self.weights), 4),
+                      tried=[dict(shift=s, floors=list(f), stalled=st, noise_db=db, kept=kept)
+                             for s, f, st, db, kept in tried],
+                      noise=round(noise_cost(chosen, self.weights), 4), noise_db=chosen_db,
                       rung=clean, clean=clean is not None, steps=self.level_steps)
         self.results.append(result)
         if clean is None:
@@ -373,6 +387,8 @@ class Tuner:
             text = "quietest clean fans %d/%d/%d %% (moved from %d/%d/%d %%)" % (chosen + floors)
         else:
             text = "quietest clean fans %d/%d/%d %%" % floors
+        if chosen_db is not None:
+            text += ", %.1f dB(A)" % chosen_db
         self.report("level-result", "%s: %s" % (self.level_label(level), text), **result)
         return result
 
@@ -423,8 +439,9 @@ class Hardware:
     the two load generators. Single-threaded on purpose (children are started with preexec_fn)."""
 
     def __init__(self, stop, saved=None, fans=None, *, counter=True, usb_name="Volt 2", limits=LIMITS,
-                 bound_s=4 * 3600):
+                 bound_s=4 * 3600, mic=None):
         self.stop, self.saved, self.fans = stop, saved, fans
+        self.mic, self.meter = mic, None
         self.counter, self.usb_name, self.limits, self.bound_s = counter, usb_name, limits, bound_s
         self.changed = False
         self.curves = None
@@ -470,6 +487,14 @@ class Hardware:
                 raise Cancelled()
             if self.silence.poll() is not None:
                 raise RuntimeError("Could not play silence to the %s through PipeWire" % self.usb_name)
+        if self.mic:
+            # Levels only, one per second; no audio is kept.
+            self.meter = noise_meter.NoiseMeter(self.mic)
+            try:
+                if not self.meter.wait_signal(self.stop):
+                    raise Cancelled()
+            except ValueError as exc:
+                raise RuntimeError(str(exc)) from None
         if self.counter:
             self.irq = (cal.hda_irqs(), time.monotonic())
 
@@ -477,8 +502,12 @@ class Hardware:
         try:
             self.stop_load()
         finally:
-            for proc in (self.silence, self.player):
-                end(proc)
+            try:
+                if self.meter is not None:
+                    self.meter.close()
+            finally:
+                for proc in (self.silence, self.player):
+                    end(proc)
             self.silence = self.player = None
             self.workdir.cleanup()
 
@@ -585,13 +614,16 @@ class Hardware:
             self.irq = (irq, now)
         if self.silence is not None and self.silence.poll() is not None:
             raise RuntimeError("The silent stream to the %s stopped" % self.usb_name)
+        if self.meter is not None and not self.meter.alive():
+            raise RuntimeError("The microphone recording stopped")
         self.check_loads()
         drops, self.drops = self.drops, 0
         gpu_c, gpu_w = cal.gpu()
         rpm = core.read_fans()
         return dict(stalls_per_s=rate, usb_drops=drops if self.usb_name else None, cpu_w=self.cpu_w,
                     gpu_w=gpu_w, gpu_c=gpu_c, cpu_c=cal.zone("x86_pkg_temp"), board_c=cal.zone("SEN3"),
-                    profile=cal.rd(PROFILE), ac=mains_online(), **{f + "_rpm": rpm[f + "_rpm"] for f in FANS})
+                    profile=cal.rd(PROFILE), ac=mains_online(), **{f + "_rpm": rpm[f + "_rpm"] for f in FANS},
+                    noise_db=self.meter.level() if self.meter is not None else None)
 
 
 def end(proc):
@@ -635,6 +667,8 @@ def preflight(a):
         raise ValueError("Select the Performance profile for auto-tune")
     if mains_online() is not True:
         raise ValueError("Connect the power adapter for auto-tune")
+    if getattr(a, "mic", None):
+        noise_meter.check_source(a.mic)     # refuses the built-in inputs before anything changes
     state = core.fan_service()[0]
     if a.usb and state != "Running":
         raise ValueError("Auto-tune reads USB drops from the fan service; it is %s" % state.lower())
@@ -654,7 +688,8 @@ def run(a, levels, ladder, stop):
             raise ValueError("Select the Performance profile for auto-tune")
         saved = cal.snapshot()
         fans = cal.Fans(False)
-        hw = Hardware(stop, saved, fans, usb_name=a.usb or None, bound_s=a.max_minutes * 60 + 600)
+        hw = Hardware(stop, saved, fans, usb_name=a.usb or None, bound_s=a.max_minutes * 60 + 600,
+                      mic=getattr(a, "mic", None))
         # Keep partial samples private until the CSV can be published atomically.
         fh = stack.enter_context(tempfile.NamedTemporaryFile(mode="w", newline="", dir=out.parent,
                                                               prefix=".autotune-", delete=False))
@@ -749,6 +784,11 @@ def plan(a, levels, ladder):
           % LIMITS)
     print("Stall rule: mean above %.1f/s on the internal counter, or any USB drop%s." % (
         STALL_LIMIT, "" if a.usb else " (USB not measured: --no-usb)"))
+    if getattr(a, "mic", None):
+        print("Noise: measured from %s (A-weighted, relative dB, levels only); a quieter mix must "
+              "measure at least %.1f dB lower." % (a.mic, MIC_MARGIN_DB))
+    else:
+        print("Noise: estimated from fan speeds (no microphone).")
     if a.no_rebalance:
         print("Quieter-mix search: off (--no-rebalance).")
     else:
@@ -774,6 +814,9 @@ def main(argv=None):
     ap.add_argument("--panel-json", action="store_true", help="emit progress as JSON lines")
     ap.add_argument("--no-rebalance", action="store_true",
                     help="skip the quieter-mix search (ladder steps only)")
+    ap.add_argument("--mic", metavar="SOURCE",
+                    help="measure fan noise from this PipeWire input (levels only, no audio kept); the "
+                         "quieter-mix search then keeps a mix only if it measures quieter")
     mode = ap.add_mutually_exclusive_group()
     mode.add_argument("--plan", "--dry-run", action="store_true", help="print the plan; change nothing")
     mode.add_argument("--check-load", type=int, metavar="SECONDS", help="hold each level; fans untouched")

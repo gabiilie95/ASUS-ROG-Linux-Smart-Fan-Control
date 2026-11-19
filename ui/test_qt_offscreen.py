@@ -189,7 +189,7 @@ def service_tabs(w, q):
             print(json.dumps(event),flush=True)
         time.sleep(30)
     """)
-    with patch.object(core, "calibration_args", side_effect=lambda p,s,c,o: ["-Ic",child,str(o)]), \
+    with patch.object(core, "calibration_args", side_effect=lambda p,s,c,o,m=None: ["-Ic",child,str(o)]), \
          patch.object(core, "sound_device_busy", return_value=False):
         cal.start.click()
         check(wait_for(lambda: cal.results.rowCount()==1), "streaming calibration progress and results")
@@ -286,7 +286,7 @@ def autotune_tests(w):
             stack.enter_context(patch.object(core, name, return_value=value))
         stack.enter_context(patch.object(core, "FAND_ETC", Path(OUT) / "etc"))
         stack.enter_context(patch.object(fan_calibration, "QMessageBox", box))
-        stack.enter_context(patch.object(core, "autotune_args", side_effect=lambda o: ["-Ic", child, str(o)]))
+        stack.enter_context(patch.object(core, "autotune_args", side_effect=lambda o, m=None: ["-Ic", child, str(o)]))
         cal.start.click()
         check(box.question.called and cal.process is None, "auto-tune asks before a long, loud run")
         box.question.return_value = "yes"
@@ -341,7 +341,7 @@ def autotune_tests(w):
                 print(json.dumps(e), flush=True)
             sys.exit(3)
         """)
-        with patch.object(core, "autotune_args", side_effect=lambda o: ["-Ic", safety, str(o)]):
+        with patch.object(core, "autotune_args", side_effect=lambda o, m=None: ["-Ic", safety, str(o)]):
             cal.start.click()
             check(wait_for(lambda: cal.process is None) and "CPU reached 95 C" in cal.message.text()
                   and "restored" in cal.message.text() and "exited with code" not in cal.message.text()
@@ -695,8 +695,31 @@ def profile_tests(w, tray, shown, status):
     shown.clear()
 
 
+def microphone_tests(w):
+    cal = w.cal_tab
+    sources = [dict(name="alsa_input.usb-Mic-00.mono", description="USB mic", usable=True),
+               dict(name="alsa_input.pci-0000_00_1f.3.analog-stereo", description="Built-in", usable=False)]
+    with patch.object(core, "mic_sources", return_value=sources):
+        cal.load_mics()
+    check(cal.mic.count() == 3 and cal.mic.itemData(0) is None and cal.mic.currentIndex() == 0,
+          "mic: Off by default, then the inputs")
+    check(not cal.mic.model().item(2).isEnabled() and "built-in" in cal.mic.itemText(2),
+          "mic: the built-in input is listed but cannot be chosen")
+    args = core.calibration_args("Observe", 30, "", "out.csv", "alsa_input.usb-Mic-00.mono")
+    check(args[-2:] == ["--observe", "30"] and "--mic" in args
+          and args[args.index("--mic") + 1] == "alsa_input.usb-Mic-00.mono", "mic: passed to calibration")
+    check(core.autotune_args("x.csv", "alsa_input.usb-Mic-00.mono")[-2:] == ["--mic", "alsa_input.usb-Mic-00.mono"]
+          and "--mic" not in core.autotune_args("x.csv"), "mic: passed to auto-tune only when chosen")
+    cal.mic.setCurrentIndex(1)
+    with patch.object(core, "mic_sources", return_value=sources):
+        cal.load_mics()
+    check(cal.mic.currentData() == "alsa_input.usb-Mic-00.mono", "mic: refresh keeps the choice")
+    cal.mic.setCurrentIndex(0)
+
+
 def tray_tests(w):
     tray_model_tests()
+    microphone_tests(w)
     hicolor = Path("/usr/share/icons/hicolor/512x512/apps/asus_notif_green.png").exists()
     QIcon.setThemeSearchPaths(["/usr/share/icons"])   # offscreen has no icon theme; a desktop sets these
     QIcon.setThemeName("hicolor")
