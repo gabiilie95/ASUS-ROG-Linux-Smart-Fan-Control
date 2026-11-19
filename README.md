@@ -302,6 +302,20 @@ but never force the fallback, because they only feed the heat display and the fe
 USB skips in the first second of a stream (after 2 s without traffic) are reported as
 `warmup_skipped` and do not count as drops.
 
+**Extra board temperatures** (2026-11-19). The chipset has no readable temperature sensor, and
+SEN3 alone predicts stalls poorly: stalls at 70 C under light load, none at 79-84 C with full
+fans. So the service also reads six motherboard-area sensors and records them for analysis:
+- `dimm_a_c`, `dimm_b_c`: the two DDR5 modules (`spd5118`, named by bus address).
+- `lan_c`: the onboard Ethernet chip (RTL8125, `r8169`), which hangs off the chipset.
+- `ssd1_c`, `ssd2_c`: the two NVMe drives (by controller, `nvme0`/`nvme1`).
+- `wifi_c`: the Wi-Fi card.
+
+They appear in `status.json` as `board_temps`, in the per-minute CSVs (with `log_csv`), and in
+every calibration and auto-tune CSV. They are logged and reported only: a missing one is not a
+problem and never triggers the fallback. The first auto-tune run will show which of them tracks the
+chipset area and its stalls best, and how much warning it gives. Only then would one drive faster,
+temperature-aware fan changes.
+
 **Response timing** (2026-11-17). Going up stays fast, but is no longer a jump. Coming down is
 quicker, and slow only while the board is still heat-soaked.
 - **Up:** a floor rises by at most 30 points per 2 s sample (`max_up_step`), so a game starting

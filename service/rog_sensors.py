@@ -26,6 +26,36 @@ def integer(path):
         return None
 
 
+# Motherboard-area temperatures besides SEN3, by stable names. The chipset has no readable sensor of
+# its own, so these are logged to find which one tracks the chipset area (and its stalls) best.
+BOARD_TEMPS = ("dimm_a_c", "dimm_b_c", "lan_c", "ssd1_c", "ssd2_c", "wifi_c")
+
+
+def board_temps(root=Path("/sys/class/hwmon")):
+    """Memory modules (spd5118, by bus address), the Ethernet chip (r8169), the SSDs (nvme, by
+    controller) and the Wi-Fi card, in C; None when a sensor is absent or unreadable."""
+    out = dict.fromkeys(BOARD_TEMPS)
+    dimms, ssds = [], []
+    for hwmon in sorted(root.glob("hwmon*")):
+        name = read(hwmon / "name") or ""
+        raw = integer(hwmon / "temp1_input")
+        value = None if raw is None or not -40000 <= raw <= 150000 else round(raw / 1000, 1)
+        device = os.path.basename(os.path.realpath(hwmon / "device"))
+        if name == "spd5118":
+            dimms.append((device, value))
+        elif name == "nvme":
+            ssds.append((device, value))
+        elif name.startswith("r8169"):
+            out["lan_c"] = value
+        elif name.startswith("iwlwifi"):
+            out["wifi_c"] = value
+    for key, (_, value) in zip(("dimm_a_c", "dimm_b_c"), sorted(dimms)):
+        out[key] = value
+    for key, (_, value) in zip(("ssd1_c", "ssd2_c"), sorted(ssds)):
+        out[key] = value
+    return out
+
+
 class Rapl:
     def __init__(self):
         self.zone = next((p for p in Path("/sys/class/powercap").glob("intel-rapl:*")

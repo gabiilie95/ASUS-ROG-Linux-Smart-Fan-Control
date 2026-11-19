@@ -25,7 +25,7 @@ import time
 HERE = Path(__file__).resolve().parent
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(HERE))
-from rog_sensors import FANS, PROFILE, Sensors, UsbMonitor, read
+from rog_sensors import BOARD_TEMPS, FANS, PROFILE, Sensors, UsbMonitor, board_temps, read
 
 VERSION = 1
 RUN = Path("/run/rog-fand")
@@ -496,7 +496,8 @@ class SampleCsv:
     def __init__(self):
         self.minute = self.path = self.buffer = self.writer = None
 
-    def add(self, timestamp, sensors, floors, usb):
+    def add(self, timestamp, sensors, floors, usb, board=None):
+        board = board or dict.fromkeys(BOARD_TEMPS)
         minute = timestamp[:16]
         if self.minute != minute:
             self.minute = minute
@@ -504,9 +505,10 @@ class SampleCsv:
             self.buffer = io.StringIO()
             self.writer = csv.writer(self.buffer)
             self.writer.writerow(["t", *sensors, "cpu_floor", "gpu_floor", "mid_floor",
-                                  "audio_active", "skipped"])
+                                  "audio_active", "skipped", *BOARD_TEMPS])
         self.writer.writerow([timestamp[11:19], *sensors.values(), *floors, usb["audio_active"],
-                              sum(d["skipped"] for d in usb["devices"])])
+                              sum(d["skipped"] for d in usb["devices"]),
+                              *(board.get(k) for k in BOARD_TEMPS)])
         atomic_write(self.path, self.buffer.getvalue())
 
 
@@ -576,6 +578,8 @@ def run_service(dry, duration):
             now = time.monotonic()
             timestamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
             values = sensors.sample(now)
+            # Logged and reported only: missing ones are not problems and never force the fallback.
+            board = board_temps()
             usb = usbmon.snapshot(time.monotonic())
             profile = values["profile"]
             if profile != last_profile:
@@ -656,7 +660,7 @@ def run_service(dry, duration):
                 last_decision = decision
             status = dict(version=VERSION, t=timestamp, elapsed_s=round(now-start, 2),
                           dry_run=dry, mode=mode, invalid_mode=last_mode_error is not None,
-                          controlled=controlled, profiles=cfg["profiles"],
+                          controlled=controlled, profiles=cfg["profiles"], board_temps=board,
                           sensors=values, unavailable=problems, degraded=degraded, heat_w=rounded(policy.heat),
                           smoothed_gpu_w=rounded(policy.gpu), floors=dict(zip(FANS, floors)), table=cfg["table"],
                           applied=applied, manual_control=manual_control, margins=policy.margins, usb=usb, events=list(events))
@@ -665,7 +669,7 @@ def run_service(dry, duration):
             else:
                 atomic_write(RUN / "status.json", json.dumps(status) + "\n", 0o644)
             if samples:
-                samples.add(timestamp, values, floors, usb)
+                samples.add(timestamp, values, floors, usb, board)
             stop.wait(max(0, min(now + 2, until) - time.monotonic()))
     finally:
         stop.set()

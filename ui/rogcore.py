@@ -536,6 +536,32 @@ def request_fan_mode(mode):
     last_mode_request = mode, time.monotonic()
 
 
+# Motherboard-area temperatures logged besides SEN3 (same names as the service's rog_sensors).
+BOARD_TEMPS = ("dimm_a_c", "dimm_b_c", "lan_c", "ssd1_c", "ssd2_c", "wifi_c")
+_sensors = None
+
+
+def sensor_module():
+    """The service's sensor module (repository or installed copy), loaded once."""
+    global _sensors
+    if _sensors is None:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("rog_sensors", FAND_PROGRAM.parent / "rog_sensors.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _sensors = module
+    return _sensors
+
+
+def board_temps():
+    """{name: C or None} for BOARD_TEMPS; all None if the service's sensor module is unavailable."""
+    try:
+        temps = sensor_module().board_temps()
+    except (OSError, ImportError, SyntaxError, AttributeError):
+        return dict.fromkeys(BOARD_TEMPS)
+    return {k: temps.get(k) for k in BOARD_TEMPS}
+
+
 def load_updater():
     import importlib.util
     spec = importlib.util.spec_from_file_location("rog_update", UPDATER)

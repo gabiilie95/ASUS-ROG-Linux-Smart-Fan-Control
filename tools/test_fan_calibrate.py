@@ -115,6 +115,23 @@ class SessionTest(unittest.TestCase):
         events = [json.loads(line) for line in self.output.getvalue().splitlines()]
         self.assertIsNone(next(e for e in events if e["kind"] == "result")["noise_db"])
 
+    def test_board_temperatures_are_logged(self):
+        temps = {k: 50.0 + i for i, k in enumerate(cal.core.BOARD_TEMPS)}
+        with patch.object(cal.core, "board_temps", return_value=temps):
+            self.session()
+        with self.out.open() as f:
+            row = next(csv.DictReader(f))
+        self.assertEqual({k: row[k] for k in cal.core.BOARD_TEMPS}, {k: str(v) for k, v in temps.items()})
+        self.assertEqual(cal.COLUMNS[-len(cal.core.BOARD_TEMPS):], cal.core.BOARD_TEMPS)
+
+    def test_board_names_match_the_service(self):
+        import importlib.util
+        path = Path(__file__).resolve().parents[1] / "service" / "rog_sensors.py"
+        spec = importlib.util.spec_from_file_location("rog_sensors_check", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self.assertEqual(module.BOARD_TEMPS, cal.core.BOARD_TEMPS)
+
     def test_bounded_extension_and_restore(self):
         self.args.step = 4
         self.args.settle_extra = 6
