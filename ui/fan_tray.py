@@ -16,7 +16,7 @@ import rogcore as core
 
 FALLBACK_ICON = "preferences-system"
 POLL_MS = 2000
-BOOST_SHOW_S = 240     # a boost holds 60 s, then steps back down 5 points every 20 s
+BOOST_SHOW_S = 150     # a boost holds 30 s, then steps down (5 points per 20 s while hot)
 NOTIFY_GAP_S = 300     # each kind of notification at most once per 5 minutes
 OWN_REQUEST_S = 30     # a mode change this soon after the panel asked for it is the panel's own
 BAD_POLLS = 2          # a down service must stay down this many polls before notifying (resume, restart)

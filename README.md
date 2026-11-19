@@ -294,13 +294,49 @@ Click counting in recordings (mono 16-bit 48 kHz WAV, high-passed at 17.5 kHz fi
 
 `rog-fand` samples the G814JZ every two seconds. Smoothed GPU watts select minimum
 CPU/GPU/middle fan levels. Each point keeps the higher of the calibrated balanced PWM
-and the requested floor. Two consecutive USB drop samples trigger a boost and raise the margin
-for that power range. Status reports missing sensors. The conservative floor of at least 60/60/80 applies only when
+and the requested floor. Two consecutive USB drop samples, or one large burst (200 or more
+skipped packets in a sample), trigger a boost and raise the margin for that power range. Status reports missing sensors. The conservative floor of at least 60/60/80 applies only when
 GPU power, a temperature or a fan speed has been missing for three consecutive samples (6 s);
 a single gap holds the last GPU reading. CPU power (RAPL) and usbmon are reported when missing
 but never force the fallback, because they only feed the heat display and the feedback.
 USB skips in the first second of a stream (after 2 s without traffic) are reported as
 `warmup_skipped` and do not count as drops.
+
+**Response timing** (2026-11-17). Going up stays fast, but is no longer a jump. Coming down is
+quicker, and slow only while the board is still heat-soaked.
+- **Up:** a floor rises by at most 30 points per 2 s sample (`max_up_step`), so a game starting
+  ramps the middle fan to 70 % over 6 s instead of in one jump. GPU power is still smoothed with a
+  6 s time constant on the way up, so a 2 s burst (a video, a web page) does not raise the fans.
+- **Down:** a floor waits 30 s (`hold_s`, was 60 s) after the target drops. It then steps down
+  every 10 s (`down_step_s`, was 20 s) by a third of the remaining gap: at least 5 and at most 20
+  points (`max_down_step`). It finishes exactly at the target.
+- **Heat soak:** while the board sensor reads 75 °C or more (`hot_board_c`), it keeps the old pace
+  of 5 points every 20 s (`hot_down_step_s`), so the chipset area cools before airflow drops.
+- **Your mode changes** (leaving Max or a preset) skip the hold. A load dip, such as a loading
+  screen, does not.
+- **GPU power smoothing on the way down:** 30 s (`fall_s`, was 60 s). Learned margins relax
+  2.5 points per 15 clean minutes (`clean_s`, was 30).
+
+Simulated with the controller code (`Policy`) and the real logs:
+
+| | Before | After |
+|---|---|---|
+| Game ends: middle floor below 50 % | 184 s | 52 s |
+| Game ends: all floors 0 | 364 s | 102 s |
+| Max preset back to Auto | 440 s | 80 s |
+| Crackle burst to boost | 2 s | first sample |
+| Game starts: floors reach 80/80/80 | 14 s | 14 s |
+| 20 s loading screen | no dip | no dip |
+| Biggest single floor change (2.6 h of logs) | 70 points | 30 points |
+| Floor changes per hour (same logs) | 10 | 27 |
+
+The extra changes are the smaller up-steps. That is still one change every two minutes, each
+gentle. The fans are speed-controlled brushless fans, and the EC limits their acceleration itself.
+Varying speed this slowly does not wear them; constant full speed and start/stop cycling would.
+
+An existing `/etc/rog-fand/config.json` was written as a full copy of the old example. Timing
+values equal to the old defaults (`fall_s` 60, `hold_s` 60, `down_step_s` 20, `clean_s` 1800) are
+therefore treated as unset and pick up the new defaults. Any other value you set is kept.
 
 **Profiles.** The service protects the platform profiles listed in `profiles` in
 `/etc/rog-fand/config.json`. By default that is all three: Performance, Balanced and Quiet. It used to
@@ -338,7 +374,9 @@ restores its base, and removes the installation, learned margins and sample logs
 switch interrupts restoration, the receipt stays in `/var/lib/rog-fand/` (`restore.json` for
 Performance, `restore-<profile>.json` for the others). A profile's curves can only be written while it
 is active, so return to the profile that `--restore` or undo names, and the next service run (or a
-repeated undo) finishes the restoration.
+repeated undo) finishes the restoration. Systemd stop-post cleanup logs deferred profiles and
+keeps their receipts without marking the unit failed. Actual restore errors still fail cleanup,
+and manual `--restore` and undo require every pending profile to be restored.
 
 Things to know once it is installed:
 - In `auto` and the presets, the Performance curve is the configured base (in
@@ -359,11 +397,28 @@ and switches the settings that already exist as scripts.
 
 - Fan preset: runs `tools/fans-original.sh`, `fans-ramped.sh`, `fans-mid-max.sh` or `fans-max.sh`; the panel says which one matches the live curve.
 - Jellyfin software interface on/off: `tools/jellyfin-software-ui.sh`; applies at Jellyfin's next start (it is not restarted).
-- CPU cap (40-100) and "Undo CPU profile": run `root-tests/setup-cool-performance.sh` through `pkexec`, so a system dialog asks for the password.
+- CPU cap (40-100) and "Undo CPU profile": run `root-tests/setup-cool-performance.sh` through `pkexec`, so a system dialog asks for the password. The cap is saved for all mapped power modes, including battery overrides, and reapplied by TuneD after reboot. Each mode keeps its existing governor, energy preference and platform settings; an existing stricter CPU limit remains in effect. Applying a cap keeps the currently selected mode. Undo restores the previous mappings, which may include an older Performance-only cap.
+
 - Fan curve editor: pick a profile (defaults to the active one), drag the 8 points per fan on the chart or type temperature (C) and speed (%), then "Apply to <profile>" per fan or "Apply all three". Runs `asusctl fan-curve --mod-profile ... --fan ... --data ...` plus `--enable-fan-curves true`; the server rejects bad curves (8 points, temps 30-100 C strictly increasing, speed non-decreasing, last point at least 40 %). Shows non-blocking warnings (middle fan below 100 % from 70 C, GPU fan below 100 % from 80 C, profile not active). Built-in and custom presets can be loaded into the editor without applying; custom ones are saved in `ui/custom-presets.json` (up to 20). Stored curves are read from `/etc/asusd/fan_curves.ron`.
 - Stall test: 10 s `tools/stall-counter.py`, shows stalls per second; refuses with "internal sound device busy" if the device is in use.
 
 The server listens on 127.0.0.1 only, POSTs need a per-run token, and only the whitelisted commands above can run.
+
+
+The all-mode cap helper is `root-tests/cpu_cap_profiles.py`; keep it beside the shell script when
+running from a checkout. The installer copies both files. It resolves inherited settings using
+the installed TuneD library and generates small profiles containing just the CPU percentage
+limits. Reapplying a different cap explicitly reloads the active profile, including when its name
+has not changed. Legacy Performance-only installations can still use Undo before applying an
+all-mode cap. The helper enables `tuned` and `tuned-ppd` for boot; Undo leaves these standard
+services enabled.
+
+CPU-cap regression checks use temporary files and mocked service commands, including simulated
+startup, mode changes, battery selection, reapply, failures and both undo paths:
+
+```bash
+/usr/bin/python3 -IB root-tests/test_cpu_cap.py
+```
 
 The native **Auto** tab shows the service mode, each fan's live speed (read from the fan sensors,
 so it shows without the service too, as rpm and percent of that fan's full speed) beside its
@@ -378,6 +433,39 @@ and set Auto to **Off · base curve** first. The calibration tool holds control 
 of the saved Performance curves and their enable flags. You can cancel a run, inspect per-step
 mean and peak stalls, and export the complete or partial sample CSV. Quitting the panel during a
 run waits for cleanup; closing the window only hides it to the tray. In panel dry-run mode, the start button previews the command.
+
+Calibration also reports temperature trends for the board, CPU and GPU, actual fan-speed
+stabilization, and estimated cooling onset. Hover over the **Thermal response** or **Assessment**
+cell for details. Cooling onset is an approximate window-based observation after fan speeds
+stabilize, not a universal temperature threshold or proof that one fan caused the change.
+Audio stalls remain an independent result: temperatures can fall while audio still stalls.
+
+Keep both CPU and GPU workload steady during each step. Fresh CPU package power comes from the
+fan service's status (at most six seconds old); missing CPU power, changing workload, sensor gaps,
+or unstable fan speeds make the comparison inconclusive. Older CSVs still show temperature slopes
+and audio results, but cannot establish a cooling response without CPU power. The CSV now includes
+monotonic step time, CPU power and sample age, requested fan percentages (blank means saved curve),
+and whether the run was Observe.
+
+The first analysis uses conservative heuristics: sustained fan-speed stability, 60-second thermal
+trends, two consecutive 30-second cooling windows, and at least 90 seconds of history after fan
+stabilization before declaring temperatures approximately steady. These thresholds need live
+validation. A stepped session can extend in 30-second increments by up to 120 seconds when load
+and RPM are steady, audio has no detected stall above 1/s, and temperatures are still changing.
+Extra settling is skipped if recent CPU or GPU readings reach the shipped base curve's full-speed
+temperatures (88 C CPU / 86 C GPU).
+Observe never extends. Set `--settle-extra 0` to retain fixed durations (maximum allowed extra time:
+600 seconds). Cancellation and exact curve restoration also cover the extended portion.
+
+Analyze an exported calibration without applying fan settings:
+
+```bash
+python3 -IB tools/fan-calibrate.py --analyze data/logs/10-fan-calibration-light.csv
+```
+
+This prints per-step JSON. On its own, analysis does not generate or apply an Auto model, rank fan
+mixes by noise, or change the service's policy. Auto-tune (below) proposes a table from generated
+load, and you review it before anything is written.
 
 **Auto-tune** (Calibrate tab, or `tools/autotune.py`; about 60-90 minutes, loud). It generates heat
 itself and replaces manual calibration runs. Levels run hottest first, at GPU 160, 120, 80 and 40 W
@@ -411,7 +499,7 @@ the red logo (`asus_notif_red`), as does the window when the tray icon is off:
 | Colour | Meaning |
 |---|---|
 | Green | Automatic control, no drops |
-| Yellow | Fans boosted after USB drops, or ramping back down (about 4 minutes) |
+| Yellow | Fans boosted after USB drops, or ramping back down (up to about 2.5 minutes) |
 | Orange | Sensor fallback: a sensor is missing and the fans are held at safe floors |
 | Red | USB audio dropping packets now (start-up skips excluded), or the service stopped, stale or unreadable |
 | Blue | Off, a manual preset, calibration in control, or a profile the service does not protect |

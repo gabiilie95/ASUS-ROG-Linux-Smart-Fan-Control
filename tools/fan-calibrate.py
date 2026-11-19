@@ -2,7 +2,7 @@
 """Fan calibration: hold fans at fixed speeds step by step and measure chipset stalls under the
 current (light) load. Restores the exact fan curves it found, at the end, on Ctrl+C or on error.
 
-    python3 tools/fan-calibrate.py                 # about 20 minutes, writes data/logs/10-...csv
+    python3 tools/fan-calibrate.py                 # about 21-35 minutes, including settling
     python3 tools/fan-calibrate.py --step 30 --dry-run   # quick check, changes nothing
 
 Stall counter: extra HD-audio interrupts per second while silence is playing on the PCH sound chip (hw:CARD=PCH,DEV=0) with a
@@ -13,8 +13,10 @@ No root needed: fan curves are set with asusctl for the Performance profile.
 import argparse
 import contextlib
 import csv
+from datetime import datetime, timezone
 import fcntl
 import json
+import math
 import os
 from pathlib import Path
 import signal
@@ -25,7 +27,9 @@ import threading
 import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ui"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import rogcore as core
+from fan_analysis import EXTENSION_LIMITS, analyze_step
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PCM = "/proc/asound/PCH/pcm0p/sub0"
@@ -165,7 +169,56 @@ def calibration_lease():
 
 
 COLUMNS = ("t", "step", "label", "stalls_per_s", "board_c", "cpu_c", "gpu_c", "gpu_w",
-           "cpu_rpm", "gpu_rpm", "mid_rpm", "counter_ok")
+           "cpu_rpm", "gpu_rpm", "mid_rpm", "counter_ok", "elapsed_s", "cpu_w", "cpu_w_age_s",
+           "cpu_pct", "gpu_pct", "mid_pct", "observe")
+
+
+def cpu_power():
+    """Use fresh service telemetry; unavailable package power is explicitly unknown."""
+    state, sample = core.fan_service()
+    if state not in ("Running", "Dry run") or not sample:
+        return None, None
+    try:
+        age = (datetime.now(timezone.utc) - datetime.fromisoformat(sample["t"])).total_seconds()
+        watts = sample["sensors"].get("cpu_w")
+        if (type(watts) in (int, float) and math.isfinite(watts) and 0 <= watts <= 1000
+                and 0 <= age <= 6):
+            return watts, round(age, 3)
+    except (KeyError, TypeError, ValueError):
+        pass
+    return None, None
+
+
+def analyze_csv(path):
+    """Analyze saved samples without opening audio devices or changing fan settings."""
+    groups = []
+    with open(path, newline="") as source:
+        reader = csv.DictReader(source)
+        if not {"t", "step", "label"} <= set(reader.fieldnames or []):
+            raise ValueError("Calibration CSV needs t, step and label columns")
+        previous_step = None
+        previous_stamp = elapsed = 0
+        for raw in reader:
+            step = raw["step"]
+            stamp = datetime.strptime(raw["t"], "%H:%M:%S")
+            seconds = stamp.hour * 3600 + stamp.minute * 60 + stamp.second
+            if step != previous_step:
+                groups.append(dict(index=step, name=raw["label"], readings=[], observe=raw.get("observe") == "1"))
+                elapsed = 0
+            else:
+                elapsed += (seconds - previous_stamp) % 86400
+            previous_step, previous_stamp = step, seconds
+            row = {}
+            for key, value in raw.items():
+                if key not in ("t", "step", "label"):
+                    try:
+                        row[key] = float(value) if value else None
+                    except (ValueError, TypeError):
+                        row[key] = None
+            at = row.get("elapsed_s")
+            groups[-1]["readings"].append((elapsed if at is None else at, row))
+    return [dict(index=g["index"], name=g["name"],
+                 analysis=analyze_step(g["readings"], observe=g["observe"])) for g in groups]
 
 
 def run(a, steps, stop):
@@ -206,7 +259,7 @@ def run(a, steps, stop):
             for index, (name, spec) in enumerate(steps, 1):
                 if stop.is_set():
                     break
-                report("step", name, index=index, total=len(steps))
+                report("step", name, index=index, total=len(steps), duration_s=a.step)
                 if not a.observe:
                     for fan in FANS:
                         if stop.is_set():
@@ -223,7 +276,19 @@ def run(a, steps, stop):
                 start = last_t = time.monotonic()
                 last_i = hda_irqs()
                 readings = []
-                while time.monotonic() - start < a.step and not stop.wait(2):
+                deadline = a.step
+                extra = 0 if a.observe or a.dry_run else getattr(a, "settle_extra", 120)
+                limit = a.step + extra
+                while not stop.is_set():
+                    if time.monotonic() - start >= deadline:
+                        assessment = analyze_step(readings, observe=bool(a.observe))
+                        if deadline >= limit or not assessment["can_extend"]:
+                            break
+                        deadline = min(limit, deadline + 30)
+                        report("extend", "Temperatures still changing; measuring for up to 30 s longer.",
+                               duration_s=deadline)
+                    if stop.wait(2):
+                        break
                     if not a.observe and rd("/sys/firmware/acpi/platform_profile") != "performance":
                         raise ValueError("Performance profile changed")
                     i, now = hda_irqs(), time.monotonic()
@@ -235,14 +300,20 @@ def run(a, steps, stop):
                     last_i, last_t = i, now
                     gt, gw = gpu()
                     rpm = core.read_fans()
+                    cw, cpu_age = cpu_power()
+                    elapsed = time.monotonic()-start
                     row = dict(zip(COLUMNS, [time.strftime("%H:%M:%S"), index, name,
                                None if rate is None else round(rate, 2), zone("SEN3"),
-                               zone("x86_pkg_temp"), gt, gw, *[rpm[f+"_rpm"] for f in FANS], int(ok)]))
+                               zone("x86_pkg_temp"), gt, gw, *[rpm[f+"_rpm"] for f in FANS], int(ok),
+                               round(elapsed, 3), cw, cpu_age, *[spec.get(f) for f in FANS], int(bool(a.observe))]))
                     writer.writerow(row.values())
-                    elapsed = time.monotonic()-start
                     readings.append((elapsed, row))
                     report("sample", f"{name} · {elapsed:.0f} s · {row['stalls_per_s']} stalls/s",
-                           row=row, elapsed=elapsed)
+                           row=row, elapsed=elapsed, duration_s=deadline)
+                    if elapsed > a.step and (any(row[key] is None or row[key] >= limit
+                            for key, limit in EXTENSION_LIMITS.items())
+                            or rate is None or rate > 1):
+                        break  # Extra observation is useful only while temperatures and audio permit it.
                 tail = [r for t, r in readings if t >= 60] or [r for _, r in readings]
                 rates = [r["stalls_per_s"] for r in tail if r["stalls_per_s"] is not None]
                 watts = [r["gpu_w"] for r in tail if r["gpu_w"] is not None]
@@ -251,8 +322,12 @@ def run(a, steps, stop):
                 mean_w = sum(watts)/len(watts) if watts else None
                 summary.append((index, name, avg, peak, tail[-1]["board_c"] if tail else None,
                                 mean_w, tuple(tail[-1][f+"_rpm"] for f in FANS) if tail else (None,)*3))
+                assessment = analyze_step(readings, observe=bool(a.observe))
+                if not a.panel_json:
+                    report("analysis", assessment["reason"])
                 report("result", f"{name} · mean {avg} · peak {peak} stalls/s", index=index,
-                       name=name, samples=len(readings), mean=avg, peak=peak, watts=mean_w)
+                       name=name, samples=len(readings), mean=avg, peak=peak, watts=mean_w,
+                       analysis=assessment)
         finally:
             try:
                 if changed:
@@ -297,7 +372,7 @@ def print_summary(a, summary):
         return
     print("\nSummary (average of each step after its first minute):")
     print("  step  stalls/s (max)   fans cpu/gpu/mid rpm   GPU W  board C   setting")
-    for si, label, avg, mx, rpm, gw, board in summary:
+    for si, label, avg, mx, board, gw, rpm in summary:
         print("  %d     %5s (%5s)     %5s/%5s/%5s     %5s   %5s     %s" % (
             si, "--" if avg is None else "%.1f" % avg, "--" if mx is None else "%.1f" % mx,
             rpm[0], rpm[1], rpm[2], "--" if gw is None else "%.0f" % gw, board, label))
@@ -306,12 +381,18 @@ def print_summary(a, summary):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--step", type=int, default=180)
+    ap.add_argument("--settle-extra", type=int, default=120, metavar="SECONDS",
+                    help="maximum extra measurement time per active step (default: 120; 0 disables)")
+    ap.add_argument("--analyze", metavar="CSV", help="analyze an existing calibration CSV as JSON; no hardware access")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--out", default=os.path.join(ROOT, "data/logs/10-fan-calibration-light.csv"))
     ap.add_argument("--steps", help="semicolon-separated settings such as mid=70;cpu=80,gpu=80,mid=80")
     ap.add_argument("--observe", type=int, metavar="SECONDS")
     ap.add_argument("--panel-json", action="store_true", help="emit progress as JSON lines")
     a = ap.parse_args()
+    if a.analyze:
+        print(json.dumps(analyze_csv(a.analyze), indent=2, allow_nan=False))
+        return
     steps = STEPS
     if a.observe is not None:
         a.step = a.observe
@@ -320,6 +401,8 @@ def main():
         steps = core.calibration_steps(a.steps)
     if a.step <= 0:
         ap.error("duration must be positive")
+    if not 0 <= a.settle_extra <= 600:
+        ap.error("extra settling time must be between 0 and 600 seconds")
     stop = threading.Event()
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: stop.set())

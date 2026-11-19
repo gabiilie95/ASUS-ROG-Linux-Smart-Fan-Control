@@ -5,7 +5,7 @@ import sys
 import tempfile
 import time
 
-from PySide6.QtCore import QProcess, QSaveFile, QIODevice, Signal
+from PySide6.QtCore import QProcess, QSaveFile, QIODevice, Signal, Qt
 from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QFileDialog, QFormLayout, QGroupBox,
                                QHBoxLayout, QHeaderView, QLineEdit, QMessageBox, QProgressBar,
                                QPushButton, QSpinBox, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
@@ -16,6 +16,7 @@ AUTOTUNE = "Auto-tune (about 60-90 min, loud)"
 SAFETY_EXIT = 3     # autotune.py stopped at a safety limit; the reason is in its progress
 STEP_COLUMNS = ["Step", "Samples", "Mean stalls/s", "Peak stalls/s", "GPU power (W)"]
 AUTOTUNE_COLUMNS = STEP_COLUMNS + ["USB drops", "Verdict"]
+CALIBRATE_COLUMNS = STEP_COLUMNS + ["Thermal response", "Assessment"]
 TABLE_COLUMNS = ["From GPU W", "CPU %", "GPU %", "Middle %"]
 
 
@@ -50,12 +51,14 @@ class CalibrateTab(QWidget):
         self.proposal = None
         self.autotune = False
         self.index = self.total = 0
+        self.step_duration = self.elapsed = 0
         self.outcome = ""
         self.stderr = ""
         layout = QVBoxLayout(self)
         layout.addWidget(heading("Fan calibration"))
-        layout.addWidget(label("Measure internal audio stalls under your current workload, or let "
-                               "auto-tune generate the heat and find the quietest clean fan mix."))
+        layout.addWidget(label("Measure thermal response and internal audio stalls under a steady workload "
+                               "(temperatures alone do not prove clean audio), or let auto-tune generate "
+                               "the heat and find the quietest clean fan mix."))
         setup = QGroupBox("Session")
         form = QFormLayout(setup)
         self.preset = QComboBox()
@@ -121,7 +124,8 @@ class CalibrateTab(QWidget):
         self.review.setVisible(False)
         layout.addWidget(self.review)
 
-        self.results = table_widget(STEP_COLUMNS)
+        self.results = table_widget(CALIBRATE_COLUMNS)
+        self.results.setAccessibleName("Calibration results with thermal response and audio assessment")
         layout.addWidget(self.results, 1)
 
     def preset_changed(self, preset):
@@ -141,6 +145,8 @@ class CalibrateTab(QWidget):
                       "to Off, the power adapter and the USB audio interface. Nothing is written until you "
                       "review the proposed table.",
         }[preset])
+        self.description.setText(self.description.text() + (" Thermal trends need a stable workload."
+            if preset == "Observe" else " Keep the workload steady. A step may extend by up to 120 s to check thermal settling."))
 
     def begin(self):
         if self.process:
@@ -203,7 +209,7 @@ class CalibrateTab(QWidget):
         self.stderr = self.outcome = ""
         self.index = self.total = 0
         self.results.setColumnCount(0)
-        columns = AUTOTUNE_COLUMNS if auto else STEP_COLUMNS
+        columns = AUTOTUNE_COLUMNS if auto else CALIBRATE_COLUMNS
         self.results.setColumnCount(len(columns))
         self.results.setHorizontalHeaderLabels(columns)
         self.results.setRowCount(0)
@@ -235,6 +241,7 @@ class CalibrateTab(QWidget):
         kind = event["kind"]
         if kind == "step" and "total" in event:
             self.index, self.total = event["index"], event["total"]
+            self.step_duration, self.elapsed = event.get("duration_s", self.seconds.value()), 0
             self.message.setText(f"Step {self.index} of {self.total}  ·  {event['message']}")
         elif kind in ("step", "level", "level-result"):
             self.message.setText(event["message"])
@@ -242,8 +249,13 @@ class CalibrateTab(QWidget):
             self.progress.setValue(round(100 * min(1, max(0, event["progress"]))))
             self.message.setText(f"{event['message']}  ·  {event['run_s'] / 60:.0f} min")
         elif kind == "sample" and self.total:
-            fraction = min(1, event["elapsed"]/self.seconds.value())
-            self.progress.setValue(round(100*(self.index-1+fraction)/self.total))
+            self.elapsed = event["elapsed"]
+            self.step_duration = event.get("duration_s", self.step_duration or self.seconds.value())
+            self.update_progress()
+            self.message.setText(f"Step {self.index} of {self.total}  ·  {event['message']}")
+        elif kind == "extend":
+            self.step_duration = event["duration_s"]
+            self.update_progress()
             self.message.setText(f"Step {self.index} of {self.total}  ·  {event['message']}")
         elif kind == "result":
             row = self.results.rowCount()
@@ -256,6 +268,8 @@ class CalibrateTab(QWidget):
                 text = ("stalls" if v else "clean") if key == "stalled" else \
                     "—" if v is None else f"{v:.2f}" if isinstance(v, float) else str(v)
                 self.results.setItem(row, col, QTableWidgetItem(text))
+            if not self.autotune:      # auto-tune steps carry their own verdict columns
+                self.show_analysis(row, event)
         elif kind == "proposal":
             self.show_proposal(event["table"], event.get("path"))
         elif kind in ("done", "restore", "safety"):
@@ -263,6 +277,53 @@ class CalibrateTab(QWidget):
             self.message.setText(self.outcome)
             if kind == "done" and not event["cancelled"] and not event.get("safety"):
                 self.progress.setValue(100)
+
+    def update_progress(self):
+        if self.total and self.step_duration > 0:
+            fraction = min(1, self.elapsed / self.step_duration)
+            self.progress.setValue(round(100 * (self.index - 1 + fraction) / self.total))
+
+    def show_analysis(self, row, event):
+        analysis = event.get("analysis")
+        thermal, assessment, details = "Not analyzed", "Not analyzed", []
+        if analysis:
+            sensors = analysis.get("sensors", {})
+            board = sensors.get("board_c", {})
+            slope, onset = board.get("slope_c_min"), board.get("cooling_onset_s")
+            thermal = f"{slope:+.2f} °C/min" if slope is not None else "Board unavailable"
+            if onset is not None:
+                thermal += f" · cooling ~{onset:.0f} s"
+            for key, name in (("board_c", "Board"), ("cpu_c", "CPU"), ("gpu_c", "GPU")):
+                sensor = sensors.get(key, {})
+                slope, onset = sensor.get("slope_c_min"), sensor.get("cooling_onset_s")
+                details.append(f"{name}: {sensor.get('trend', 'unavailable')}; slope "
+                               + (f"{slope:+.2f} °C/min" if slope is not None else "unavailable")
+                               + "; estimated cooling onset " + (f"{onset:.0f} s" if onset is not None else "not detected"))
+                onset_temp = sensor.get("cooling_onset_c")
+                if onset is not None and onset_temp is not None:
+                    details[-1] += f" at approximately {onset_temp:.1f} °C"
+            settled = analysis.get("rpm_settled_s")
+            details.append("RPM stabilization: " + (f"{settled:.0f} s" if settled is not None else "not confirmed"))
+            details.append("Stable load: " + {True: "yes", False: "no", None: "unknown"}[analysis.get("load_stable")])
+            assessment = analysis.get("reason") or analysis.get("status", "Not analyzed")
+            details.append("Assessment: " + analysis.get("status", "unknown") + " · " + assessment)
+        audio_clean = (analysis or {}).get("audio_clean")
+        if "audio_clean" not in (analysis or {}):
+            rates = [event[key] for key in ("mean", "peak") if event.get(key) is not None]
+            audio_clean = not any(rate > 1 for rate in rates) if rates else None
+        stalls = audio_clean is False
+        if stalls:
+            assessment = "Stalls detected · " + assessment
+        elif audio_clean is None:
+            assessment = "Audio unverified · " + assessment
+        details.append("Audio assessment: " + {True: "clean", False: "stalls detected", None: "unverified"}[audio_clean])
+        details.append("Internal audio stalls are assessed independently of thermal trends. "
+                       "Cooling alone does not prove clean audio.")
+        for col, value in ((len(STEP_COLUMNS), thermal), (len(STEP_COLUMNS) + 1, assessment)):
+            item = QTableWidgetItem(value)
+            item.setToolTip("\n".join(details))
+            item.setData(Qt.AccessibleTextRole, value + ". " + " ".join(details))
+            self.results.setItem(row, col, item)
 
     def process_error(self, error):
         if self.process and error == QProcess.FailedToStart:

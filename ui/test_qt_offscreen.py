@@ -181,7 +181,11 @@ def service_tabs(w, q):
         os.replace(path+'.part',path)
         for event in [dict(kind='step',message='Observe',index=1,total=1),
                       dict(kind='sample',message='Reading',row={},elapsed=30),
-                      dict(kind='result',name='Observe',samples=15,mean=0,peak=0,watts=70)]:
+                      dict(kind='result',name='Observe',samples=15,mean=0,peak=0,watts=70,
+                           analysis=dict(status='cooling',reason='Board still cooling',load_stable=True,
+                                         rpm_settled_s=12,audio_clean=True,can_extend=False,
+                                         sensors=dict(board_c=dict(slope_c_min=-0.6,cooling_onset_s=24,trend='cooling'),
+                                                      cpu_c=dict(slope_c_min=0.1,cooling_onset_s=None,trend='steady'))))]:
             print(json.dumps(event),flush=True)
         time.sleep(30)
     """)
@@ -190,6 +194,32 @@ def service_tabs(w, q):
         cal.start.click()
         check(wait_for(lambda: cal.results.rowCount()==1), "streaming calibration progress and results")
         check(auto.calibrating and cal.progress.value()==25, "active calibration holds UI controls")
+        check(cal.results.columnCount()==7 and "-0.60" in cal.results.item(0,5).text()
+              and "cooling ~24 s" in cal.results.item(0,5).text()
+              and "Board still cooling" in cal.results.item(0,6).text()
+              and "RPM stabilization: 12 s" in cal.results.item(0,5).toolTip()
+              and "CPU: steady" in cal.results.item(0,5).toolTip(),
+              "thermal response and assessment render with sensor tooltips")
+        cal.consume(dict(kind="extend",message="Checking thermal settling",duration_s=240))
+        check(cal.progress.value()==12 and "Checking thermal settling" in cal.message.text(),
+              "extension updates deadline and current progress")
+        cal.consume(dict(kind="sample",message="Extended reading",elapsed=60,duration_s=240))
+        check(cal.progress.value()==25, "sample uses the extended duration")
+        cal.consume(dict(kind="result",name="Legacy",samples=15,mean=0,peak=0,watts=None))
+        check(cal.results.item(1,5).text()=="Not analyzed" and cal.results.item(1,6).text()=="Not analyzed",
+              "legacy result remains readable without analysis")
+        cal.consume(dict(kind="result",name="Stalls despite cooling",samples=15,mean=1,peak=2,watts=70,
+                         analysis=dict(status="steady",reason="Thermally steady",audio_clean=False,sensors={})))
+        check("Stalls detected" in cal.results.item(2,6).text(), "audio warning remains independent of thermal result")
+        cal.consume(dict(kind="result",name="Background",samples=15,mean=0.04,peak=0.08,watts=70))
+        check("Stalls detected" not in cal.results.item(3,6).text(), "legacy background counter noise is not a stall warning")
+        cal.consume(dict(kind="result",name="Audio clean",samples=15,mean=2,peak=4,watts=70,
+                         analysis=dict(status="steady",reason="Thermally steady",audio_clean=True,sensors={})))
+        check("Stalls detected" not in cal.results.item(4,6).text(), "explicit audio assessment takes precedence over summary")
+        cal.consume(dict(kind="result",name="Audio unknown",samples=15,mean=None,peak=None,watts=70,
+                         analysis=dict(status="steady",reason="Thermally steady",audio_clean=None,sensors={})))
+        check("Audio unverified" in cal.results.item(5,6).text()
+              and "Thermally steady" in cal.results.item(5,6).text(), "unknown audio remains separate from thermal confidence")
         cal.cancel.click()
         check(wait_for(lambda: cal.process is None) and "Cancelled" in cal.message.text(), "cancel waits for owned child")
     dest = Path(OUT) / "export.csv"
@@ -471,7 +501,9 @@ def tray_model_tests():
     path.unlink()
 
 
-def update_tests(w, tray, shown):
+# Update UI scenarios use a simulated installed updater, independent of host ownership mappings.
+@patch.object(core, "updater_installed", return_value=True)
+def update_tests(w, tray, shown, _installed):
     up = w.updater
     class Fake:
         def __init__(self, tag, installed, fail=None):

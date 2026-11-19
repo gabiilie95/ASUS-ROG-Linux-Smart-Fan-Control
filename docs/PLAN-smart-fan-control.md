@@ -1,7 +1,37 @@
 # Smart fan control for the ROG Strix G18 (G814JZ) — plan
 
-Status: agreed with the owner on 2026-11-17, not started. Build in three phases, each its own branch
-and review. Background and all measurements: `../README.md`.
+Status updated 2026-11-17: the service and native panel are implemented. The calibration analysis
+stage described below is implemented in the checkout; live adaptive fan optimization remains
+future work. Background and all measurements: `../README.md`.
+
+## Saved implementation progress — 2026-11-17
+
+- Added `tools/fan_analysis.py`: conservative per-sensor temperature slopes, approximate sustained
+  cooling onset/time/temperature, actual RPM stabilization, workload stability and independent
+  audio assessment. Missing or stale CPU power, workload changes and sparse data prevent confident
+  attribution. Thresholds are initial heuristics, not a fitted physical model.
+- Calibration records monotonic time, requested fan percentages and fresh CPU power from the
+  service. It can extend suitable active steps by up to 120 seconds; Observe stays fixed. Extra
+  observation ends on hot CPU/GPU readings or audio failures. Restoration still covers cancellation
+  and failures. Fixed the CLI summary's swapped board/RPM fields.
+- Panel shows thermal results and assessment with detailed tooltips. `--analyze CSV` reprocesses
+  exported samples without applying fan settings. Installer includes the analysis module.
+- CPU-cap follow-up: owner chose **every power mode**. TuneD overlays now retain each mapped
+  profile's other policies while applying the saved ceiling, including battery mappings. Existing
+  lower limits are respected; same-profile edits force a reload. Legacy and new undo are supported.
+  Installer includes the new `root-tests/cpu_cap_profiles.py` helper.
+- Validation: 36 calibration tests, 66 service/updater tests, 7 CPU-cap tests, Qt offscreen checks
+  with zero failures, shell syntax and diff whitespace checks. Replayed all three historical
+  calibration CSVs; missing CPU power remains explicit. CPU-cap tests simulate startup and mode
+  changes; installed TuneD profile inheritance was inspected read-only.
+- Deployment state: source changes only. No installation, real fan calibration, CPU-cap application,
+  service restart, or reboot was performed for this work.
+
+Next: install and validate the updated panel/helpers on the laptop; confirm the chosen CPU cap
+after reboot in each mode. Collect repeated, steady-load fan comparisons after heat soak, including
+CPU power and listening preferences. Only then fit/rank quieter fan mixes, log proposed Auto choices
+without applying them, and validate before enabling adaptive reductions. The existing live Auto
+policy is unchanged by this implementation.
 
 ## Why
 
@@ -77,7 +107,7 @@ Decision:
   GPU < 50 W: no floor; 50-110 W: 35 / 40 / 70; 110-140 W: 60 / 60 / 75; >= 140 W: 80 / 80 / 80.
 - Feedback: when audio is active and drops are seen in 2 consecutive samples, boost at once
   (middle +20 points, others +10, capped at 100) and raise that heat bin's margin by 5 points
-  (cap 20). After 30 min clean in a bin, lower its margin by 2.5 (floor 0). Persist margins in
+  (cap 20). After 15 min clean in a bin (was 30), lower its margin by 2.5 (floor 0). Persist margins in
   `/var/lib/rog-fand/state.json`.
 - No feedback when no USB audio is playing (nothing to protect on USB); feed-forward still applies.
 
@@ -90,8 +120,10 @@ Applying (fail-safe by construction):
   are touched only while their floors are above zero, with their own curves and enable flags saved
   in a per-profile receipt and restored exactly afterwards.) If the owner switches profile, finish
   or defer the write and log it.
-- Write only when a floor changes by at least 5 points. Up: immediately. Down: after a 60 s hold, at
-  most 5 points per 20 s (no surging).
+- Write only when a floor changes by at least 5 points. Up: at most 30 points per 2 s sample.
+  Down: after a 30 s hold, a third of the gap (5 to 20 points) every 10 s, finishing at the target;
+  5 points per 20 s while the board sensor reads 75 °C or more. A mode the user picks skips the
+  hold. (Was: up at once; down after a 60 s hold, 5 points per 20 s. Changed 2026-11-17.)
 - On stop (SIGTERM, `ExecStopPost`) and on any unhandled error: restore the base curve exactly.
 - If a sensor fails (NVML unavailable, RAPL unreadable), use a conservative floor (for example 60 / 60 / 80)
   and report it in the status.

@@ -8,9 +8,10 @@ state=/var/lib/rog-fand
 unit=/etc/systemd/system/rog-fand.service
 launcher=/usr/local/share/applications/rog-panel-qt.desktop
 panel_files=(ui/{rog-panel-qt,rogcore,fan_auto,fan_calibration,fan_tray,panel_settings}.py
-             tools/{fan-calibrate,stall-counter,autotune,gpuload}.py tools/loadgen.c
+             tools/{fan-calibrate,fan_analysis,stall-counter,autotune,gpuload}.py tools/loadgen.c
              tools/fans-{balanced,max,mid-max,original,ramped}.sh
-             tools/jellyfin-software-ui.sh root-tests/{setup-cool-performance,usb-drop-count}.sh)
+             tools/jellyfin-software-ui.sh root-tests/{setup-cool-performance,usb-drop-count}.sh
+             root-tests/cpu_cap_profiles.py)
 tmp=
 cleanup() {
     if [[ -n $tmp ]]; then rm -f -- "$tmp"; fi
