@@ -1,79 +1,89 @@
 #!/bin/bash
-# Makes the "Performance" power profile run the CPU cooler without touching fans or GPU power.
-#
-#   sudo bash root-tests/setup-cool-performance.sh           install (cap 55 %)
-#   sudo CAP=70 bash root-tests/setup-cool-performance.sh    install with another cap
-#   sudo bash root-tests/setup-cool-performance.sh undo      put everything back
-#
-# What changes: Fedora maps the Performance profile to tuned's "throughput-performance", which
-# uses the `performance` governor and so holds every core at the highest allowed frequency.
-# This installs a small tuned profile, "rog-performance", that keeps the ASUS Performance
-# platform profile (fans, GPU power) but uses the `powersave` governor with a
-# balance_performance preference and the CPU cap, then maps Performance to it.
-# Nothing here affects the fan curves; those live in asusd.
-
-set -u
-[ "$(id -u)" = 0 ] || { echo "Run this with sudo."; exit 1; }
+# Persist a CPU ceiling in every TuneD/PPD mode, retaining each mode's other policies.
+# sudo CAP=70 bash root-tests/setup-cool-performance.sh [install|undo]
+set -euo pipefail
+[ "$(id -u)" = 0 ] || { echo "Run this with sudo." >&2; exit 1; }
 CAP=${CAP:-55}
 MODE=${1:-install}
-DIR=/etc/tuned/profiles/rog-performance
+HERE=$(cd -- "$(dirname -- "$0")" && pwd -P)
 PPD=/etc/tuned/ppd.conf
-P=/sys/devices/system/cpu/intel_pstate
+BACKUP=/etc/tuned/ppd.conf.before-rog-cpu-cap
 OLDUNIT=intel-pstate-70.service
-MARK=/etc/tuned/rog-performance.disabled-old-cap-unit
-
-state() {
-  echo "  tuned profile : $(tuned-adm active 2>/dev/null | sed 's/Current active profile: //')"
-  echo "  governor      : $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)   preference: $(cat /sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference 2>/dev/null)"
-  echo "  CPU cap       : max $(cat $P/max_perf_pct) %  min $(cat $P/min_perf_pct) %"
-  echo "  ASUS profile  : $(cat /sys/firmware/acpi/platform_profile 2>/dev/null)"
-}
+MARK=/etc/tuned/rog-cpu-cap.disabled-old-cap-unit
+stage=
+trap 'if [[ -n $stage ]]; then rm -rf -- "$stage"; fi' EXIT
 
 case "$MODE" in
 install)
-  [ -f /usr/lib/tuned/profiles/throughput-performance/tuned.conf ] || { echo "tuned's throughput-performance profile not found; nothing changed."; exit 1; }
-  grep -q '^performance=' "$PPD" || { echo "$PPD has no 'performance=' line; nothing changed."; exit 1; }
-  echo "Before:"; state
-  mkdir -p "$DIR"
-  cat > "$DIR/tuned.conf" <<EOF
-[main]
-summary=ROG G18: Performance fans and GPU power, CPU on the powersave governor capped at ${CAP} %
-include=throughput-performance
-
-[cpu]
-governor=powersave
-energy_performance_preference=balance_performance
-energy_perf_bias=normal
-min_perf_pct=10
-max_perf_pct=${CAP}
-EOF
-  [ -f "$PPD.before-rog-performance" ] || cp -p "$PPD" "$PPD.before-rog-performance"
-  sed -i 's/^performance=.*/performance=rog-performance/' "$PPD"
-  # The older boot unit writes a fixed 55 % at every boot and would race with tuned's value,
-  # so tuned becomes the single place the cap is set. "undo" re-enables the unit.
-  if [ "$(systemctl is-enabled "$OLDUNIT" 2>/dev/null)" = enabled ]; then
-    systemctl disable "$OLDUNIT" >/dev/null 2>&1 && touch "$MARK" && echo "Disabled $OLDUNIT (tuned now sets the cap)."
+  [[ $CAP =~ ^(4[0-9]|[5-9][0-9]|100)$ ]] || { echo "CAP must be an integer from 40 to 100; nothing changed." >&2; exit 1; }
+  command -v powerprofilesctl >/dev/null
+  [ -f /sys/devices/system/cpu/intel_pstate/max_perf_pct ] || { echo "Intel P-State percentage control unavailable." >&2; exit 1; }
+  selected=$(powerprofilesctl get)
+  [[ $selected == performance || $selected == balanced || $selected == power-saver ]] || { echo "Unknown power profile: $selected" >&2; exit 1; }
+  source=$PPD
+  [ ! -f "$BACKUP" ] || source=$BACKUP
+  # Resolve all inherited CPU policies before writing configuration or invoking a service.
+  stage=$(mktemp -d /etc/tuned/.rog-cpu-cap.XXXXXXXX)
+  /usr/bin/python3 -IB "$HERE/cpu_cap_profiles.py" "$source" "$stage/generated" "$CAP"
+  [ -f "$BACKUP" ] || cp -p "$PPD" "$BACKUP"
+  for dir in "$stage"/generated/rog-cpu-cap-*; do
+    mkdir -p "/etc/tuned/profiles/$(basename "$dir")"
+    install -m 0644 "$dir/tuned.conf" "/etc/tuned/profiles/$(basename "$dir")/tuned.conf"
+  done
+  install -m 0644 "$stage/generated/ppd.conf" "$PPD"
+  if [ "$(systemctl is-enabled "$OLDUNIT" 2>/dev/null || true)" = enabled ]; then
+    systemctl disable "$OLDUNIT"
+    touch "$MARK"
   fi
+  systemctl enable tuned.service tuned-ppd.service
   systemctl restart tuned-ppd
-  tuned-adm profile rog-performance
+  powerprofilesctl set "$selected"
+  # PPD skips an already-active TuneD profile. Force a reload when only CAP changed;
+  # obtain the active mapping from TuneD so the battery-specific mapping is respected.
+  active=$(tuned-adm active | sed 's/Current active profile: //')
+  [[ $active == rog-cpu-cap-* && $active != *[[:space:]]* ]] || {
+    echo "TuneD did not select a CPU cap overlay: $active" >&2; exit 1;
+  }
+  tuned-adm profile "$active"
   sleep 2
-  echo "After:"; state
-  ok=1
-  [ "$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)" = powersave ] || ok=0
-  [ "$(cat $P/max_perf_pct)" = "$CAP" ] || ok=0
-  [ "$(cat /sys/firmware/acpi/platform_profile 2>/dev/null)" = performance ] || ok=0
-  if [ $ok = 1 ]; then echo "OK. It is re-applied whenever the Performance power profile is selected, including after a reboot."
-  else echo "Something did not apply as expected. Run:  sudo bash $0 undo   and show Claude this output."; fi
+  actual=$(cat /sys/devices/system/cpu/intel_pstate/max_perf_pct)
+  [[ $actual =~ ^[0-9]+$ ]] && (( actual <= CAP )) &&
+    [ "$(powerprofilesctl get)" = "$selected" ] &&
+    [ "$(cat /etc/tuned/ppd_base_profile)" = "$selected" ] || {
+      echo "CPU cap verification failed; configuration is saved. Undo with: sudo bash $0 undo" >&2
+      exit 1
+    }
+  echo "Saved CPU ceiling $CAP % for every power mode (current limit $actual %, mode $selected)."
   ;;
 undo)
-  if [ -f "$PPD.before-rog-performance" ]; then mv -f "$PPD.before-rog-performance" "$PPD"; fi
-  if [ -f "$MARK" ]; then systemctl enable "$OLDUNIT" >/dev/null 2>&1 && echo "Re-enabled $OLDUNIT."; fi
+  legacy=0
+  restore=$BACKUP
+  if [ ! -f "$restore" ]; then
+    restore=$PPD.before-rog-performance
+    [ -f "$restore" ] || { echo "No saved CPU cap installation to undo."; exit 0; }
+    legacy=1
+  fi
+  selected=$(powerprofilesctl get)
+  cp -p "$restore" "$PPD"
   systemctl restart tuned-ppd
-  tuned-adm profile throughput-performance
-  rm -rf "$DIR"
-  sleep 2
-  echo "Reverted:"; state
+  powerprofilesctl set "$selected"
+  if [ -f "$MARK" ]; then
+    systemctl enable "$OLDUNIT"
+    rm -f "$MARK"
+  fi
+  if (( legacy )); then
+    legacy_mark=/etc/tuned/rog-performance.disabled-old-cap-unit
+    if [ -f "$legacy_mark" ]; then
+      systemctl enable "$OLDUNIT"
+      rm -f "$legacy_mark"
+    fi
+    rm -rf /etc/tuned/profiles/rog-performance
+  else
+    # The legacy profile and backup may be needed by the restored mappings.
+    rm -rf /etc/tuned/profiles/rog-cpu-cap-*
+  fi
+  rm -f "$restore"
+  echo "Restored the previous power-profile mappings; selected mode remains $selected."
   ;;
-*)
-  echo "Usage: sudo bash $0 [install|undo]"; exit 1 ;;
+*) echo "Usage: sudo CAP=55 bash $0 [install|undo]" >&2; exit 1 ;;
 esac
