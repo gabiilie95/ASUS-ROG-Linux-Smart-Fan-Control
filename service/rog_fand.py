@@ -144,8 +144,13 @@ def config(installed=False):
             pwd.getpwnam(user)
         except KeyError:
             raise ValueError(f"control_user {user!r} does not exist") from None
+    validate_table(cfg["table"])
+    return cfg
+
+
+def validate_table(table):
     last = -1
-    for row in cfg["table"]:
+    for row in table:
         threshold = number(row["min_gpu_w"], 0, 1000)
         if threshold <= last or (last == -1 and threshold != 0):
             raise ValueError("GPU thresholds must start at zero and increase")
@@ -153,7 +158,28 @@ def config(installed=False):
         last = threshold
     if last == -1:
         raise ValueError("empty GPU table")
-    return cfg
+    return table
+
+
+def write_model(text):
+    """Install an auto-tune table as model.json (root; the panel runs this through pkexec), then
+    restart the service so it loads it. Accepts only whole numbers in the table's own shape."""
+    if len(text) > 4096:
+        raise ValueError("model too large")
+    table = json.loads(text)
+    if not isinstance(table, list) or not 1 <= len(table) <= 16:
+        raise ValueError("expected a list of 1 to 16 table rows")
+    for row in table:
+        if (not isinstance(row, dict) or set(row) != {"min_gpu_w", "floors"}
+                or type(row["min_gpu_w"]) != int or not isinstance(row["floors"], list)
+                or any(type(v) != int for v in row["floors"])):
+            raise ValueError("rows must be {\"min_gpu_w\": int, \"floors\": [int, int, int]}")
+    validate_table(table)
+    model = dict(version=1, source="auto-tune", table=table,
+                 written=datetime.now(timezone.utc).isoformat(timespec="seconds"))
+    atomic_write(ETC / "model.json", json.dumps(model, indent=1) + "\n", 0o644)
+    # try-restart: only a running service is restarted; a stopped one reads the model at start.
+    subprocess.run(["/usr/bin/systemctl", "try-restart", "rog-fand.service"], check=True, timeout=180)
 
 
 def migrate_timing(overrides):
@@ -632,7 +658,7 @@ def run_service(dry, duration):
                           dry_run=dry, mode=mode, invalid_mode=last_mode_error is not None,
                           controlled=controlled, profiles=cfg["profiles"],
                           sensors=values, unavailable=problems, degraded=degraded, heat_w=rounded(policy.heat),
-                          smoothed_gpu_w=rounded(policy.gpu), floors=dict(zip(FANS, floors)),
+                          smoothed_gpu_w=rounded(policy.gpu), floors=dict(zip(FANS, floors)), table=cfg["table"],
                           applied=applied, manual_control=manual_control, margins=policy.margins, usb=usb, events=list(events))
             if dry:
                 print(json.dumps(status), flush=True)
@@ -659,6 +685,7 @@ def main(argv=None):
     modes.add_argument("--dry-run", action="store_true", help="read sensors and print JSON only")
     modes.add_argument("--replay", type=Path, metavar="CSV", help="replay recorded GPU decisions")
     modes.add_argument("--restore", action="store_true", help="finish a pending base restore")
+    modes.add_argument("--write-model", metavar="JSON", help="install an auto-tune table (root)")
     modes.add_argument("--restore-on-stop", action="store_true",
                        help="systemd cleanup: keep inactive-profile receipts for later recovery")
     parser.add_argument("--seconds", type=int, help="end the dry run after this many seconds")
@@ -672,6 +699,13 @@ def main(argv=None):
         run_service(True, args.seconds)
     elif os.geteuid() != 0:
         parser.error("live control requires root; use --dry-run or --replay")
+    elif args.write_model is not None:
+        try:
+            write_model(args.write_model)
+        except ValueError as exc:
+            print(f"invalid model: {exc}", file=sys.stderr)
+            return 1
+        print(f"wrote {ETC / 'model.json'} and restarted rog-fand if it was running")
     else:
         # Serialize manual restore, service startup, and systemd stop-post recovery.
         lock = os.open(STATE, os.O_DIRECTORY)

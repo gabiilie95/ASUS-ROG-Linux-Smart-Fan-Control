@@ -187,7 +187,7 @@ to the design below:
 
 ### 3. Load test and model (Phase 3)
 
-`tools/autotune.py`, unattended, about 60-90 minutes, loud:
+`tools/autotune.py`, unattended, about 60-110 minutes, loud:
 - Heat levels: CPU load from `tools/loadgen.c`, GPU load from `stress-ng --gpu` on the NVIDIA render
   node (or `vkmark`), at 3-4 levels covering about 40-170 W on the GPU. Confirm first that the
   generator reaches those levels on the NVIDIA card.

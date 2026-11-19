@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Offscreen test of rog-panel-qt.py (dry run only; nothing real runs, no window on a real display)."""
+import contextlib
 import importlib.util
 import os
 import sys
@@ -227,6 +228,128 @@ def service_tabs(w, q):
     screenshot(w, "calibrate.png")
     cal.dry_run = auto.dry_run = True
     path.unlink()
+    core.FAND_UNIT.unlink()
+
+
+def autotune_tests(w):
+    """The Calibrate tab's auto-tune entry: preview, refusals, live progress, review and write.
+    The tool and pkexec are replaced by small Python children; nothing touches load or fans."""
+    import fan_calibration
+    from textwrap import dedent
+    from unittest.mock import Mock
+    cal = w.cal_tab
+    logs = Path(OUT) / "logs"
+    w.tabs.setCurrentIndex(4)
+    cal.preset.setCurrentText(fan_calibration.AUTOTUNE)
+    check(not cal.form.isRowVisible(cal.seconds) and not cal.form.isRowVisible(cal.custom)
+          and "60-110" in cal.description.text(), "auto-tune hides step settings and explains the run")
+    with patch.object(core, "log_dir", return_value=logs):
+        cal.start.click()
+    check("autotune.py" in cal.message.text() and "--panel-json" in cal.message.text() and cal.process is None,
+          "auto-tune dry run only previews the command")
+    cal.dry_run = False
+    quiet = dict(sound_device_busy=False, manual_fan_problem=None, log_dir=logs)
+    with contextlib.ExitStack() as stack:
+        for name, value in quiet.items():
+            stack.enter_context(patch.object(core, name, return_value=value))
+        cal.start.click()
+    check("Start the service" in cal.message.text() and cal.process is None,
+          "auto-tune refuses without the fan service (USB drops)")
+
+    core.FAND_UNIT.touch()
+    status = core.FAND_RUN / "status.json"
+    publish(status, json.dumps(fand_sample(mode="off")))
+    table = [{"min_gpu_w": 0, "floors": [0, 0, 0]}, {"min_gpu_w": 75, "floors": [35, 40, 70]}]
+    child = dedent("""
+        import json, sys
+        out = sys.argv[1]
+        with open(out, 'w') as f:
+            f.write('t,level\\n12:00:00,1\\n')
+        table = %s
+        for e in [dict(kind='level', message='Level 1 of 1 (GPU 160 W), CPU 4 threads', index=1, total=1),
+                  dict(kind='step', message='Level 1 of 1 · fans 100/100/100 %%', level=1, index=1, rung=0),
+                  dict(kind='sample', message='Level 1 · 62 s', elapsed=62, phase='judge', run_s=600,
+                       progress=0.3, row={}),
+                  dict(kind='result', message='r', name='Level 1 · 100/100/100 %%', samples=60, mean=0.0,
+                       peak=0.0, watts=159.0, usb_drops=0, stalled=False),
+                  dict(kind='level-result', message='quietest clean fans 100/100/100 %%'),
+                  dict(kind='restore', message='Saved Performance curves and enable flags restored.'),
+                  dict(kind='proposal', message='Proposed', table=table, path=out + '.model.json'),
+                  dict(kind='done', message='Completed.', cancelled=False, safety=None)]:
+            print(json.dumps(e), flush=True)
+    """ % json.dumps(table))
+    box = Mock()
+    box.Yes = "yes"
+    box.question.return_value = "no"
+    with contextlib.ExitStack() as stack:
+        for name, value in quiet.items():
+            stack.enter_context(patch.object(core, name, return_value=value))
+        stack.enter_context(patch.object(core, "FAND_ETC", Path(OUT) / "etc"))
+        stack.enter_context(patch.object(fan_calibration, "QMessageBox", box))
+        stack.enter_context(patch.object(core, "autotune_args", side_effect=lambda o: ["-Ic", child, str(o)]))
+        cal.start.click()
+        check(box.question.called and cal.process is None, "auto-tune asks before a long, loud run")
+        box.question.return_value = "yes"
+        cal.start.click()
+        check(wait_for(lambda: cal.process is None), "auto-tune child finished")
+        check(cal.results.columnCount() == 7 and cal.results.rowCount() == 1
+              and cal.results.item(0, 6).text() == "clean" and cal.results.item(0, 5).text() == "0",
+              "auto-tune step results show USB drops and the verdict")
+        check(cal.review.isVisible() and cal.proposed_table.rowCount() == 2
+              and cal.proposed_table.item(1, 3).text() == "70", "review shows the proposed table")
+        check(cal.current_table.rowCount() == 4 and "default" in cal.current_box.title(),
+              "review shows the current table beside it (%s)" % cal.current_box.title())
+        check("Completed" in cal.message.text() and cal.progress.value() == 100 and cal.export.isEnabled()
+              and cal.output_path.parent == logs, "auto-tune completes and keeps its log")
+        screenshot(w, "autotune.png")
+
+        cal.dry_run = True
+        cal.write_model.click()
+        check("pkexec" in cal.review_status.text() and "--write-model" in cal.review_status.text()
+              and cal.proposal is not None, "write model in dry run only previews pkexec")
+        cal.dry_run = False
+        with patch.object(core, "root_owned", return_value=False):
+            cal.write_model.click()
+        check("not installed" in cal.review_status.text() and cal.writer is None,
+              "write refused without the installed service")
+        fail = ["-c", "import sys; sys.stderr.write('error: unrecognized arguments: --write-model'); sys.exit(2)"]
+        with patch.object(core, "root_owned", return_value=True), \
+                patch.object(core, "model_command", return_value=[sys.executable, *fail]):
+            cal.write_model.click()
+            check(wait_for(lambda: cal.writer is None) and "older" in cal.review_status.text()
+                  and cal.write_model.isEnabled(), "an old installed service is explained")
+        with patch.object(core, "root_owned", return_value=True), \
+                patch.object(core, "model_command", return_value=[sys.executable, "-c", "print('ok')"]):
+            cal.write_model.click()
+            check(wait_for(lambda: cal.writer is None) and "Written" in cal.review_status.text()
+                  and cal.proposal is None and not cal.write_model.isEnabled(), "model written through pkexec")
+        publish(status, json.dumps(fand_sample(mode="off", table=table)))
+        cal.show_proposal(table)
+        check("reported by the fan service" in cal.current_box.title() and cal.current_table.rowCount() == 2,
+              "current table comes from the running service when it reports one")
+        cal.discard.click()
+        check(not cal.review.isVisible() and cal.proposal is None, "discard hides the proposal")
+        cal.show_proposal([{"min_gpu_w": 5, "floors": [0, 0, 0]}])
+        check("invalid" in cal.message.text() and cal.proposal is None, "an invalid proposal is rejected")
+
+        safety = dedent("""
+            import json, sys
+            for e in [dict(kind='safety', message='Stopped: CPU reached 95 C (limit 95 C).', reason='CPU'),
+                      dict(kind='restore', message='Saved Performance curves and enable flags restored.'),
+                      dict(kind='done', message='Stopped for safety: CPU reached 95 C.', cancelled=False,
+                           safety='CPU reached 95 C')]:
+                print(json.dumps(e), flush=True)
+            sys.exit(3)
+        """)
+        with patch.object(core, "autotune_args", side_effect=lambda o: ["-Ic", safety, str(o)]):
+            cal.start.click()
+            check(wait_for(lambda: cal.process is None) and "CPU reached 95 C" in cal.message.text()
+                  and "restored" in cal.message.text() and "exited with code" not in cal.message.text()
+                  and cal.progress.value() < 100 and not cal.review.isVisible(),
+                  "safety stop shows its reason and the restore, not an error code")
+    cal.dry_run = True
+    cal.preset.setCurrentText("Observe")
+    status.unlink()
     core.FAND_UNIT.unlink()
 
 
@@ -648,6 +771,7 @@ def main():
         return finish(w)
     pump(300)
     service_tabs(w, q)
+    autotune_tests(w)
 
     # ---- monitor: synthetic IRQ counts, no aplay ----
     wu = q.core.StallRate()

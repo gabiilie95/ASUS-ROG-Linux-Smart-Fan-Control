@@ -499,6 +499,8 @@ def validate_fand_sample(s):
             raise ValueError("Invalid service event")
     if not isinstance(s["unavailable"], list) or not all(isinstance(x, str) for x in s["unavailable"]):
         raise ValueError("Invalid sensor status")
+    if "table" in s:
+        table_rows(s["table"])
     return stamp.timestamp()
 
 
@@ -542,14 +544,19 @@ def load_updater():
     return module
 
 
-def updater_installed():
-    """The installed updater, if root owns it and nobody else can write it (pkexec runs it as root)."""
+def root_owned(path):
+    """A regular file that root owns and nobody else can write (pkexec runs it as root)."""
     try:
-        st = os.stat(UPDATER_INSTALLED, follow_symlinks=False)
+        st = os.stat(path, follow_symlinks=False)
     except OSError:
         return False
     import stat
     return stat.S_ISREG(st.st_mode) and st.st_uid == 0 and not st.st_mode & 0o022
+
+
+def updater_installed():
+    """The installed updater, if root owns it and nobody else can write it."""
+    return root_owned(UPDATER_INSTALLED)
 
 
 def update_command(tag):
@@ -610,6 +617,81 @@ def calibration_steps(text):
             spec[match[1]] = int(match[2])
         steps.append((" + ".join(f"{fan} {v} %" for fan, v in spec.items()), spec))
     return steps
+
+
+def log_dir():
+    """Where long measurements keep their logs: the checkout's data/logs, or, for the installed
+    panel (whose files are root-owned), ~/.local/share/rog-fand/logs."""
+    repo = Path(ROOT) / "data" / "logs"
+    if repo.is_dir() and os.access(repo, os.W_OK):
+        return repo
+    return Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share") / "rog-fand" / "logs"
+
+
+def autotune_args(output):
+    return ["-IB", os.path.join(TOOLS, "autotune.py"), "--panel-json", "--out", str(output)]
+
+
+FAND_ETC = Path("/etc/rog-fand")
+FAND_INSTALLED = Path("/usr/local/lib/rog-fand/rog_fand.py")   # the root-owned copy pkexec runs
+MAX_TABLE_ROWS = 16
+
+
+def table_rows(table):
+    """A GPU-power table as the service accepts it: rows of min_gpu_w (from 0 W, rising) and three
+    floors (cpu, gpu, mid %). Raises ValueError; returns plain dicts."""
+    if not isinstance(table, list) or not 1 <= len(table) <= MAX_TABLE_ROWS:
+        raise ValueError("A fan table needs 1 to %d rows" % MAX_TABLE_ROWS)
+    rows, last = [], None
+    for row in table:
+        if not isinstance(row, dict):
+            raise ValueError("Each table row must be an object")
+        watts, floors = row.get("min_gpu_w"), row.get("floors")
+        if (type(watts) not in (int, float) or not math.isfinite(watts) or not 0 <= watts <= 1000
+                or (watts != 0 if last is None else watts <= last)):
+            raise ValueError("GPU thresholds must start at 0 W and rise")
+        if (not isinstance(floors, list) or len(floors) != 3
+                or any(type(v) not in (int, float) or not 0 <= v <= 100 for v in floors)):
+            raise ValueError("Floors must be three percentages from 0 to 100")
+        rows.append({"min_gpu_w": watts, "floors": list(floors)})
+        last = watts
+    return rows
+
+
+def check_model(table):
+    """The stricter form the panel writes: whole numbers only and no other keys."""
+    rows = table_rows(table)
+    if any(set(r) != {"min_gpu_w", "floors"} for r in table) or any(
+            type(r["min_gpu_w"]) is not int or any(type(v) is not int for v in r["floors"]) for r in rows):
+        raise ValueError("A model table holds whole watts and whole percentages only")
+    return rows
+
+
+def current_table():
+    """(rows or None, where they come from) for the table the service uses now. A running service
+    from 0.4.0 reports it; otherwise /etc/rog-fand/model.json when present, else the installed
+    default (which the root-only config.json may override)."""
+    s = fan_service()[1]
+    if s is not None and "table" in s:
+        return table_rows(s["table"]), "reported by the fan service"
+    try:
+        return table_rows(json.loads((FAND_ETC / "model.json").read_text())["table"]), str(FAND_ETC / "model.json")
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError, KeyError, TypeError):
+        return None, "unreadable " + str(FAND_ETC / "model.json")
+    try:
+        default = json.loads((FAND_PROGRAM.parent / "config.example.json").read_text())["table"]
+        return table_rows(default), "service default (config.json may override it)"
+    except (OSError, ValueError, KeyError, TypeError):
+        return None, "unknown"
+
+
+def model_command(table):
+    """Install an auto-tune table as /etc/rog-fand/model.json and restart the service. The
+    installed, root-owned service program validates it again before writing."""
+    return ["pkexec", "/usr/bin/python3", "-IB", str(FAND_INSTALLED), "--write-model",
+            json.dumps(check_model(table), separators=(",", ":"))]
 
 
 def calibration_args(preset, seconds, custom, output):

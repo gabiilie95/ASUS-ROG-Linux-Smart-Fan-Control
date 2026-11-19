@@ -463,9 +463,48 @@ Analyze an exported calibration without applying fan settings:
 python3 -IB tools/fan-calibrate.py --analyze data/logs/10-fan-calibration-light.csv
 ```
 
-This prints per-step JSON. Analysis does not generate or apply a new Auto model, rank fan mixes by
-noise, or change the service's existing policy. Those steps need repeated comparisons at matching
-loads, listening preferences, and independent validation of the proposed settings.
+This prints per-step JSON. On its own, analysis does not generate or apply an Auto model, rank fan
+mixes by noise, or change the service's policy. Auto-tune (below) proposes a table from generated
+load, and you review it before anything is written.
+
+**Auto-tune** (Calibrate tab, or `tools/autotune.py`; about 60-110 minutes, loud). It generates heat
+itself and replaces manual calibration runs. Levels run hottest first, at GPU 160, 120, 80 and 40 W
+plus 4, 3, 2 and 2 CPU threads. At each level the fan floors step from loud to quiet along a fixed
+ladder: 180 s per step, judged on the last 120 s. The descent stops at the first step that stalls
+(more than 1 stall/s on the internal counter, or any USB drop in the service's status). The fans
+then go straight back to the last clean step, and the next level starts there. Silence plays to the
+Volt 2 through PipeWire so the USB link stays busy. Hard stops: CPU 95 C, GPU 85 C, board 90 C,
+battery power, or the profile leaving Performance; any stop or cancel ends the load and restores
+the exact saved curves. The log goes to `data/logs/autotune-<time>.csv` (installed panel:
+`~/.local/share/rog-fand/logs/`), the proposal beside it as `.model.json`. The panel shows the
+proposed table next to the current one. **Write model…** installs it through pkexec
+(`rog_fand.py --write-model`, strictly validated) as `/etc/rog-fand/model.json` and restarts the
+service. Delete that file as root to go back to the default table.
+
+**Quieter-mix search.** After a level's quietest clean ladder step, auto-tune moves 10, then 20
+points of airflow from the middle fan to the CPU and GPU fans, at the same heat and under the same
+stall rules. It keeps the quietest mix that stays clean. Background:
+- **Why:** calibration showed that total airflow keeps the chipset area clean, not the middle fan
+  alone (middle 60 % plus another fan at full was as clean as middle 70 %), and the middle fan is
+  the whiny one.
+- **Noise score:** sound power grows roughly with fan speed to the fifth power, so two fans at
+  medium speed are quieter than one fast one. The middle fan's whine counts double, using the
+  service's `noise_weights`. A mix is only tried if it scores quieter, so an even mix like 80/80/80
+  is left alone.
+- **Cost:** at most two extra 3-minute steps per level, 0–24 minutes in a run. `--no-rebalance`
+  skips the search.
+- **The table:** the proposal uses the chosen mixes. Floors still never fall as GPU power rises,
+  so a hotter row takes the higher of each fan from the cooler row's mix and its own.
+
+GPU load comes from `tools/gpuload.py`, not `stress-ng --gpu`, because Fedora's stress-ng is
+built without EGL/GBM and skips that stressor. gpuload runs a PTX kernel through the NVIDIA
+driver's own `libcuda.so.1` (no toolkit needed). It only sees the NVIDIA GPU, and a duty cycle
+holds a target power. Checked on 2026-11-17: `nvidia-smi` read 40.4, 79.7, 120.3 and 160.0 W
+for 40/80/120/160 W targets. CPU: `loadgen` at 4 threads about 57 W, 8 threads about 105-110 W.
+
+    python3 tools/autotune.py --plan            # print levels, ladder and limits; changes nothing
+    python3 tools/autotune.py --check-load 30   # hold each level 30 s, fans untouched
+    python3 -B tools/test_autotune.py
 
 **Tray icon** (`ui/fan_tray.py`). The panel puts the ROG logo that asusctl installs in the
 system tray. The logo is loaded by icon name and not copied here. Its colour shows the service
