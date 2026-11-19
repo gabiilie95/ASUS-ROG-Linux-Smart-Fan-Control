@@ -628,8 +628,26 @@ def log_dir():
     return Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share") / "rog-fand" / "logs"
 
 
-def autotune_args(output):
-    return ["-IB", os.path.join(TOOLS, "autotune.py"), "--panel-json", "--out", str(output)]
+def autotune_args(output, mic=None):
+    args = ["-IB", os.path.join(TOOLS, "autotune.py"), "--panel-json", "--out", str(output)]
+    return args + (["--mic", mic] if mic else [])
+
+
+def noise_meter_module():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("noise_meter", os.path.join(TOOLS, "noise_meter.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def mic_sources():
+    """Microphone inputs for noise measurement: [{name, description, usable}] (built-in inputs are
+    listed but not usable while the stall counter runs)."""
+    try:
+        return noise_meter_module().list_sources()
+    except (OSError, ImportError, SyntaxError):
+        return []
 
 
 FAND_ETC = Path("/etc/rog-fand")
@@ -694,10 +712,12 @@ def model_command(table):
             json.dumps(check_model(table), separators=(",", ":"))]
 
 
-def calibration_args(preset, seconds, custom, output):
+def calibration_args(preset, seconds, custom, output, mic=None):
     if preset not in ("Light", "Heavy", "Custom", "Observe") or type(seconds) != int or seconds < 1:
         raise ValueError("Invalid calibration preset or duration")
     args = ["-IB", os.path.join(TOOLS, "fan-calibrate.py"), "--panel-json", "--out", str(output)]
+    if mic:
+        args += ["--mic", mic]
     if preset == "Observe":
         return args + ["--observe", str(seconds)]
     args += ["--step", str(seconds)]

@@ -244,6 +244,39 @@ class QuieterMixTest(unittest.TestCase):
         self.assertEqual(t.results[0]["ladder_floors"], [35, 40, 70])
         self.assertEqual(t.results[0]["floors"], [55, 60, 50])
 
+    def test_measured_noise_decides_with_a_microphone(self):
+        # Both shifts stay clean (plain airflow model). Measured: 45/50/60 is 1 dB quieter than the
+        # ladder step and kept; 55/60/50 is only 0.2 dB quieter than that and not kept.
+        noise = {(35, 40, 70): -40.0, (45, 50, 60): -41.0, (55, 60, 50): -41.2}
+        m = FakeMachine({80: 215})
+        m.override = lambda machine: {"noise_db": noise.get(machine.floors)}
+        events = []
+        t = tuner(m, "80:2", events=events, rebalance=at.REBALANCE)
+        t.run()
+        r = t.results[0]
+        self.assertEqual((r["ladder_floors"], r["floors"], r["noise_db"]), ([35, 40, 70], [45, 50, 60], -41.0))
+        self.assertEqual([(x["floors"], x["kept"], x["noise_db"]) for x in r["tried"]],
+                         [([45, 50, 60], True, -41.0), ([55, 60, 50], False, -41.2)])
+        self.assertIn("-41.0 dB(A)", [e for e in events if e["kind"] == "level-result"][0]["message"])
+        self.assertTrue(any("noise -41.2 dB(A)" in e["message"] for e in events if e["kind"] == "result"))
+        rows = list(csv.DictReader(io.StringIO(",".join(at.COLUMNS) + "\n" + t.csv.getvalue())))
+        self.assertIn("-41.0", [r["noise_db"] for r in rows])
+
+    def test_louder_by_measurement_is_not_kept(self):
+        noise = {(35, 40, 70): -40.0, (45, 50, 60): -39.0, (55, 60, 50): -38.0}
+        m = FakeMachine({80: 215})
+        m.override = lambda machine: {"noise_db": noise.get(machine.floors)}
+        t = tuner(m, "80:2", rebalance=at.REBALANCE)
+        t.run()
+        self.assertEqual(t.results[0]["floors"], [35, 40, 70])
+        self.assertFalse(t.results[0]["rebalanced"])
+
+    def test_plan_mentions_the_microphone(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            at.main(["--plan", "--mic", "alsa_input.usb-Mic-00.mono"])
+        self.assertIn("measured from alsa_input.usb-Mic-00.mono", out.getvalue())
+
     def test_switch_off(self):
         m = MiddleHeavyMachine({120: 270})
         t = tuner(m, "120:3")

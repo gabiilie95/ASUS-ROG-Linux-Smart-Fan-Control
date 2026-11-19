@@ -30,6 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ui"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import rogcore as core
 from fan_analysis import EXTENSION_LIMITS, analyze_step
+import noise_meter
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PCM = "/proc/asound/PCH/pcm0p/sub0"
@@ -170,7 +171,7 @@ def calibration_lease():
 
 COLUMNS = ("t", "step", "label", "stalls_per_s", "board_c", "cpu_c", "gpu_c", "gpu_w",
            "cpu_rpm", "gpu_rpm", "mid_rpm", "counter_ok", "elapsed_s", "cpu_w", "cpu_w_age_s",
-           "cpu_pct", "gpu_pct", "mid_pct", "observe")
+           "cpu_pct", "gpu_pct", "mid_pct", "observe", "noise_db")
 
 
 def cpu_power():
@@ -250,7 +251,13 @@ def run(a, steps, stop):
         tmp = Path(fh.name)
         writer = csv.writer(fh)
         writer.writerow(COLUMNS)
+        meter = None
         try:
+            if getattr(a, "mic", None):
+                # Levels only, one per second; no audio is kept.
+                meter = noise_meter.NoiseMeter(a.mic)
+                stack.callback(meter.close)
+                meter.wait_signal(stop)
             if not counter_ready():
                 player = subprocess.Popen(APLAY, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 stop.wait(3)
@@ -305,7 +312,8 @@ def run(a, steps, stop):
                     row = dict(zip(COLUMNS, [time.strftime("%H:%M:%S"), index, name,
                                None if rate is None else round(rate, 2), zone("SEN3"),
                                zone("x86_pkg_temp"), gt, gw, *[rpm[f+"_rpm"] for f in FANS], int(ok),
-                               round(elapsed, 3), cw, cpu_age, *[spec.get(f) for f in FANS], int(bool(a.observe))]))
+                               round(elapsed, 3), cw, cpu_age, *[spec.get(f) for f in FANS], int(bool(a.observe)),
+                               meter.level() if meter else None]))
                     writer.writerow(row.values())
                     readings.append((elapsed, row))
                     report("sample", f"{name} · {elapsed:.0f} s · {row['stalls_per_s']} stalls/s",
@@ -320,14 +328,16 @@ def run(a, steps, stop):
                 avg = sum(rates)/len(rates) if rates else None
                 peak = max(rates) if rates else None
                 mean_w = sum(watts)/len(watts) if watts else None
+                noise = noise_meter.summarize([r["noise_db"] for r in tail]) if meter else None
                 summary.append((index, name, avg, peak, tail[-1]["board_c"] if tail else None,
                                 mean_w, tuple(tail[-1][f+"_rpm"] for f in FANS) if tail else (None,)*3))
                 assessment = analyze_step(readings, observe=bool(a.observe))
                 if not a.panel_json:
                     report("analysis", assessment["reason"])
-                report("result", f"{name} · mean {avg} · peak {peak} stalls/s", index=index,
+                report("result", f"{name} · mean {avg} · peak {peak} stalls/s"
+                       + ("" if noise is None else f" · noise {noise} dB(A)"), index=index,
                        name=name, samples=len(readings), mean=avg, peak=peak, watts=mean_w,
-                       analysis=assessment)
+                       analysis=assessment, noise_db=noise)
         finally:
             try:
                 if changed:
@@ -389,6 +399,9 @@ def main():
     ap.add_argument("--steps", help="semicolon-separated settings such as mid=70;cpu=80,gpu=80,mid=80")
     ap.add_argument("--observe", type=int, metavar="SECONDS")
     ap.add_argument("--panel-json", action="store_true", help="emit progress as JSON lines")
+    ap.add_argument("--mic", metavar="SOURCE",
+                    help="also measure fan noise (A-weighted level, no audio kept) from this PipeWire "
+                         "input; see tools/noise_meter.py --list")
     a = ap.parse_args()
     if a.analyze:
         print(json.dumps(analyze_csv(a.analyze), indent=2, allow_nan=False))

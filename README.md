@@ -496,6 +496,28 @@ stall rules. It keeps the quietest mix that stays clean. Background:
 - **The table:** the proposal uses the chosen mixes. Floors still never fall as GPU power rises,
   so a hotter row takes the higher of each fan from the cooler row's mix and its own.
 
+**Microphone noise measurement** (optional; `--mic` for both tools, or **Microphone** in the
+Calibrate tab).
+- **What it records:** the chosen PipeWire input, as one A-weighted level per second (dBFS(A),
+  48 kHz). No audio is recorded or saved; `tools/noise_meter.py` keeps only the levels.
+- **How a step is judged:** by the median of its levels, so a cough or a key press does not decide it.
+  - **Calibration** shows it in a **Noise dB(A)** column and in the CSV's `noise_db` column.
+  - **Auto-tune** writes the same column. The quieter-mix search then keeps a mix only if it
+    measures at least 0.5 dB quieter than the best clean mix so far. Without a microphone, the
+    noise score decides.
+- **Relative levels:** they are not calibrated sound pressure, and are only for comparing fan mixes
+  in one session. Place the microphone where you sit and keep the room quiet.
+- **Which input:** use a USB microphone or audio interface (for example the Volt 2's input, or the
+  dock's headset mic). The laptop's built-in inputs (`alsa_input.pci-…`) are refused, because they
+  sit on the same HD-audio controller whose interrupts are the stall counter.
+- **Cost:** the A-weighting filter runs in plain Python, using about 2 % of one core. It is within
+  0.2 dB of the standard curve up to 6.3 kHz.
+
+```bash
+python3 tools/noise_meter.py --list                      # inputs (x = not usable)
+python3 tools/noise_meter.py --source <name> --seconds 10   # print levels
+```
+
 GPU load comes from `tools/gpuload.py`, not `stress-ng --gpu`, because Fedora's stress-ng is
 built without EGL/GBM and skips that stressor. gpuload runs a PTX kernel through the NVIDIA
 driver's own `libcuda.so.1` (no toolkit needed). It only sees the NVIDIA GPU, and a duty cycle
