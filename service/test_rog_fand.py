@@ -558,6 +558,12 @@ class LifecycleTest(unittest.TestCase):
                 fand.write_model(text)
         self.assertEqual(fand.read_json(model)["table"], table)
         self.assertEqual(self.command.call_count, 1)
+        self.assertNotIn("preset", fand.read_json(model), "older panels write no preset")
+        fand.write_model(json.dumps(table), "quick")
+        self.assertEqual(fand.read_json(model)["preset"], "quick")
+        with self.assertRaises(ValueError):
+            fand.write_model(json.dumps(table), "turbo")
+        self.assertEqual(fand.read_json(model)["preset"], "quick")
 
     def test_write_model_needs_root_and_reports_invalid_input(self):
         with patch.object(fand.os, "geteuid", return_value=1000), \
@@ -569,6 +575,14 @@ class LifecycleTest(unittest.TestCase):
         self.assertIn("invalid model", err.getvalue())
         self.assertFalse((self.path / "model.json").exists())
         self.command.assert_not_called()
+        for argv in (["--model-preset", "quick"], ["--write-model", "[]", "--model-preset", "turbo"]):
+            with self.subTest(argv=argv), patch.object(fand.os, "geteuid", return_value=0), \
+                    contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                fand.main(argv)
+        table = json.dumps([{"min_gpu_w": 0, "floors": [0, 0, 0]}])
+        with patch.object(fand.os, "geteuid", return_value=0), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(fand.main(["--write-model", table, "--model-preset", "full"]), 0)
+        self.assertEqual(fand.read_json(self.path / "model.json")["preset"], "full")
 
 
 QUIET_OUTPUT = """

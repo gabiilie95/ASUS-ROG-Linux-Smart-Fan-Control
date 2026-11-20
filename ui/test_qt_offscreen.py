@@ -98,14 +98,14 @@ def service_tabs(w, q):
              events=[dict(t=stamp(now), message="USB drop boost")])
     publish(path, json.dumps(s))
     auto.refresh()
-    check(auto.state == "Stale" and not auto.chart.samples, "stale samples excluded")
+    check(auto.state == "Stale" and not auto.service_log, "stale samples excluded")
     for i in range(101):
         s["t"] = stamp(now-200+2*i)
         s["floors"] = dict(cpu=35 if i<40 else 80, gpu=40 if i<40 else 80, mid=70 if i<40 else 80)
         auto.display("Running", s)
     publish(path, json.dumps(s))
     auto.refresh()
-    check(len(auto.chart.samples) == 101 and auto.bars["mid"].value()==80, "timestamped graph deduplicates samples")
+    check(len(auto.service_log) == 101 and auto.bars["mid"].value()==80, "timestamped graph deduplicates samples")
     check("1.5 drops/s" in auto.usb.text() and "+5 pp" in auto.margin.text(), "USB rates and learned margins")
     check("boost" in auto.events.toPlainText() and not auto.apply.isEnabled(), "dry panel reads live events without control")
     auto.display("Running", dict(s, sensors=dict(s["sensors"], profile="quiet")))
@@ -286,7 +286,7 @@ def autotune_tests(w):
             stack.enter_context(patch.object(core, name, return_value=value))
         stack.enter_context(patch.object(core, "FAND_ETC", Path(OUT) / "etc"))
         stack.enter_context(patch.object(fan_calibration, "QMessageBox", box))
-        stack.enter_context(patch.object(core, "autotune_args", side_effect=lambda o, m=None: ["-Ic", child, str(o)]))
+        stack.enter_context(patch.object(core, "autotune_args", side_effect=lambda o, m=None, **kw: ["-Ic", child, str(o)]))
         cal.start.click()
         check(box.question.called and cal.process is None, "auto-tune asks before a long, loud run")
         box.question.return_value = "yes"
@@ -341,7 +341,7 @@ def autotune_tests(w):
                 print(json.dumps(e), flush=True)
             sys.exit(3)
         """)
-        with patch.object(core, "autotune_args", side_effect=lambda o, m=None: ["-Ic", safety, str(o)]):
+        with patch.object(core, "autotune_args", side_effect=lambda o, m=None, **kw: ["-Ic", safety, str(o)]):
             cal.start.click()
             check(wait_for(lambda: cal.process is None) and "CPU reached 95 C" in cal.message.text()
                   and "restored" in cal.message.text() and "exited with code" not in cal.message.text()
@@ -351,6 +351,167 @@ def autotune_tests(w):
     cal.preset.setCurrentText("Observe")
     status.unlink()
     core.FAND_UNIT.unlink()
+
+
+def overview_tests(w):
+    """The Overview's sensor cards, every-sensor table, chart views and the fan calibration setup.
+    Sensor readings are synthetic; mode requests and auto-tune starts are recorded, never run."""
+    import fan_calibration
+    import sensor_scan
+    from calibration_card import check_items
+    from unittest.mock import Mock
+    auto, cal, card = w.auto_tab, w.cal_tab, w.auto_tab.calibration
+    check(w.tabs.tabText(0) == "Overview", "first tab is the Overview")
+    w.tabs.setCurrentIndex(0)
+    r = sensor_scan.reading
+    readings = [r("sen3", "Board", "Board · SEN3", 78.0, "°C", "thermal zone · SEN3", 75.05, 80.05),
+                r("dimm_a", "Board", "Memory A", 86.0, "°C", "spd5118 · temp1", 75, 85),
+                r("cpu_pkg", "CPU", "Package", 63.0, "°C", "coretemp · Package id 0", 90, 95),
+                r("cpu_fan", "Fans", "CPU fan", 4100, "rpm", "asus · cpu_fan"),
+                r("bat_pct", "Power", "Battery charge", 80, "%", "BAT0 · capacity"),
+                r("mystery@x/in0", "Other", "mystery · in0", 1.2, "V", "mystery · in0")]
+    auto.set_system({"cpu": {"max_perf_pct": 70, "governor": "performance"},
+                     "gpu": {"temp_c": 61, "power_w": 96.5, "util_pct": 72, "mem_used_mb": 5400,
+                             "mem_total_mb": 12288, "mem_high": False}})
+    auto.timer.stop()
+    check(wait_for(lambda: not auto.scanning, 5000), "no live sensor scan in flight")
+    auto.sensors = sensor_scan.SensorHistory()       # only the synthetic readings below
+    with patch.object(core, "fan_service", return_value=("Stopped", None)):
+        auto.display("Stopped", None)
+        for i in range(3):
+            auto.take_scan(dict(readings=[dict(x, value=x["value"] + i) for x in readings], ac=True,
+                                battery_status="Not charging"))
+    board, cpu, gpu, power = (auto.cards[k] for k in ("Board", "CPU", "GPU", "Power"))
+    check(board.rows["sen3"][0].text() == "80 °C" and "Warm" in board.rows["sen3"][1].text()
+          and "Hot" in board.rows["dimm_a"][1].text() and not cpu.rows["cpu_pkg"][1].text(),
+          "sensor cards: values with warm and hot badges from each sensor's limits")
+    check(len(board.rows["sen3"][2].points) == 3 and "Warm from" in board.rows["sen3"][0].toolTip()
+          and "thermal zone · SEN3" in board.rows["sen3"][0].toolTip() and "78 °C to 80 °C" in board.rows["sen3"][0].toolTip(),
+          "sensor cards: sparkline history, source and range since the panel opened")
+    check(gpu.rows["gpu_c"][0].text() == "61 °C" and gpu.rows["gpu_util"][0].text() == "72 %"
+          and gpu.rows["gpu_mem"][0].text() == "5.3 / 12 GB" and cpu.rows["cpu_cap"][0].text() == "70 %",
+          "GPU and CPU cards: nvidia-smi and CPU policy without the fan service")
+    check(power.rows["ac"][0].text() == "Connected" and power.rows["bat_pct"][0].text() == "82 % · not charging"
+          and board.rows["ssd1"][0].text() == "—", "power card, and a missing sensor shows a dash")
+    total = len(readings) + len(auto.service_readings())
+    check(auto.table_btn.text() == "Show every sensor (%d)" % total and not auto.table_btn.isChecked(),
+          "every-sensor table starts folded, with a count")
+    auto.table_btn.click()
+    rows = [[auto.table.item(i, c).text() for c in range(6)] for i in range(auto.table.rowCount())]
+    check(len(rows) == total and rows[0][:2] == ["CPU", "Package"] and rows[-1][0] == "Other"
+          and any(row[1] == "Memory A" and "Hot" in row[2] and row[3] == "86 °C" and row[4] == "88 °C" for row in rows),
+          "every-sensor table: grouped, key sensors first, lowest and highest")
+    auto.table_btn.click()
+    check(not auto.table.isVisibleTo(auto), "every-sensor table folds again")
+    auto.series.setCurrentText("Board temperatures")
+    check(len(auto.chart.series) == 7 and len(auto.chart.series[0][1]) == 3 and auto.chart.unit == "°C"
+          and auto.legend.text().count("●") == 7, "chart: board temperatures, one legend entry per series")
+    auto.series.setCurrentText("Fan floors")
+    check(auto.chart.fixed == (0, 100) and all(not pts for _, pts in auto.chart.series),
+          "chart: service views draw only fresh service samples")
+    auto.series.setCurrentText("Power")
+    check([name for name, _ in auto.chart.series] == ["CPU package", "GPU", "Heat input"]
+          and auto.chart.readout(auto.chart.end()).splitlines()[0] == "Now", "chart: power view and hover read-out")
+
+    # ---- calibration card ----
+    etc = Path(OUT) / "etc-cal"
+    etc.mkdir(exist_ok=True)
+    good = check_items("Running", "performance", True, True, True, "Volt 2")
+    with patch.object(core, "FAND_ETC", etc):
+        w.prefs.set("calibration_setup", True)
+        card.show_state(core.calibration_state(), good)
+        check(card.mode == "setup" and card.title.text().startswith("Finish setup") and card.quick.isEnabled()
+              and card.property("prominent") and card.checks.text().count("✓") == 5,
+              "setup: suggested until calibrated, every check passing")
+        bad = check_items("Running", "quiet", False, True, False, "Volt 2")
+        card.show_state(None, bad)
+        check(not card.quick.isEnabled() and not card.full.isEnabled() and card.checks.text().count("✗") == 2
+              and "Performance profile" in card.checks.text() and "only the laptop's internal" in card.checks.text()
+              and "Fix the items" in card.note.text(), "setup: blocked until required checks pass; USB is optional")
+        card.show_state(None, bad, dry_run=True)
+        check(card.quick.isEnabled(), "setup: a dry run can always preview the command")
+        card.show_state(None, good)
+        card.later.click()
+        check(not w.prefs.get("calibration_setup") and card.mode == "compact"
+              and "Not calibrated yet" in card.text.text() and not w.settings_tab.boxes["calibration_setup"].isChecked(),
+              "Not now: stops suggesting, keeps a one-line state, and Settings follows")
+        card.open.click()
+        check(card.mode == "setup" and card.later.text() == "Close", "Calibrate… opens the setup again")
+        card.later.click()
+        check(card.mode == "compact" and not w.prefs.get("calibration_setup"), "Close folds it without a setting change")
+        (etc / "model.json").write_text(json.dumps(dict(table=[dict(min_gpu_w=0, floors=[0, 0, 0])], preset="quick",
+                                                         written="2026-11-20T12:00:00+00:00")))
+        w.prefs.set("calibration_setup", True)
+        auto.update_calibration()
+        check(card.mode == "compact" and card.text.text() == "Calibrated with a quick auto-tune on 20 Nov 2026.",
+              "after a written model: when and which run")
+        auto.calibrating = True
+        auto.update_calibration()
+        check(card.mode == "running" and card.show_tab.text() == "Show progress", "running: points to its progress")
+        card.show_tab.click()
+        check(w.tabs.currentWidget() is w.cal_scroll, "Show progress opens the Calibrate tab")
+        auto.calibrating = False
+        cal.show_proposal([{"min_gpu_w": 0, "floors": [0, 0, 50]}])
+        check(auto.proposal and card.mode == "proposal" and card.show_tab.text() == "Review proposal",
+              "a finished run asks for review on the Overview")
+        cal.discard_proposal()
+        check(not auto.proposal and card.mode == "compact", "discarding the proposal clears the reminder")
+        (etc / "model.json").unlink()
+        auto.update_calibration()
+        w.tabs.setCurrentIndex(0)
+
+    # ---- start from the setup card: switch to Off, start, give the mode back ----
+    sample = fand_sample(mode="auto")
+    state = dict(off=False)
+    requests = []
+
+    def request(mode):
+        requests.append(mode)
+        state["off"] = mode == "off"
+
+    box = Mock()
+    box.Yes = "yes"
+    box.question.return_value = "yes"
+    cal.dry_run = False
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(patch.object(core, "fan_service", return_value=("Running", sample)))
+        stack.enter_context(patch.object(core, "request_fan_mode", side_effect=request))
+        stack.enter_context(patch.object(core, "manual_fan_problem",
+                                         side_effect=lambda *a: None if state["off"] else "Set Off first"))
+        stack.enter_context(patch.object(fan_calibration, "QMessageBox", box))
+        begin = stack.enter_context(patch.object(cal, "begin", return_value=True))
+        card.startRequested.emit("quick")
+        check(w.tabs.currentWidget() is w.cal_scroll and cal.preset.currentText() == fan_calibration.QUICK_AUTOTUNE
+              and requests == ["off"] and cal.mode_timer.isActive(), "setup start: asks, then requests Off")
+        check(wait_for(lambda: not cal.mode_timer.isActive(), 3000) and begin.call_args.kwargs == dict(confirmed=True)
+              and cal.restore_mode == "auto" and "about 20-40 minutes" in box.question.call_args.args[2]
+              and "switches to Off" in box.question.call_args.args[2], "setup start: begins once Off is acknowledged")
+        cal.give_back_mode()
+        check(requests == ["off", "auto"] and cal.restore_mode is None, "the previous mode comes back after the run")
+        requests.clear()
+        box.question.return_value = "no"
+        card.startRequested.emit("full")
+        check(requests == [] and not cal.mode_timer.isActive() and cal.preset.currentText() == fan_calibration.AUTOTUNE,
+              "declining the question changes nothing")
+        box.question.return_value = "yes"
+        stack.enter_context(patch.object(fan_calibration, "OFF_WAIT_S", 0.3))
+        stack.enter_context(patch.object(core, "manual_fan_problem", return_value="Set Off first"))
+        card.startRequested.emit("full")
+        check(wait_for(lambda: not cal.mode_timer.isActive(), 3000) and requests == ["off", "auto"]
+              and "did not switch to Off" in cal.message.text(), "no acknowledgement: not started, mode given back")
+    cal.dry_run = True
+    with patch.object(core, "log_dir", return_value=Path(OUT) / "logs"):
+        cal.preset.setCurrentText(fan_calibration.QUICK_AUTOTUNE)
+        cal.start.click()
+    check("--preset quick" in cal.message.text() and "20-40" in cal.description.text(),
+          "Calibrate tab: quick auto-tune passes its preset")
+    check(core.model_command([{"min_gpu_w": 0, "floors": [0, 0, 0]}], "quick")[-2:] == ["--model-preset", "quick"],
+          "the written model records which run produced it")
+    cal.preset.setCurrentText("Observe")
+    w.prefs.set("calibration_setup", True)
+    w.tabs.setCurrentIndex(0)
+    auto.timer.start()
+    screenshot(w, "overview.png")
 
 
 def fand_sample(**changes):
@@ -795,6 +956,7 @@ def main():
     pump(300)
     service_tabs(w, q)
     autotune_tests(w)
+    overview_tests(w)
 
     # ---- monitor: synthetic IRQ counts, no aplay ----
     wu = q.core.StallRate()

@@ -1,25 +1,50 @@
-"""Smart fan dashboard for the native ROG settings panel."""
+"""The panel's Overview tab: fan service control, fan speeds, every readable sensor, a five-minute
+history chart and the fan calibration setup."""
 from collections import deque
 import json
-import math
 import os
 import sys
 import time
 
-from PySide6.QtCore import QProcess, QRectF, Qt, QTimer, QPointF
-from PySide6.QtGui import QColor, QPainter, QPen
-from PySide6.QtWidgets import (QComboBox, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout,
-                               QLabel, QPlainTextEdit, QProgressBar, QPushButton, QVBoxLayout,
-                               QWidget)
+from PySide6.QtCore import QObject, QProcess, QRunnable, QThreadPool, Qt, QTimer, Signal
+from PySide6.QtGui import QColor
+from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QFormLayout, QGridLayout, QGroupBox,
+                               QHBoxLayout, QHeaderView, QLabel, QPlainTextEdit, QProgressBar,
+                               QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 import rogcore as core
+import sensor_scan
+from calibration_card import CalibrationCard, check_items
+from charts import STATUS, SERIES, Sparkline, TimeChart, is_dark, series_color
 
 FAN_LABELS = ("CPU", "GPU", "Middle")
-COLORS = ("#4288cf", "#dc8e32", "#329b87")
 # Full speed of each fan with every curve point at 255, measured on the G814JZ on 2026-11-16.
 TOP_RPM = {"cpu": 6300, "gpu": 6900, "mid": 7400}
-SERIES = {"Fan floors": ("% floor", FAN_LABELS), "Fan speeds": ("RPM", FAN_LABELS),
-          "Heat input": ("W", ("Smoothed total", "Smoothed GPU")),
-          "USB drops": ("packets/s", ("All devices",))}
+# Chart views: name -> (unit, ((key, series name), ...), source, from zero, fixed range).
+# "sensors" keys are sensor ids (sensor_scan plus the service's own readings); "service" keys are
+# per-sample service values.
+VIEWS = {
+    "Board temperatures": ("°C", (("sen3", "SEN3"), ("dimm_a", "Memory A"), ("dimm_b", "Memory B"),
+                                  ("lan", "Ethernet"), ("ssd1", "SSD 1"), ("ssd2", "SSD 2"), ("wifi", "Wi-Fi")),
+                           "sensors", False, None),
+    "CPU and GPU temperatures": ("°C", (("cpu_pkg", "CPU package"), ("cpu_core_max", "Hottest core"),
+                                        ("gpu_c", "GPU")), "sensors", False, None),
+    "Fan speeds": ("rpm", (("cpu_fan", "CPU"), ("gpu_fan", "GPU"), ("mid_fan", "Middle")), "sensors", True, None),
+    "Fan floors": ("%", (("cpu", "CPU"), ("gpu", "GPU"), ("mid", "Middle")), "service", True, (0, 100)),
+    "Power": ("W", (("cpu_w", "CPU package"), ("gpu_w", "GPU"), ("heat_w", "Heat input")), "sensors", True, None),
+    "USB drops": ("drops/s", (("usb_drops", "All USB audio"),), "service", True, None),
+}
+# Sensor cards: title -> ((id, row name), ...). Rows without history show text, not a sparkline.
+CARDS = (
+    ("CPU", (("cpu_pkg", "Package"), ("cpu_core_max", "Hottest core"), ("cpu_w", "Power"),
+             ("cpu_clock_avg", "Clock · average"), ("cpu_clock_max", "Clock · fastest"), ("cpu_cap", "Performance cap"))),
+    ("GPU", (("gpu_c", "Temperature"), ("gpu_w", "Power"), ("gpu_util", "Load"), ("gpu_mem", "Memory"))),
+    ("Board", (("sen3", "SEN3"), ("dimm_a", "Memory A"), ("dimm_b", "Memory B"), ("lan", "Ethernet"),
+               ("ssd1", "SSD 1"), ("ssd2", "SSD 2"), ("wifi", "Wi-Fi"))),
+    ("Power", (("ac", "Adapter"), ("bat_pct", "Battery"), ("bat_w", "Battery power"), ("bat_v", "Battery voltage"))),
+)
+TEXT_ROWS = {"cpu_cap", "gpu_mem", "ac"}
+CARD_ORDER = {rid: i for i, rid in enumerate(rid for _, rows in CARDS for rid, _ in rows)}
+TABLE_COLUMNS = ["Group", "Sensor", "Now", "Lowest", "Highest", "Source"]
 
 
 def label(text=""):
@@ -42,79 +67,93 @@ def metric(value, unit):
     return "Unavailable" if value is None else f"{value:g} {unit}"
 
 
-class History(QWidget):
-    def __init__(self):
+def first(*values):
+    return next((v for v in values if v is not None), None)
+
+
+# ---- sensor scan on a worker thread -------------------------------------------------------------
+class ScanSignals(QObject):
+    done = Signal(object)
+
+
+class ScanJob(QRunnable):
+    def __init__(self, signals, sys_root):
         super().__init__()
-        self.samples = deque(maxlen=180)
-        self.kind = "Fan floors"
-        self.setMinimumHeight(146)
-        self.setAccessibleName("Five-minute fan service history")
+        self.signals, self.sys_root = signals, sys_root
 
-    def append(self, stamp, s):
-        if self.samples:
-            previous = self.samples[-1][0]
-            if stamp == previous:
-                return
-            if stamp < previous or stamp - previous > 300:
-                self.samples.clear()
-        usb = s["usb"]
-        drops = None if usb.get("error") else sum(d["drops_per_s"] for d in usb["devices"])
-        self.samples.append((stamp, {
-            "Fan floors": list(s["floors"][f] for f in core.FANS),
-            "Fan speeds": list(s["sensors"].get(f + "_rpm") for f in core.FANS),
-            "Heat input": [s["heat_w"], s["smoothed_gpu_w"]], "USB drops": [drops]}))
-        while self.samples and stamp - self.samples[0][0] > 300:
-            self.samples.popleft()
-        self.update()
+    def run(self):
+        try:
+            result = sensor_scan.scan(self.sys_root)
+        except Exception as e:      # a strange sysfs file must never kill the panel
+            result = dict(readings=[], ac=None, battery_status=None, error=str(e))
+        try:
+            self.signals.done.emit(result)
+        except RuntimeError:        # the tab was closed meanwhile
+            pass
 
-    def paintEvent(self, _event):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing)
-        pal = self.palette()
-        r = QRectF(47, 12, max(1, self.width()-60), max(1, self.height()-40))
-        p.fillRect(r, pal.base())
-        points = [(t, row[self.kind]) for t, row in self.samples]
-        values = [v for _, row in points for v in row if v is not None]
-        top = 100 if self.kind == "Fan floors" else max(1, math.ceil(max(values, default=1)))
-        for frac in (0, 0.5, 1):
-            y = r.bottom() - frac*r.height()
-            p.setPen(pal.mid().color())
-            p.drawLine(QPointF(r.left(), y), QPointF(r.right(), y))
-            p.setPen(pal.text().color())
-            p.drawText(QRectF(0, y-9, 41, 18), Qt.AlignRight | Qt.AlignVCenter, f"{top*frac:g}")
-        p.drawText(QRectF(r.left(), r.bottom()+4, 80, 20), Qt.AlignLeft, "−5 min")
-        p.drawText(QRectF(r.right()-55, r.bottom()+4, 55, 20), Qt.AlignRight, "Now")
-        if not values:
-            p.drawText(r, Qt.AlignCenter, "Waiting for samples" if not points else "Reading unavailable")
-        elif points:
-            end = points[-1][0]
-            for i in range(len(SERIES[self.kind][1])):
-                previous = None
-                p.setPen(QPen(QColor(COLORS[i]), 2))
-                for t, row in points:
-                    if row[i] is None:
-                        previous = None
-                        continue
-                    pt = QPointF(r.right() - (end-t)*r.width()/300, r.bottom()-row[i]*r.height()/top)
-                    if previous and t-previous[0] <= 8:
-                        p.drawLine(previous[1], pt)
-                    else:
-                        p.drawPoint(pt)
-                    previous = t, pt
-        p.end()
+
+class SensorCard(QGroupBox):
+    """One group of sensors: name, value, attention badge and a five-minute sparkline per row."""
+
+    def __init__(self, title, rows):
+        super().__init__(title)
+        grid = QGridLayout(self)
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(3)
+        self.rows = {}
+        for i, (rid, name) in enumerate(rows):
+            value = QLabel("—")
+            value.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            value.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            font = value.font()
+            font.setBold(True)
+            value.setFont(font)
+            badge = QLabel()
+            badge.setTextFormat(Qt.RichText)
+            spark = None if rid in TEXT_ROWS else Sparkline()
+            grid.addWidget(QLabel(name), i, 0)
+            grid.addWidget(value, i, 1)
+            grid.addWidget(badge, i, 2)
+            if spark:
+                spark.setAccessibleName(f"{title} {name}, last five minutes")
+                grid.addWidget(spark, i, 3)
+            self.rows[rid] = (value, badge, spark)
+        grid.setColumnStretch(0, 1)
+        grid.setRowStretch(len(rows), 1)
+
+    def set(self, rid, text, level=None, points=None, tip=""):
+        value, badge, spark = self.rows[rid]
+        value.setText(text)
+        value.setToolTip(tip)
+        badge.setText("" if not level else
+                      f'<span style="color:{STATUS[level]}">●</span> {"Hot" if level == "hot" else "Warm"}')
+        if spark is not None:
+            spark.set_points(points or [], level)
 
 
 class AutoTab(QWidget):
-    def __init__(self, dry_run):
+    def __init__(self, dry_run, sys_root="/sys"):
         super().__init__()
         self.dry_run = dry_run
+        self.sys_root = sys_root
         self.preview = None
         self.preview_sample = None
         self.source = None
         self.pending = None
         self.sample_time = None
         self.calibrating = False
+        self.proposal = False
         self.state = ""
+        self.confirmed = None
+        self.last_sample = None       # the service sample shown now (None when not fresh)
+        self.system = {}              # the window's status poll: CPU policy and nvidia-smi readings
+        self.scan_result = None
+        self.scanning = False
+        self.sensors = sensor_scan.SensorHistory()
+        self.service_log = deque(maxlen=180)   # (service time, per-sample values), deduplicated
+        self.scan_signals = ScanSignals(self)
+        self.scan_signals.done.connect(self.take_scan)
+        self.colors = SERIES[is_dark(self)]
         root = QVBoxLayout(self)
         root.setSpacing(10)
         header = QHBoxLayout()
@@ -143,16 +182,18 @@ class AutoTab(QWidget):
         root.addLayout(controls)
         self.feedback = label()
         root.addWidget(self.feedback)
+        self.calibration = CalibrationCard()
+        root.addWidget(self.calibration)
 
-        grid = QGridLayout()
-        fans = QGroupBox("Fan response")
+        top = QHBoxLayout()
+        fans = QGroupBox("Fans")
         fg = QGridLayout(fans)
         for i, title in enumerate(("Fan", "Speed now", "Requested floor")):
             fg.addWidget(label(title), 0, i)
         self.speeds, self.bars = {}, {}
         for i, (fan, title) in enumerate(zip(core.FANS, FAN_LABELS), 1):
             fg.addWidget(label(title), i, 0)
-            colour = QColor(COLORS[i-1])
+            colour = QColor(self.colors[i - 1])
             speed = QProgressBar()
             speed.setRange(0, TOP_RPM[fan])
             speed.setStyleSheet("QProgressBar::chunk {background:" + colour.name() + ";}")
@@ -172,41 +213,72 @@ class AutoTab(QWidget):
                      % " / ".join(f"{TOP_RPM[f]:,}" for f in core.FANS))
         note.setEnabled(False)
         fg.addWidget(note, len(core.FANS) + 1, 0, 1, 3)
-        grid.addWidget(fans, 0, 0)
-        thermal = QGroupBox("Heat input")
-        form = QFormLayout(thermal)
+        top.addWidget(fans, 3)
+        audio = QGroupBox("Audio and heat input")
+        form = QFormLayout(audio)
         self.heat = {}
-        for k, title in (("heat_w", "Smoothed total"), ("cpu_w", "CPU package"),
-                         ("gpu_w", "NVIDIA GPU"), ("board_c", "Board · SEN3")):
+        for k, title in (("heat_w", "Heat input · smoothed"), ("smoothed_gpu_w", "GPU · smoothed")):
             self.heat[k] = label()
             font = self.heat[k].font()
             font.setBold(True)
             self.heat[k].setFont(font)
             form.addRow(title, self.heat[k])
-        grid.addWidget(thermal, 0, 1)
-        grid.setColumnStretch(0, 3)
-        grid.setColumnStretch(1, 2)
-        root.addLayout(grid)
+        self.usb = label()
+        form.addRow("USB audio", self.usb)
+        self.margin = label()
+        form.addRow("GPU-bin margins", self.margin)
+        top.addWidget(audio, 2)
+        root.addLayout(top)
+
+        sensors = QHBoxLayout()
+        self.cards = {}
+        for title, rows in CARDS:
+            card = SensorCard(title, rows)
+            self.cards[title] = card
+            sensors.addWidget(card, 1)
+        root.addLayout(sensors)
+
         history = QGroupBox("Last five minutes")
         hl = QVBoxLayout(history)
         row = QHBoxLayout()
         self.series = QComboBox()
-        self.series.addItems(SERIES)
+        self.series.addItems(VIEWS)
         self.series.setAccessibleName("Chart measurement")
         row.addWidget(self.series)
         self.legend = QLabel()
-        row.addWidget(self.legend)
-        row.addStretch()
+        self.legend.setTextFormat(Qt.RichText)
+        self.legend.setWordWrap(True)
+        row.addWidget(self.legend, 1)
         hl.addLayout(row)
-        self.chart = History()
+        self.chart = TimeChart()
         hl.addWidget(self.chart)
-        self.series.currentTextChanged.connect(self.select_series)
-        self.select_series(self.series.currentText())
         root.addWidget(history)
-        self.usb = label()
-        self.margin = label()
-        root.addWidget(self.usb)
-        root.addWidget(self.margin)
+        self.series.currentTextChanged.connect(self.update_chart)
+
+        every = QHBoxLayout()
+        self.table_btn = QPushButton("Show every sensor")
+        self.table_btn.setCheckable(True)
+        self.table_btn.toggled.connect(self.toggle_table)
+        every.addWidget(self.table_btn)
+        self.table_note = label("Lowest and highest are since the panel opened.")
+        self.table_note.setEnabled(False)
+        every.addWidget(self.table_note, 1)
+        root.addLayout(every)
+        self.table = QTableWidget(0, len(TABLE_COLUMNS))
+        self.table.setHorizontalHeaderLabels(TABLE_COLUMNS)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setAlternatingRowColors(True)
+        self.table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        head = self.table.horizontalHeader()
+        head.setSectionResizeMode(QHeaderView.ResizeToContents)
+        head.setSectionResizeMode(len(TABLE_COLUMNS) - 1, QHeaderView.Stretch)
+        self.table.setAccessibleName("Every sensor with its lowest and highest value")
+        self.table.hide()
+        self.table_note.hide()
+        self.table_ids = []
+        root.addWidget(self.table)
+
         self.events = QPlainTextEdit()
         self.events.setReadOnly(True)
         self.events.setMaximumHeight(72)
@@ -214,18 +286,13 @@ class AutoTab(QWidget):
         root.addWidget(label("Recent service events"))
         root.addWidget(self.events)
         root.addStretch()
+        self.update_chart()
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh)
         self.timer.start(2000)
         self.refresh()
 
-    def select_series(self, kind):
-        self.chart.kind = kind
-        unit, names = SERIES[kind]
-        self.legend.setText(" &nbsp; ".join(f'<span style="color:{c}">●</span> {name}'
-                                          for c, name in zip(COLORS, names)) + f" &nbsp; ({unit})")
-        self.chart.update()
-
+    # -- service preview ------------------------------------------------------------------------
     def toggle_preview(self):
         if self.preview:
             self.preview.terminate()
@@ -256,20 +323,55 @@ class AutoTab(QWidget):
         self.preview = self.preview_sample = None
         self.refresh()
 
+    # -- polling --------------------------------------------------------------------------------
     def refresh(self):
         state, s = core.fan_service()
         if self.preview:
             state, s = "Dry run", self.preview_sample
         self.display(state, s)
+        self.start_scan()
 
+    def start_scan(self):
+        if not self.scanning:
+            self.scanning = True
+            QThreadPool.globalInstance().start(ScanJob(self.scan_signals, self.sys_root))
+
+    def take_scan(self, result):
+        """A finished sensor scan: record it with the service's own readings and redraw."""
+        self.scanning = False
+        self.scan_result = result
+        self.sensors.add(time.monotonic(), result["readings"] + self.service_readings())
+        self.render_sensors()
+        self.update_calibration()
+        if VIEWS[self.series.currentText()][2] == "sensors":
+            self.update_chart()
+
+    def set_system(self, status):
+        """The window's 2 s status poll (CPU policy and nvidia-smi), shown in the CPU and GPU cards."""
+        self.system = status or {}
+
+    def service_readings(self):
+        """Readings only the fan service (root: RAPL, NVML) or nvidia-smi provide, as sensor rows."""
+        s = self.last_sample or {}
+        sens = s.get("sensors") or {}
+        gpu = self.system.get("gpu") or {}
+        r = sensor_scan.reading
+        return [r("cpu_w", "CPU", "Package power", sens.get("cpu_w"), "W", "rog-fand · RAPL"),
+                r("gpu_c", "GPU", "Temperature", first(sens.get("gpu_c"), gpu.get("temp_c")), "°C",
+                  "NVIDIA driver", *sensor_scan.LIMITS["gpu"]),
+                r("gpu_w", "GPU", "Power", first(sens.get("gpu_w"), gpu.get("power_w")), "W", "NVIDIA driver"),
+                r("gpu_util", "GPU", "Load", gpu.get("util_pct"), "%", "nvidia-smi"),
+                r("heat_w", "Power", "Heat input · smoothed", s.get("heat_w"), "W", "rog-fand")]
+
+    # -- rendering ------------------------------------------------------------------------------
     def display(self, state, s):
         if self.source != state:
-            self.chart.samples.clear()
-            self.chart.update()
+            self.service_log.clear()
             self.source = state
             self.confirmed = None
             self.feedback.clear()
         self.state = state
+        self.last_sample = s
         self.state_label.setText("rog-fand  ·  " + state)
         self.preview_btn.setText("End preview" if self.preview else "Preview live sensors")
         self.preview_btn.setVisible(bool(self.preview) or state != "Running")
@@ -307,7 +409,7 @@ class AutoTab(QWidget):
                 self.feedback.clear()
                 self.mode.setCurrentIndex(self.mode.findData(s["mode"]))
                 self.confirmed = s["mode"]
-            self.chart.append(core.validate_fand_sample(s), s)
+            self.log_service(core.validate_fand_sample(s), s)
         if self.pending:
             wanted, deadline, previous_sample = self.pending
             if (state == "Running" and s and s["t"] != previous_sample and s["mode"] == wanted
@@ -335,20 +437,136 @@ class AutoTab(QWidget):
             speed.setValue(min(rpm or 0, TOP_RPM[fan]))
             speed.setFormat("—" if rpm is None else f"{rpm:,.0f} rpm · {100 * rpm / TOP_RPM[fan]:.0f}%")
         for k, lab in self.heat.items():
-            value = (s["heat_w"] if k == "heat_w" else s["sensors"].get(k)) if s else None
-            lab.setText(metric(value, "°C" if k == "board_c" else "W"))
+            lab.setText(metric(s.get(k) if s else None, "W"))
         usb = s["usb"] if s else {}
         devices = [f"{d.get('name') or d.get('path') or 'USB device'} · {d['drops_per_s']:g} drops/s"
                    for d in usb.get("devices", [])]
         audio = "Audio active" if usb.get("audio_active") else "Idle"
-        self.usb.setText("USB audio   " + (usb.get("error") or "  /  ".join([audio, *devices]) if s else "—"))
+        self.usb.setText((usb.get("error") or "  /  ".join([audio, *devices])) if s else "—")
         margins = sorted(s["margins"].items(), key=lambda x: float(x[0])) if s else []
-        self.margin.setText("GPU-bin margins   " + ("   ·   ".join(f"≥{w} W  +{v:g} pp" for w,v in margins) or "—"))
+        self.margin.setText("   ·   ".join(f"≥{w} W  +{v:g} pp" for w, v in margins) or "—")
         events = "\n".join(f"{e['t'][11:19]} UTC   {e['message']}" for e in reversed(s["events"])) if s else ""
         if self.events.toPlainText() != events:
             self.events.setPlainText(events)
         self.events.setPlaceholderText("Events appear when the controller reports a change.")
+        self.update_calibration()
+        if VIEWS[self.series.currentText()][2] == "service":
+            self.update_chart()
 
+    def log_service(self, stamp, s):
+        """One row per new service sample; a gap or a clock jump starts the history again."""
+        if self.service_log:
+            previous = self.service_log[-1][0]
+            if stamp == previous:
+                return
+            if stamp < previous or stamp - previous > 300:
+                self.service_log.clear()
+        usb = s["usb"]
+        drops = None if usb.get("error") else sum(d["drops_per_s"] for d in usb["devices"])
+        self.service_log.append((stamp, dict(s["floors"], usb_drops=drops)))
+        while self.service_log and stamp - self.service_log[0][0] > 300:
+            self.service_log.popleft()
+
+    def render_sensors(self):
+        h = self.sensors
+        info = h.info
+        for card in self.cards.values():
+            for rid in card.rows:
+                if rid in TEXT_ROWS:
+                    continue
+                r = info.get(rid)
+                value = r["value"] if r else None
+                tip = ""
+                if r:
+                    tip = r["source"]
+                    if r.get("warm") is not None or r.get("hot") is not None:
+                        tip += "\nWarm from %s, hot from %s" % (sensor_scan.fmt(r.get("warm"), r["unit"]),
+                                                               sensor_scan.fmt(r.get("hot"), r["unit"]))
+                    if rid in h.low:
+                        tip += "\nSince the panel opened: %s to %s" % (sensor_scan.fmt(h.low[rid], r["unit"]),
+                                                                       sensor_scan.fmt(h.high[rid], r["unit"]))
+                text = "—" if r is None else sensor_scan.fmt(value, r["unit"])
+                if rid == "bat_pct" and value is not None and (self.scan_result or {}).get("battery_status"):
+                    text += " · " + self.scan_result["battery_status"].lower()
+                card.set(rid, text, sensor_scan.level(r) if r else None, h.series(rid), tip)
+        cpu, gpu = self.system.get("cpu") or {}, self.system.get("gpu") or {}
+        cap = cpu.get("max_perf_pct")
+        self.cards["CPU"].set("cpu_cap", "—" if cap is None else f"{cap} %",
+                              tip="intel_pstate max_perf_pct · governor %s" % (cpu.get("governor") or "unknown"))
+        used, total = gpu.get("mem_used_mb"), gpu.get("mem_total_mb")
+        self.cards["GPU"].set("gpu_mem", "—" if used is None or not total else
+                              f"{used / 1024:.1f} / {total / 1024:.0f} GB", "warm" if gpu.get("mem_high") else None,
+                              tip="nvidia-smi")
+        ac = (self.scan_result or {}).get("ac")
+        self.cards["Power"].set("ac", {True: "Connected", False: "Unplugged"}.get(ac, "—"))
+        self.fill_table()
+
+    def toggle_table(self, on):
+        self.table.setVisible(on)
+        self.table_note.setVisible(on)
+        self.fill_table()
+
+    def fill_table(self):
+        h = self.sensors
+        ids = sorted(h.info, key=lambda rid: (
+            sensor_scan.GROUPS.index(h.info[rid]["group"]) if h.info[rid]["group"] in sensor_scan.GROUPS else 99,
+            CARD_ORDER.get(rid, len(CARD_ORDER))))     # a group's card rows first, then the rest as found
+        self.table_btn.setText(("Hide" if self.table_btn.isChecked() else "Show") + f" every sensor ({len(ids)})")
+        if not self.table_btn.isChecked():
+            return
+        if ids != self.table_ids:
+            self.table.setRowCount(len(ids))
+            self.table_ids = ids
+        for row, rid in enumerate(ids):
+            r = h.info[rid]
+            unit = r["unit"]
+            values = [r["group"], r["name"], sensor_scan.fmt(r["value"], unit),
+                      sensor_scan.fmt(h.low.get(rid), unit), sensor_scan.fmt(h.high.get(rid), unit), r["source"]]
+            level = sensor_scan.level(r)
+            if level:
+                values[2] += "  ● " + ("Hot" if level == "hot" else "Warm")
+            for col, text in enumerate(values):
+                item = self.table.item(row, col)
+                if item is None:
+                    item = QTableWidgetItem()
+                    if col in (2, 3, 4):
+                        item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                    self.table.setItem(row, col, item)
+                if item.text() != text:
+                    item.setText(text)
+        height = self.table.horizontalHeader().height() + sum(self.table.rowHeight(i) for i in range(len(ids)))
+        self.table.setFixedHeight(height + 2 * self.table.frameWidth())
+
+    def update_chart(self, *_):
+        view = self.series.currentText()
+        unit, series, source, zero, fixed = VIEWS[view]
+        if source == "sensors":
+            data = [(name, self.sensors.series(key)) for key, name in series]
+            empty = "Waiting for sensor readings"
+        else:
+            data = [(name, [(t, row.get(key)) for t, row in self.service_log]) for key, name in series]
+            empty = "Waiting for fan service samples"
+        self.chart.set_series(data, unit, zero, fixed, empty)
+        self.chart.setAccessibleName(f"{view}, last five minutes")
+        dots = [f'<span style="color:{series_color(self, i).name()}">●</span>&nbsp;{name}'
+                for i, (_, name) in enumerate(series)]
+        self.legend.setText(" &nbsp; ".join(dots) + f" &nbsp; ({unit})")
+
+    def calibration_checks(self):
+        ac = (self.scan_result or {}).get("ac")
+        profile = ((self.last_sample or {}).get("sensors") or {}).get("profile") or core.rd(core.PROFILE_FILE)
+        return check_items(self.state, profile, ac, not core.sound_device_busy(),
+                           core.usb_audio_card(), core.AUTOTUNE_USB)
+
+    def update_calibration(self):
+        self.calibration.show_state(core.calibration_state(), self.calibration_checks(), self.calibrating,
+                                    self.proposal, self.dry_run)
+
+    def set_proposal(self, ready):
+        self.proposal = bool(ready)
+        self.update_calibration()
+
+    # -- control --------------------------------------------------------------------------------
     def change_mode(self):
         if self.dry_run or self.calibrating or self.preview:
             return

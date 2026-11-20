@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
 """Fan auto-tune: find the quietest fan floors that keep audio clean at several heat levels and
-propose a GPU-power table for rog-fand. Unattended, about 60-110 minutes, loud.
+propose a GPU-power table for rog-fand. Unattended and loud: about 60-110 minutes for the full run,
+about 20-40 minutes for the quick one.
 
     python3 tools/autotune.py                    # full run, log in data/logs/autotune-<time>.csv
+    python3 tools/autotune.py --preset quick     # quick run: three levels, a coarser ladder
     python3 tools/autotune.py --plan             # print the plan and change nothing
     python3 tools/autotune.py --check-load 30    # hold each heat level 30 s; fans untouched
 
 Heat: GPU load from tools/gpuload.py (held at a target power on the NVIDIA GPU), CPU load from
 tools/loadgen.c (compiled into a temporary directory at start). Levels run hottest first. At each
 level the fan floors step from loud to quiet along a fixed ladder, 180 s per step, judged on the
-last 120 s. The descent stops at the first combination that stalls: more than 1 stall/s on the
+last 120 s (quick: 120 s judged on the last 90 s). The descent stops at the first combination that stalls: more than 1 stall/s on the
 internal counter, or any USB drop in the service's status. The fans then go straight back to the
 last clean combination (the safe curve between levels) and the next, cooler level starts from it.
 If a level's first combination already stalls, it steps back up until one is clean. Floors are
 applied the way the service applies them: each point of the saved curve raised to the floor.
 
-Needs the Performance profile, the fan service in Off (Auto tab), mains power, a free internal
+Needs the Performance profile, the fan service in Off (Overview tab), mains power, a free internal
 sound device (the stall counter plays silence on it, so the laptop speakers are blocked) and the
 USB audio interface, which is kept busy with silence through PipeWire so USB drops can be counted.
 Hard stops: CPU 95 C, GPU 85 C, board sensor 90 C, battery power, or the profile leaving
@@ -67,6 +69,17 @@ LIMITS = {"cpu_c": 95, "gpu_c": 85, "board_c": 90}
 # whiny one. After a level's quietest clean ladder step, move these many points from the middle fan
 # to the CPU and GPU fans, in order, keeping only mixes that score quieter; stop at the first stall.
 REBALANCE = (10, 20)
+# The quick run repeats the hand calibration of 2026-11-16 (a light and a heavy gaming load, a few
+# fan mixes each) unattended, plus a low level so idle stays quiet: three levels, every other ladder
+# rung plus the quiet end, shorter steps and one quieter-mix shift.
+QUICK_LADDER = ((100, 100, 100), (80, 80, 80), (70, 70, 75), (50, 50, 70), (25, 30, 60), (0, 0, 50),
+                (0, 0, 0))
+PRESETS = {
+    "full": dict(levels=LEVELS, ladder=LADDER, step=180, judge=120, warmup=120, max_minutes=150,
+                 rebalance=REBALANCE, minutes="60-110"),
+    "quick": dict(levels="150:4,80:2,40:2", ladder=QUICK_LADDER, step=120, judge=90, warmup=60,
+                  max_minutes=50, rebalance=(10,), minutes="20-40"),
+}
 NOISE_EXPONENT = 5      # fan sound power grows roughly with speed^5 (fan affinity laws)
 MIC_MARGIN_DB = 0.5     # with a microphone, a mix must measure this much quieter to replace another
 STALL_LIMIT = 1.0       # stalls per second on the internal counter, mean of the judged window
@@ -696,8 +709,9 @@ def run(a, levels, ladder, stop):
                                                               prefix=".autotune-", delete=False))
         writer = csv.writer(fh)
         writer.writerow(COLUMNS)
+        preset = PRESETS[getattr(a, "preset", "full")]
         tuner = Tuner(hw, levels, ladder, report, writer, step_s=a.step, judge_s=a.judge,
-                      rebalance=() if getattr(a, "no_rebalance", False) else REBALANCE,
+                      rebalance=() if getattr(a, "no_rebalance", False) else preset["rebalance"],
                       warmup_s=a.warmup, max_s=a.max_minutes * 60)
         try:
             hw.start()
@@ -725,7 +739,7 @@ def run(a, levels, ladder, stop):
                         os.replace(fh.name, out)
         outcome["cancelled"] = outcome["cancelled"] or stop.is_set()
         if table is not None and not outcome["cancelled"]:
-            proposal = dict(version=1, source="tools/autotune.py",
+            proposal = dict(version=1, source="tools/autotune.py", preset=getattr(a, "preset", "full"),
                             created=datetime.now(timezone.utc).isoformat(timespec="seconds"),
                             table=table, levels=tuner.results, steps=tuner.steps,
                             ladder=[list(f) for f in tuner.ladder], step_s=a.step, judge_s=a.judge,
@@ -776,6 +790,8 @@ def check_load(a, levels, stop):
 
 
 def plan(a, levels, ladder):
+    preset = PRESETS[a.preset]
+    print("Preset: %s (about %s minutes, loud)." % (a.preset, preset["minutes"]))
     print("Levels (hottest first): " + ", ".join("GPU %g W + %d CPU threads" % (lv.gpu_w, lv.cpu_threads)
                                                   for lv in levels))
     print("Fan ladder (cpu/gpu/middle %), loud to quiet: " + "  ".join("%d/%d/%d" % f for f in ladder))
@@ -793,21 +809,26 @@ def plan(a, levels, ladder):
     if a.no_rebalance:
         print("Quieter-mix search: off (--no-rebalance).")
     else:
+        shifts = preset["rebalance"]
         print("Quieter-mix search: after each level's quietest clean step, move %s points from the middle "
               "fan to the CPU and GPU fans while that scores quieter and stays clean (noise weights "
-              "cpu/gpu/middle %g/%g/%g, sound ~ speed^%d); up to %d extra steps per level."
-              % (" then ".join(map(str, REBALANCE)), *NOISE_WEIGHTS, NOISE_EXPONENT, len(REBALANCE)))
+              "cpu/gpu/middle %g/%g/%g, sound ~ speed^%d); up to %d extra step%s per level."
+              % (" then ".join(map(str, shifts)), *NOISE_WEIGHTS, NOISE_EXPONENT, len(shifts),
+                 "" if len(shifts) == 1 else "s"))
     print("Log: %s" % a.out)
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--levels", default=LEVELS, help="GPU watts:CPU threads, comma separated (default %(default)s)")
-    ap.add_argument("--ladder", help="fan floors loud to quiet, cpu,gpu,mid;... (default: built-in ladder)")
-    ap.add_argument("--step", type=int, default=180, help="seconds per fan combination")
-    ap.add_argument("--judge", type=int, default=120, help="judge each step on its last N seconds")
-    ap.add_argument("--warmup", type=int, default=120, help="seconds of heat before the first step")
-    ap.add_argument("--max-minutes", type=int, default=150, help="stop if the run takes longer")
+    ap.add_argument("--preset", choices=sorted(PRESETS), default="full",
+                    help="full (about 60-110 min) or quick (about 20-40 min); sets the defaults below")
+    ap.add_argument("--levels", help="GPU watts:CPU threads, comma separated (full: %s; quick: %s)"
+                    % (LEVELS, PRESETS["quick"]["levels"]))
+    ap.add_argument("--ladder", help="fan floors loud to quiet, cpu,gpu,mid;... (default: the preset's ladder)")
+    ap.add_argument("--step", type=int, help="seconds per fan combination (full 180, quick 120)")
+    ap.add_argument("--judge", type=int, help="judge each step on its last N seconds (full 120, quick 90)")
+    ap.add_argument("--warmup", type=int, help="seconds of heat before the first step (full 120, quick 60)")
+    ap.add_argument("--max-minutes", type=int, help="stop if the run takes longer (full 150, quick 50)")
     ap.add_argument("--usb", default="Volt 2", help="ALSA card name of the USB audio interface")
     ap.add_argument("--no-usb", dest="usb", action="store_const", const="", help="do not measure USB drops")
     ap.add_argument("--out", default=str(core.log_dir() / time.strftime("autotune-%Y%m%d-%H%M.csv")))
@@ -822,9 +843,13 @@ def main(argv=None):
     mode.add_argument("--plan", "--dry-run", action="store_true", help="print the plan; change nothing")
     mode.add_argument("--check-load", type=int, metavar="SECONDS", help="hold each level; fans untouched")
     a = ap.parse_args(argv)
+    preset = PRESETS[a.preset]
+    for key in ("levels", "step", "judge", "warmup", "max_minutes"):
+        if getattr(a, key) is None:          # explicit options win over the preset
+            setattr(a, key, preset[key])
     try:
         levels = parse_levels(a.levels)
-        ladder = parse_ladder(a.ladder) if a.ladder else check_ladder(LADDER)
+        ladder = parse_ladder(a.ladder) if a.ladder else check_ladder(preset["ladder"])
     except ValueError as exc:
         ap.error(str(exc))
     if not PERIOD <= a.judge <= a.step or a.warmup < 0 or a.max_minutes <= 0:

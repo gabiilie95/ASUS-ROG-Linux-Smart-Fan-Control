@@ -18,6 +18,7 @@ SETUP = os.path.join(ROOT, "root-tests", "setup-cool-performance.sh")
 USB_DROP = os.path.join(ROOT, "root-tests", "usb-drop-count.sh")
 STALL_STATUS = "/proc/asound/PCH/pcm0p/sub0/status"
 PSTATE = "/sys/devices/system/cpu/intel_pstate"
+PROFILE_FILE = "/sys/firmware/acpi/platform_profile"
 CPUFREQ = "/sys/devices/system/cpu/cpu0/cpufreq"
 
 # Preset -> (script, description, curves {fan: [(temp C, pwm 0-255), ...]}) as written in the scripts.
@@ -626,7 +627,7 @@ def manual_fan_problem(holding_lease=False):
                 os.close(fd)
         except OSError:
             pass
-    return "Set the fan service to Off in Auto and wait for the base curve before editing Performance."
+    return "Set the fan service to Off on the Overview and wait for the base curve before editing Performance."
 
 
 HEAVY_STEPS = "cpu=100,gpu=100,mid=100;cpu=80,gpu=80,mid=80;mid=100;cpu=70,gpu=70,mid=70"
@@ -654,9 +655,25 @@ def log_dir():
     return Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share") / "rog-fand" / "logs"
 
 
-def autotune_args(output, mic=None):
-    args = ["-IB", os.path.join(TOOLS, "autotune.py"), "--panel-json", "--out", str(output)]
-    return args + (["--mic", mic] if mic else [])
+AUTOTUNE_PRESETS = ("quick", "full")
+AUTOTUNE_USB = "Volt 2"     # autotune.py's default USB audio interface (ALSA card name)
+
+
+def autotune_args(output, mic=None, preset="full", usb=True):
+    """`usb` False runs without a USB audio interface: only the internal stall counter judges."""
+    if preset not in AUTOTUNE_PRESETS:
+        raise ValueError("Unknown auto-tune preset")
+    args = ["-IB", os.path.join(TOOLS, "autotune.py"), "--panel-json", "--out", str(output), "--preset", preset]
+    return args + (["--mic", mic] if mic else []) + ([] if usb else ["--no-usb"])
+
+
+def usb_audio_card(name=AUTOTUNE_USB, cards="/proc/asound/cards"):
+    """Whether an ALSA card with this long name (the part after " - ") is connected."""
+    for line in (rd(cards) or "").splitlines():
+        match = re.match(r"\s*\d+ \[[^\]]*\]: \S+ - (.+)$", line)
+        if match and match[1].strip() == name:
+            return True
+    return False
 
 
 def noise_meter_module():
@@ -731,11 +748,33 @@ def current_table():
         return None, "unknown"
 
 
-def model_command(table):
+def model_command(table, preset=None):
     """Install an auto-tune table as /etc/rog-fand/model.json and restart the service. The
     installed, root-owned service program validates it again before writing."""
-    return ["pkexec", "/usr/bin/python3", "-IB", str(FAND_INSTALLED), "--write-model",
-            json.dumps(check_model(table), separators=(",", ":"))]
+    if preset is not None and preset not in AUTOTUNE_PRESETS:
+        raise ValueError("Unknown auto-tune preset")
+    return (["pkexec", "/usr/bin/python3", "-IB", str(FAND_INSTALLED), "--write-model",
+             json.dumps(check_model(table), separators=(",", ":"))]
+            + (["--model-preset", preset] if preset else []))
+
+
+def calibration_state(path=None):
+    """None while no auto-tune model is installed, else {"preset": "quick"/"full"/None (written by
+    an older panel), "written": aware datetime or None, "rows": n}, or {"error": text}."""
+    path = Path(path) if path else FAND_ETC / "model.json"
+    try:
+        model = json.loads(path.read_text())
+        rows = table_rows(model["table"])
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        return {"error": "unreadable %s (%s)" % (path, e)}
+    try:
+        written = datetime.fromisoformat(model.get("written"))
+    except (TypeError, ValueError):
+        written = None
+    preset = model.get("preset")
+    return {"preset": preset if preset in AUTOTUNE_PRESETS else None, "written": written, "rows": len(rows)}
 
 
 def calibration_args(preset, seconds, custom, output, mic=None):
