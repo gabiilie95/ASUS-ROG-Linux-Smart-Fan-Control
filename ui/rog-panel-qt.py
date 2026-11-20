@@ -457,8 +457,8 @@ class MainWindow(QMainWindow):
             QProgressBar {border: 1px solid palette(midlight); border-radius: 4px;
                           text-align: center; background: palette(alternate-base);}
             QProgressBar::chunk {background: #3684ad; border-radius: 3px;}
-            QPushButton#primaryAction:enabled {color: white; background: #236b92;
-                                              border: 0; border-radius: 4px; min-width: 88px; padding: 5px 13px;}
+            QPushButton#primaryAction {min-width: 88px; padding: 5px 13px; border-radius: 4px;}
+            QPushButton#primaryAction:enabled {color: white; background: #236b92; border: 0;}
             QPushButton#primaryAction:pressed {background: #195576;}
             QGroupBox#calibrationCard[prominent="true"] {border: 2px solid #388ab9;}
         """)

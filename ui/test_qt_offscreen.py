@@ -413,6 +413,28 @@ def overview_tests(w):
     check([name for name, _ in auto.chart.series] == ["CPU package", "GPU", "Heat input"]
           and auto.chart.readout(auto.chart.end()).splitlines()[0] == "Now", "chart: power view and hover read-out")
 
+    # ---- layout: nothing clipped at a narrow width or after a state change ----
+    card.quick.setEnabled(False)
+    disabled = card.quick.sizeHint()
+    card.quick.setEnabled(True)
+    check(card.quick.sizeHint() == disabled, "a primary button keeps its size when it becomes enabled")
+    auto.sensor_row.resize(700, 400)
+    narrow = auto.sensor_row.columns
+    auto.sensor_row.resize(2400, 400)
+    check((narrow, auto.sensor_row.columns) == (2, 4) and auto.sensor_row.minimumSizeHint().width() < 700,
+          "sensor cards wrap to two columns instead of widening the page")
+    auto.top_row.resize(500, 400)
+    stacked = auto.top_row.columns
+    auto.top_row.resize(2400, 400)
+    check((stacked, auto.top_row.columns) == (1, 2), "fans and audio stack when narrow")
+    auto.display("Running", fand_sample(usb=dict(audio_active=True, error=None, devices=[
+        dict(name="Volt 2", drops_per_s=0.0), dict(name="Dock", drops_per_s=1.5)])))
+    check(auto.usb.text().splitlines() == ["Audio active", "Volt 2 · 0 drops/s", "Dock · 1.5 drops/s"]
+          and not auto.usb.wordWrap() and len(auto.margin.text().splitlines()) == 2,
+          "audio rows carry their own line breaks instead of wrapping")
+    with patch.object(core, "fan_service", return_value=("Stopped", None)):
+        auto.display("Stopped", None)
+
     # ---- calibration card ----
     etc = Path(OUT) / "etc-cal"
     etc.mkdir(exist_ok=True)

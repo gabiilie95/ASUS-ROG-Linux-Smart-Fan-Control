@@ -6,11 +6,12 @@ import os
 import sys
 import time
 
-from PySide6.QtCore import QObject, QProcess, QRunnable, QThreadPool, Qt, QTimer, Signal
+from PySide6.QtCore import QObject, QProcess, QRunnable, QSize, QThreadPool, Qt, QTimer, Signal
 from PySide6.QtGui import QColor
-from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QFormLayout, QGridLayout, QGroupBox,
-                               QHBoxLayout, QHeaderView, QLabel, QPlainTextEdit, QProgressBar,
-                               QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QGridLayout, QGroupBox,
+                               QHBoxLayout, QHeaderView, QLabel, QLayout, QPlainTextEdit, QProgressBar,
+                               QPushButton, QSizePolicy, QSpacerItem, QTableWidget, QTableWidgetItem,
+                               QVBoxLayout, QWidget)
 import rogcore as core
 import sensor_scan
 from calibration_card import CalibrationCard, check_items
@@ -92,6 +93,53 @@ class ScanJob(QRunnable):
             pass
 
 
+class Reflow(QWidget):
+    """Lays its widgets out side by side when they fit, else in fewer columns (one of `options`,
+    most first). Its minimum width is one column's, so a narrow window wraps instead of scrolling
+    sideways."""
+
+    def __init__(self, widgets, options, stretches=None):
+        super().__init__()
+        self.widgets, self.options = list(widgets), tuple(options)
+        self.stretches = stretches or [1] * len(self.widgets)
+        self.grid = QGridLayout(self)
+        self.grid.setContentsMargins(0, 0, 0, 0)
+        self.grid.setSizeConstraint(QLayout.SetNoConstraint)
+        self.columns = None
+        self.place(self.options[0])
+
+    def column_width(self):
+        return max(w.minimumSizeHint().width() for w in self.widgets)
+
+    def fit(self, width):
+        need = self.column_width()
+        gap = self.grid.horizontalSpacing()
+        return next((n for n in self.options if n * need + (n - 1) * gap <= width), self.options[-1])
+
+    def place(self, columns):
+        if columns == self.columns:
+            return
+        self.columns = columns
+        for w in self.widgets:
+            self.grid.removeWidget(w)
+        for i, w in enumerate(self.widgets):
+            self.grid.addWidget(w, i // columns, i % columns)
+        for c in range(max(self.options)):
+            self.grid.setColumnStretch(c, self.stretches[c] if c < columns and columns == len(self.widgets) else
+                                       1 if c < columns else 0)
+        self.updateGeometry()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.place(self.fit(event.size().width()))
+
+    def minimumSizeHint(self):
+        return QSize(self.column_width(), self.grid.minimumSize().height())
+
+    def sizeHint(self):
+        return QSize(self.grid.sizeHint().width(), self.grid.sizeHint().height())
+
+
 class SensorCard(QGroupBox):
     """One group of sensors: name, value, attention badge and a five-minute sparkline per row."""
 
@@ -118,7 +166,10 @@ class SensorCard(QGroupBox):
                 spark.setAccessibleName(f"{title} {name}, last five minutes")
                 grid.addWidget(spark, i, 3)
             self.rows[rid] = (value, badge, spark)
-        grid.setColumnStretch(0, 1)
+        grid.setColumnMinimumWidth(1, 76)
+        # Spare width goes after the sparkline, not between a name and its value.
+        grid.addItem(QSpacerItem(0, 0, QSizePolicy.Expanding, QSizePolicy.Minimum), 0, 4)
+        grid.setColumnStretch(4, 1)
         grid.setRowStretch(len(rows), 1)
 
     def set(self, rid, text, level=None, points=None, tip=""):
@@ -185,7 +236,6 @@ class AutoTab(QWidget):
         self.calibration = CalibrationCard()
         root.addWidget(self.calibration)
 
-        top = QHBoxLayout()
         fans = QGroupBox("Fans")
         fg = QGridLayout(fans)
         for i, title in enumerate(("Fan", "Speed now", "Requested floor")):
@@ -213,30 +263,35 @@ class AutoTab(QWidget):
                      % " / ".join(f"{TOP_RPM[f]:,}" for f in core.FANS))
         note.setEnabled(False)
         fg.addWidget(note, len(core.FANS) + 1, 0, 1, 3)
-        top.addWidget(fans, 3)
         audio = QGroupBox("Audio and heat input")
-        form = QFormLayout(audio)
+        ag = QGridLayout(audio)
+        ag.setHorizontalSpacing(12)
         self.heat = {}
-        for k, title in (("heat_w", "Heat input · smoothed"), ("smoothed_gpu_w", "GPU · smoothed")):
-            self.heat[k] = label()
-            font = self.heat[k].font()
-            font.setBold(True)
-            self.heat[k].setFont(font)
-            form.addRow(title, self.heat[k])
-        self.usb = label()
-        form.addRow("USB audio", self.usb)
-        self.margin = label()
-        form.addRow("GPU-bin margins", self.margin)
-        top.addWidget(audio, 2)
-        root.addLayout(top)
+        self.usb, self.margin = QLabel(), QLabel()
+        # Values never wrap: a wrapped label in a two-column layout can be given one line's height
+        # and get clipped. Multi-line values carry their own line breaks instead.
+        rows = (("heat_w", "Heat input · smoothed"), ("smoothed_gpu_w", "GPU · smoothed"),
+                ("usb", "USB audio"), ("margin", "GPU-bin margins"))
+        for i, (k, title) in enumerate(rows):
+            value = self.usb if k == "usb" else self.margin if k == "margin" else QLabel()
+            value.setTextFormat(Qt.PlainText)
+            value.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            if k in ("heat_w", "smoothed_gpu_w"):
+                font = value.font()
+                font.setBold(True)
+                value.setFont(font)
+                self.heat[k] = value
+            name = QLabel(title)
+            ag.addWidget(name, i, 0, Qt.AlignLeft | Qt.AlignTop)
+            ag.addWidget(value, i, 1, Qt.AlignLeft | Qt.AlignTop)
+        ag.setColumnStretch(1, 1)
+        ag.setRowStretch(len(rows), 1)
+        self.top_row = Reflow((fans, audio), (2, 1), stretches=(3, 2))
+        root.addWidget(self.top_row)
 
-        sensors = QHBoxLayout()
-        self.cards = {}
-        for title, rows in CARDS:
-            card = SensorCard(title, rows)
-            self.cards[title] = card
-            sensors.addWidget(card, 1)
-        root.addLayout(sensors)
+        self.cards = {title: SensorCard(title, rows) for title, rows in CARDS}
+        self.sensor_row = Reflow(self.cards.values(), (4, 2, 1))
+        root.addWidget(self.sensor_row)
 
         history = QGroupBox("Last five minutes")
         hl = QVBoxLayout(history)
@@ -442,9 +497,10 @@ class AutoTab(QWidget):
         devices = [f"{d.get('name') or d.get('path') or 'USB device'} · {d['drops_per_s']:g} drops/s"
                    for d in usb.get("devices", [])]
         audio = "Audio active" if usb.get("audio_active") else "Idle"
-        self.usb.setText((usb.get("error") or "  /  ".join([audio, *devices])) if s else "—")
+        self.usb.setText((usb.get("error") or "\n".join([audio, *devices])) if s else "—")
         margins = sorted(s["margins"].items(), key=lambda x: float(x[0])) if s else []
-        self.margin.setText("   ·   ".join(f"≥{w} W  +{v:g} pp" for w, v in margins) or "—")
+        pairs = [f"≥{w} W +{v:g} pp" for w, v in margins]
+        self.margin.setText("\n".join("   ".join(pairs[i:i + 2]) for i in range(0, len(pairs), 2)) or "—")
         events = "\n".join(f"{e['t'][11:19]} UTC   {e['message']}" for e in reversed(s["events"])) if s else ""
         if self.events.toPlainText() != events:
             self.events.setPlainText(events)
