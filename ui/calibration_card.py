@@ -12,7 +12,7 @@ from PySide6.QtWidgets import QGroupBox, QHBoxLayout, QLabel, QPushButton, QVBox
 
 from charts import STATUS
 
-QUICK_MINUTES, FULL_MINUTES = "20-40", "60-110"
+QUICK_MINUTES, FULL_MINUTES = "30-50", "60-120"
 
 
 def check_items(state, profile, ac, speakers_free, usb_found, usb_name):
@@ -149,11 +149,12 @@ class CalibrationCard(QGroupBox):
             self.title.setText("Finish setup: calibrate the fans for this laptop" if calibration is None
                                else "Calibrate the fans again")
             self.text.setText(
-                "Auto-tune heats the laptop by itself and steps the fans from loud to quiet to find the "
-                "quietest mix that keeps audio clean, then shows the fan table it proposes before anything is "
-                f"written. Quick (about {QUICK_MINUTES} min) tests three heat levels with coarser steps, like "
-                f"the first hand calibration. Full (about {FULL_MINUTES} min) tests four levels with finer "
-                "steps and more tries at moving air away from the whiny middle fan. Both are loud.")
+                "Auto-tune heats the laptop by itself. At each heat level it starts with the fans as quiet as "
+                "they go, waits until the board has warmed up, and raises the fans step by step until audio "
+                "is clean. Then it shows the fan table it proposes before anything is written. Quick (about "
+                f"{QUICK_MINUTES} min) tests three heat levels with coarser steps, like the first hand "
+                f"calibration. Full (about {FULL_MINUTES} min) tests four levels with finer steps and more "
+                "tries at moving air away from the whiny middle fan. Both are loud.")
             self.later.setText("Close" if self.expanded else "Not now")
             lines = []
             for ok, text, required in checks:

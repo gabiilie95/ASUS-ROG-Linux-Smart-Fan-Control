@@ -12,10 +12,10 @@ from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QFileDialog, QFormL
 import rogcore as core
 from fan_auto import heading, label
 
-QUICK_AUTOTUNE = "Quick auto-tune (about 20-40 min, loud)"
-AUTOTUNE = "Full auto-tune (about 60-110 min, loud)"
+QUICK_AUTOTUNE = "Quick auto-tune (about 30-50 min, loud)"
+AUTOTUNE = "Full auto-tune (about 60-120 min, loud)"
 AUTOTUNES = {QUICK_AUTOTUNE: "quick", AUTOTUNE: "full"}
-MINUTES = {"quick": "20-40", "full": "60-110"}
+MINUTES = {"quick": "30-50", "full": "60-120"}
 OFF_WAIT_S = 20     # how long to wait for the fan service to acknowledge Off before a setup run
 SAFETY_EXIT = 3     # autotune.py stopped at a safety limit; the reason is in its progress
 STEP_COLUMNS = ["Step", "Samples", "Mean stalls/s", "Peak stalls/s", "GPU power (W)"]
@@ -112,7 +112,7 @@ class CalibrateTab(QWidget):
         self.cancel.setEnabled(False)
         self.export = QPushButton("Export CSV…")
         self.export.setEnabled(False)
-        for btn, slot in ((self.start, self.begin), (self.cancel, self.stop), (self.export, self.save)):
+        for btn, slot in ((self.start, self.start_clicked), (self.cancel, self.stop), (self.export, self.save)):
             row.addWidget(btn)
             btn.clicked.connect(slot)
         row.addStretch()
@@ -167,16 +167,17 @@ class CalibrateTab(QWidget):
             "Light": "Seven measured steps for light gaming, including middle-fan and assisted cooling.",
             "Heavy": "Four heavy-load steps, starting with all fans at full speed.",
             "Custom": "Separate steps with a semicolon. Omitted fans follow their saved curves.",
-            QUICK_AUTOTUNE: "Unattended, like the first hand calibration: heats the GPU (150, 80 and 40 W) "
-                            "and CPU, and at each level steps the fans from loud to quiet in coarse steps of 2 "
-                            "minutes to find the quietest mix with clean audio. About 20-40 minutes with loud "
+            QUICK_AUTOTUNE: "Unattended, like the first hand calibration: heats the GPU (40, 80 and 150 W) "
+                            "and CPU. At each level the fans start as quiet as they go until the board has warmed "
+                            "up, then rise in coarse steps until audio is clean. About 30-50 minutes with loud "
                             "fans; the laptop speakers stay blocked. Needs Performance, the fan service set to "
                             "Off and the power adapter. Nothing is written until you review the proposed table.",
-            AUTOTUNE: "Unattended: heats the GPU (160, 120, 80 and 40 W) and CPU, and at each level steps "
-                      "the fans from loud to quiet to find the quietest mix with clean audio, then tries "
-                      "moving air away from the middle fan. About 60-110 minutes with loud fans; the laptop "
-                      "speakers stay blocked. Needs Performance, the fan service set to Off and the power "
-                      "adapter. Nothing is written until you review the proposed table.",
+            AUTOTUNE: "Unattended: heats the GPU (40, 80, 120 and 160 W) and CPU. At each level the fans "
+                      "start as quiet as they go until the board has warmed up, then rise step by step until "
+                      "audio is clean, then it tries moving air away from the middle fan. About 60-120 "
+                      "minutes with loud fans; the laptop speakers stay blocked. Needs Performance, the fan "
+                      "service set to Off and the power adapter. Nothing is written until you review the "
+                      "proposed table.",
         }[preset])
         if auto:
             self.description.setText(self.description.text() + (
@@ -209,23 +210,56 @@ class CalibrateTab(QWidget):
             "end." % (MINUTES[kind], "The fan service switches to Off for the run and back afterwards. "
                       if switch_mode else "")) == QMessageBox.Yes
 
-    def start_autotune(self, kind):
-        """The Overview's setup buttons: choose the run, switch the fan service to Off if it is not,
-        then start once the service has handed the fans over."""
+    def service_sample_to_switch(self):
+        """The running fan service's sample when it still owns the fans (it must hand them over by
+        switching to Off before a run sets them), else None."""
+        if self.dry_run:
+            return None
+        state, s = core.fan_service()
+        if state == "Running" and s is not None and (s["mode"] != "off" or core.manual_fan_problem() is not None):
+            return s
+        return None
+
+    def start_clicked(self):
+        """Start session: auto-tune and stepped runs switch the fan service to Off themselves (after
+        asking) and give its mode back afterwards, as the Overview's setup buttons do."""
+        preset = self.preset.currentText()
+        if preset in AUTOTUNES:
+            self.start_autotune(AUTOTUNES[preset])
+            return
         if self.process or self.mode_timer.isActive():
             return
-        self.preset.setCurrentText(QUICK_AUTOTUNE if kind == "quick" else AUTOTUNE)
-        state, s = core.fan_service()
-        switch = (not self.dry_run and state == "Running" and s is not None
-                  and (s["mode"] != "off" or core.manual_fan_problem() is not None))
-        if not switch:
+        s = None if preset == "Observe" else self.service_sample_to_switch()
+        if s is None:
             self.begin()
             return
         if self.action_in_progress():
             self.message.setText("Wait for the current panel action to finish.")
             return
-        if not self.confirm_autotune(kind, switch_mode=True):
+        answer = QMessageBox.question(
+            self, "Set the fan service to Off?",
+            "This calibration sets the fans itself, so the fan service switches to Off for the run and "
+            "back to %s afterwards." % core.FAND_MODES.get(s["mode"], s["mode"]))
+        if answer == QMessageBox.Yes:
+            self.switch_off_then_begin(s)
+
+    def start_autotune(self, kind):
+        """The Overview's setup buttons and Start session: choose the run, switch the fan service to
+        Off if it is not, then start once the service has handed the fans over."""
+        if self.process or self.mode_timer.isActive():
             return
+        self.preset.setCurrentText(QUICK_AUTOTUNE if kind == "quick" else AUTOTUNE)
+        s = self.service_sample_to_switch()
+        if s is None:
+            self.begin()
+            return
+        if self.action_in_progress():
+            self.message.setText("Wait for the current panel action to finish.")
+            return
+        if self.confirm_autotune(kind, switch_mode=True):
+            self.switch_off_then_begin(s)
+
+    def switch_off_then_begin(self, s):
         previous = s["mode"]
         try:
             core.request_fan_mode("off")
@@ -234,7 +268,7 @@ class CalibrateTab(QWidget):
             return
         self.restore_mode = previous if previous != "off" else None
         self.mode_deadline = time.monotonic() + OFF_WAIT_S
-        self.message.setText("Setting the fan service to Off for auto-tune…")
+        self.message.setText("Setting the fan service to Off for the run…")
         self.mode_timer.start()
 
     def wait_for_off(self):
@@ -244,7 +278,7 @@ class CalibrateTab(QWidget):
                 self.give_back_mode()
         elif time.monotonic() > self.mode_deadline:
             self.mode_timer.stop()
-            self.message.setText("The fan service did not switch to Off, so auto-tune was not started.")
+            self.message.setText("The fan service did not switch to Off, so the run was not started.")
             self.give_back_mode()
 
     def give_back_mode(self):

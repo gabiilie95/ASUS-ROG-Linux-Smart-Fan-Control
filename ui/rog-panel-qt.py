@@ -344,6 +344,15 @@ def card(title):
     return g, form
 
 
+def lock_note():
+    """A visible reason why some controls are locked (hidden while nothing is)."""
+    l = QLabel("")
+    l.setWordWrap(True)
+    l.setStyleSheet("border-left: 3px solid #388ab9; padding: 4px 8px;")
+    l.hide()
+    return l
+
+
 def note_label(text):
     l = QLabel(text)
     l.setWordWrap(True)
@@ -570,6 +579,8 @@ class MainWindow(QMainWindow):
         box, lay = card("Fan preset")
         self.curmatch = QLabel("")
         lay.addWidget(self.curmatch)
+        self.preset_lock = lock_note()
+        lay.addWidget(self.preset_lock)
         self.preset_lay = QGridLayout()
         lay.addLayout(self.preset_lay)
         lay.addStretch(1)
@@ -642,6 +653,8 @@ class MainWindow(QMainWindow):
         row.addWidget(self.edact)
         row.addStretch(1)
         m.addLayout(row)
+        self.curve_lock = lock_note()
+        m.addWidget(self.curve_lock)
         self.warn_box = QVBoxLayout()
         self.warn_labels = []
         for _ in range(3):
@@ -697,7 +710,8 @@ class MainWindow(QMainWindow):
             self.charts[f], self.spins[f], self.dirty_lbl[f], self.en_lbl[f], self.apply_btns[f] = chart, sp_list, dv, en, ap
 
         row = QHBoxLayout()
-        row.addWidget(self.add_action_button("Apply all three", lambda: self.apply_fans([f for f, _ in FAN_LABELS])))
+        self.apply_all = self.add_action_button("Apply all three", lambda: self.apply_fans([f for f, _ in FAN_LABELS]))
+        row.addWidget(self.apply_all)
         b = QPushButton("Reload from saved")
         b.clicked.connect(self.on_reload)
         self.action_buttons.append(b)
@@ -909,6 +923,7 @@ class MainWindow(QMainWindow):
     def calibration_changed(self, running):
         self.auto_tab.calibrating = running
         self.auto_tab.refresh()
+        self.apply_locks()
         if not running and self.close_after_calibration:
             QTimer.singleShot(0, self.quit_app)
 
@@ -1020,6 +1035,7 @@ class MainWindow(QMainWindow):
             self.render_editor(s)
         except Exception as e:
             self.edmsg.setText("Editor error: %s" % e)
+        self.apply_locks()
 
     # ---- actions ----
     def set_busy(self, busy):
@@ -1028,6 +1044,25 @@ class MainWindow(QMainWindow):
             b.setEnabled(not busy)
         if not busy:
             self.pdel.setEnabled(self.psel.currentData() is not None and str(self.psel.currentData()).startswith("c:"))
+            self.apply_locks()
+
+    def lock_reason(self, profile):
+        state, s = core.fan_service()
+        return core.curve_lock(profile, state, s, calibrating=bool(self.cal_tab.process))
+
+    def apply_locks(self):
+        """Disable applying curves the fan service or a calibration run owns, and say why."""
+        perf = self.lock_reason("performance")
+        for b in self.preset_buttons.values():
+            b.setEnabled(not self.acting and perf is None)
+        self.preset_lock.setText(perf or "")
+        self.preset_lock.setVisible(perf is not None)
+        reason = self.lock_reason(self.ed_prof) if self.ed_prof else None
+        for b in [*self.apply_btns.values(), self.apply_all]:
+            b.setEnabled(not self.acting and reason is None)
+            b.setToolTip(reason or "")
+        self.curve_lock.setText(reason or "")
+        self.curve_lock.setVisible(reason is not None)
 
     def act(self, name, body=None):
         self.act_many([(name, body or {}, None)])
@@ -1038,6 +1073,13 @@ class MainWindow(QMainWindow):
         if self.cal_tab.process and any(j[0] in ("fan-curve", "fan-preset", "stall-test") for j in jobs):
             self.show_error("Finish the calibration session first.")
             return
+        for name, body, _ in jobs:
+            profile = "performance" if name == "fan-preset" else body.get("profile") if name == "fan-curve" else None
+            reason = self.lock_reason(profile) if profile else None
+            if reason:
+                self.show_error(reason)
+                self.apply_locks()
+                return
         self.set_busy(True)
         self.out.setPlainText("Running %s..." % ", ".join(j[2] or j[0] for j in jobs))
         self.launch(lambda sig: ActionJob(jobs, self.dry_run, sig), self._action_done)
@@ -1134,6 +1176,7 @@ class MainWindow(QMainWindow):
             l.setText(msgs[i] if i < len(msgs) else "")
             l.setVisible(i < len(msgs))
         self.edact.setText("Active profile: " + na(self.active_prof))
+        self.apply_locks()
 
     def render_editor(self, s):
         self.stored = s["stored_curves"]

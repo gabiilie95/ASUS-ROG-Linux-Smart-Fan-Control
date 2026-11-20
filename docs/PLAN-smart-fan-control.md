@@ -187,7 +187,12 @@ to the design below:
 
 ### 3. Load test and model (Phase 3)
 
-`tools/autotune.py`, unattended, about 60-110 minutes, loud:
+`tools/autotune.py`, unattended, about 60-120 minutes (quick: 30-50), loud. Revised on 2026-11-20
+after the first live quick run: it searched each level from loud to quiet, hottest first, so the
+cooler levels inherited 0 % floors from the hot level (where the saved curve already runs the fans
+fast) and were judged after 2 minutes, before the chipset had heated up; it proposed 0 % floors
+everywhere. The search now runs coolest first and climbs from the quietest floors after a heat soak
+(see README, Auto-tune). The original plan:
 - Heat levels: CPU load from `tools/loadgen.c`, GPU load from `stress-ng --gpu` on the NVIDIA render
   node (or `vkmark`), at 3-4 levels covering about 40-170 W on the GPU. Confirm first that the
   generator reaches those levels on the NVIDIA card.

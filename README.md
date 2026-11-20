@@ -413,7 +413,7 @@ and switches the settings that already exist as scripts.
 - Jellyfin software interface on/off: `tools/jellyfin-software-ui.sh`; applies at Jellyfin's next start (it is not restarted).
 - CPU cap (40-100) and "Undo CPU profile": run `root-tests/setup-cool-performance.sh` through `pkexec`, so a system dialog asks for the password. The cap is saved for all mapped power modes, including battery overrides, and reapplied by TuneD after reboot. Each mode keeps its existing governor, energy preference and platform settings; an existing stricter CPU limit remains in effect. Applying a cap keeps the currently selected mode. Undo restores the previous mappings, which may include an older Performance-only cap.
 
-- Fan curve editor: pick a profile (defaults to the active one), drag the 8 points per fan on the chart or type temperature (C) and speed (%), then "Apply to <profile>" per fan or "Apply all three". Runs `asusctl fan-curve --mod-profile ... --fan ... --data ...` plus `--enable-fan-curves true`; the server rejects bad curves (8 points, temps 30-100 C strictly increasing, speed non-decreasing, last point at least 40 %). Shows non-blocking warnings (middle fan below 100 % from 70 C, GPU fan below 100 % from 80 C, profile not active). Built-in and custom presets can be loaded into the editor without applying; custom ones are saved in `ui/custom-presets.json` (up to 20). Stored curves are read from `/etc/asusd/fan_curves.ron`.
+- Fan curve editor: pick a profile (defaults to the active one), drag the 8 points per fan on the chart or type temperature (C) and speed (%), then "Apply to <profile>" per fan or "Apply all three". While the fan service runs, applying to Performance is locked (it writes its own base curve, raised to the floors, so an edit would soon be replaced), as are the Status tab's fan presets, which write Performance. Balanced or Quiet is locked only while the service is raising it, and every profile while a calibration run owns the fans; the tab says why. Runs `asusctl fan-curve --mod-profile ... --fan ... --data ...` plus `--enable-fan-curves true`; the server rejects bad curves (8 points, temps 30-100 C strictly increasing, speed non-decreasing, last point at least 40 %). Shows non-blocking warnings (middle fan below 100 % from 70 C, GPU fan below 100 % from 80 C, profile not active). Built-in and custom presets can be loaded into the editor without applying; custom ones are saved in `ui/custom-presets.json` (up to 20). Stored curves are read from `/etc/asusd/fan_curves.ron`.
 - Stall test: 10 s `tools/stall-counter.py`, shows stalls per second; refuses with "internal sound device busy" if the device is in use.
 
 The server listens on 127.0.0.1 only, POSTs need a per-run token, and only the whitelisted commands above can run.
@@ -500,13 +500,25 @@ This prints per-step JSON. On its own, analysis does not generate or apply an Au
 mixes by noise, or change the service's policy. Auto-tune (below) proposes a table from generated
 load, and you review it before anything is written.
 
-**Auto-tune** (Overview setup, Calibrate tab, or `tools/autotune.py`; full run about 60-110 minutes,
-loud). It generates heat itself and replaces manual calibration runs. Levels run hottest first, at GPU 160, 120, 80 and 40 W
-plus 4, 3, 2 and 2 CPU threads. At each level the fan floors step from loud to quiet along a fixed
-ladder: 180 s per step, judged on the last 120 s. The descent stops at the first step that stalls
-(more than 1 stall/s on the internal counter, or any USB drop in the service's status). The fans
-then go straight back to the last clean step, and the next level starts there. Silence plays to the
-Volt 2 through PipeWire so the USB link stays busy. Hard stops: CPU 95 C, GPU 85 C, board 90 C,
+**Auto-tune** (Overview setup, Calibrate tab, or `tools/autotune.py`; full run about 60-120 minutes,
+loud). It generates heat itself and replaces manual calibration runs. Levels run coolest first, at
+GPU 40, 80, 120 and 160 W plus 2, 2, 3 and 4 CPU threads. Each level searches from quiet to loud:
+- **Heat soak.** The level starts at the quietest floors (0/0/0: the saved curve alone) and holds
+  them until the board and memory temperatures change by at most 0.4 C/min over two minutes (full:
+  at most 12 minutes, quick 8). Chipset stalls build up over minutes at light load, where the saved
+  curve keeps the fans slow, so a short check after loud fans would miss them.
+- **Judging.** Each step is judged on the next 120 s (quick 90 s): it stalls with more than 1
+  stall/s on the internal counter, or any USB drop in the service's status. A step that keeps
+  stalling while the board is not cooling is decided before its settling ends.
+- **Climbing.** A stall raises the floors one ladder step. Each new step settles at least 180 s
+  (quick 120 s), longer while temperatures still move (up to 360 s, quick 240 s), and stalls left
+  over from the quieter step are not held against it while the board cools. The first clean step
+  is the level's result. Measuring too early can only make a result louder, never let it crackle.
+- **Why this order.** Light load can need higher floors than heavy load: under heavy load the saved
+  curve already runs the fans fast because the CPU and GPU are hot. The table never lets floors
+  fall as GPU power rises, so heavy load keeps at least the light-load floors.
+
+Silence plays to the Volt 2 through PipeWire so the USB link stays busy. Hard stops: CPU 95 C, GPU 85 C, board 90 C,
 battery power, or the profile leaving Performance; any stop or cancel ends the load and restores
 the exact saved curves. The log goes to `data/logs/autotune-<time>.csv` (installed panel:
 `~/.local/share/rog-fand/logs/`), the proposal beside it as `.model.json`. The panel shows the
@@ -514,19 +526,21 @@ proposed table next to the current one. **Write model…** installs it through p
 (`rog_fand.py --write-model`, strictly validated) as `/etc/rog-fand/model.json` and restarts the
 service. Delete that file as root to go back to the default table.
 
-**Quick auto-tune** (`--preset quick`; about 20-40 minutes, loud). The hand calibration of
+**Quick auto-tune** (`--preset quick`; about 30-50 minutes, loud). The hand calibration of
 2026-11-16 (a light and a heavy gaming load, a few fan mixes each), unattended, plus a low level so
 idle stays quiet:
 
 | | Quick | Full |
 |---|---|---|
-| Heat levels (GPU W : CPU threads) | 150:4, 80:2, 40:2 | 160:4, 120:3, 80:2, 40:2 |
-| Fan ladder (cpu/gpu/middle %) | 100, 80, 70/70/75, 50/50/70, 25/30/60, 0/0/50, 0/0/0 | 11 steps, 100 to 0/0/0 |
-| Step, judged on | 120 s, last 90 s | 180 s, last 120 s |
+| Heat levels (GPU W : CPU threads) | 40:2, 80:2, 150:4 | 40:2, 80:2, 120:3, 160:4 |
+| Fan ladder (cpu/gpu/middle %), quiet to loud | 0/0/0, 0/0/50, 25/30/60, 50/50/70, 70/70/75, 80, 100 | 11 steps, 0/0/0 to 100 |
+| Heat soak at a level's quietest floors | up to 8 min | up to 12 min |
+| Settling per step | 120-240 s | 180-360 s |
+| Judged on | 90 s | 120 s |
 | Quieter-mix shifts | 10 points | 10, then 20 points |
-| Stops after | 50 min | 150 min |
+| Stops after | 75 min | 180 min |
 
-Explicit options (`--levels`, `--step`, ...) override the preset. Quick steps are full-ladder steps,
+Explicit options (`--levels`, `--settle`, `--settle-max`, `--soak`, `--judge`, ...) override the preset. Quick steps are full-ladder steps,
 so the two runs compare. The table is coarser: each row covers a wider GPU-power range, so the
 middle of the range may run louder than after a full run. The proposal and the written
 `model.json` record which run produced them (`--model-preset`).
