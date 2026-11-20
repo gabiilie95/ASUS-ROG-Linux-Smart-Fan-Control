@@ -24,6 +24,7 @@ OPTIONS = {   # key: (default, label)
     "notifications": (True, "Show desktop notifications"),
     "start_at_login": (False, "Start at login"),
     "check_updates": (True, "Check for updates every 12 hours"),
+    "calibration_setup": (True, "Suggest fan calibration on the Overview until it is done"),
 }
 
 
@@ -277,6 +278,13 @@ class SettingsTab(QWidget):
         self.update_status = label()
         lay.addWidget(self.update_status)
         root.addWidget(updates)
+
+        calibration = QGroupBox("Fan calibration")
+        lay = QVBoxLayout(calibration)
+        lay.addWidget(self.option("calibration_setup"))
+        lay.addWidget(label("The Overview offers a quick or full auto-tune until one has been written. "
+                            "Calibrate… on the Overview starts one at any time."))
+        root.addWidget(calibration)
         root.addStretch()
 
         self.prefs.changed.connect(self.pref_changed)

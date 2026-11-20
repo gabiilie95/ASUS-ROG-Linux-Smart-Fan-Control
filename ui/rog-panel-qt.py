@@ -420,11 +420,18 @@ class MainWindow(QMainWindow):
         self.updater = Updater(self, self.prefs)
         self.settings_tab = SettingsTab(self)
         self.prefs.changed.connect(self.pref_changed)
-        self.tabs.addTab(self._scroll(self.auto_tab), "Auto")
+        setup = self.auto_tab.calibration
+        setup.set_suggest(self.prefs.get("calibration_setup"))
+        setup.startRequested.connect(self.start_calibration)
+        setup.dismissed.connect(lambda: self.prefs.set("calibration_setup", False))
+        setup.openCalibrate.connect(lambda: self.tabs.setCurrentWidget(self.cal_scroll))
+        self.cal_tab.proposalChanged.connect(self.auto_tab.set_proposal)
+        self.tabs.addTab(self._scroll(self.auto_tab), "Overview")
         self.tabs.addTab(self._scroll(self._build_status_tab()), "Status")
         self.tabs.addTab(self._build_editor_tab(), "Fan curves")
         self.tabs.addTab(self._scroll(self._build_monitor_tab()), "Monitor")
-        self.tabs.addTab(self._scroll(self.cal_tab), "Calibrate")
+        self.cal_scroll = self._scroll(self.cal_tab)
+        self.tabs.addTab(self.cal_scroll, "Calibrate")
         self.settings_scroll = self._scroll(self.settings_tab)
         self.tabs.addTab(self.settings_scroll, "Settings")
         gb, lay = card("Last result")
@@ -434,7 +441,7 @@ class MainWindow(QMainWindow):
         lay.addWidget(self.out)
         root.addWidget(gb)
         self.tabs.currentChanged.connect(
-            lambda i: gb.setVisible(self.tabs.tabText(i) not in ("Auto", "Calibrate", "Settings")))
+            lambda i: gb.setVisible(self.tabs.tabText(i) not in ("Overview", "Calibrate", "Settings")))
         gb.hide()
         self.setStyleSheet("""
             QFrame#masthead {background: #192e40; border-radius: 7px;}
@@ -453,6 +460,7 @@ class MainWindow(QMainWindow):
             QPushButton#primaryAction:enabled {color: white; background: #236b92;
                                               border: 0; border-radius: 4px; min-width: 88px; padding: 5px 13px;}
             QPushButton#primaryAction:pressed {background: #195576;}
+            QGroupBox#calibrationCard[prominent="true"] {border: 2px solid #388ab9;}
         """)
         self._set_banner()
         self.resize(1280, 800)
@@ -491,9 +499,16 @@ class MainWindow(QMainWindow):
         self.settings_tab.refresh()
         return self.tray
 
-    def pref_changed(self, key, _value):
+    def pref_changed(self, key, value):
         if key == "tray":
             self.apply_tray()
+        elif key == "calibration_setup":
+            self.auto_tab.calibration.set_suggest(value)
+
+    def start_calibration(self, kind):
+        """The Overview's setup buttons: run auto-tune from the Calibrate tab, where it can be followed."""
+        self.tabs.setCurrentWidget(self.cal_scroll)
+        self.cal_tab.start_autotune(kind)
 
     def show_settings(self):
         self.tabs.setCurrentWidget(self.settings_scroll)
@@ -939,6 +954,7 @@ class MainWindow(QMainWindow):
             return
         self._set_banner()
         self.last_status = res
+        self.auto_tab.set_system(res)
         self.render(res)
         self.first_status = True
 

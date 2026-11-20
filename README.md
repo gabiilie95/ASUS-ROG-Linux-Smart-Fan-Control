@@ -434,16 +434,35 @@ startup, mode changes, battery selection, reapply, failures and both undo paths:
 /usr/bin/python3 -IB root-tests/test_cpu_cap.py
 ```
 
-The native **Auto** tab shows the service mode, each fan's live speed (read from the fan sensors,
-so it shows without the service too, as rpm and percent of that fan's full speed) beside its
-requested floor, heat input,
-USB drops per device and learned margins. Select a measurement to chart its last five minutes.
-**Apply mode** waits for acknowledgement from the service. **Preview live sensors** runs the
-controller read-only in your desktop session and works before installation.
+The native panel opens on the **Overview**:
+- **Fan service:** its mode, with **Apply mode** (waits for acknowledgement from the service) and
+  **Preview live sensors** (runs the controller read-only in your desktop session, also before
+  installation).
+- **Fans:** each fan's live speed (from the fan sensors, so it shows without the service too, as rpm
+  and percent of that fan's full speed) beside its requested floor.
+- **Audio and heat input:** smoothed heat input, USB drops per device and the learned margins.
+- **Sensors:** CPU, GPU, board and power cards. Each value has a five-minute sparkline and a
+  **Warm** or **Hot** badge from that sensor's own limits. The board card shows SEN3 (with the
+  firmware's 75 C hot and 80 C critical trip points), both memory modules, the Ethernet chip, the
+  SSDs and the Wi-Fi card. CPU power comes from the fan service (RAPL needs root); GPU readings
+  come from the service or `nvidia-smi`. Hover a value for its source and its range since the
+  panel opened.
+- **Last five minutes:** charts board temperatures, CPU and GPU temperatures, fan speeds, fan
+  floors, power or USB drops. Hover the chart to read every series at that moment.
+- **Show every sensor:** every hwmon input, the ACPI thermal zones without an hwmon twin, the
+  battery and the CPU clocks, each with its lowest and highest value since the panel opened
+  (`ui/sensor_scan.py`; about 10 ms per scan, on a worker thread, only while the window is shown).
+- **Fan calibration:** until an auto-tune table is installed, a setup card offers a quick or a full
+  auto-tune and lists, live, what the run needs: the fan service running, the Performance
+  profile, the power adapter, free laptop speakers and (optional) the Volt 2. Starting it switches
+  the fan service to Off, runs auto-tune in the Calibrate tab and gives the previous mode back
+  afterwards; a finished run asks you to review its table. **Not now** (or the Settings tab) stops
+  the suggestion; afterwards the card is one line saying when and how the laptop was calibrated,
+  with **Calibrate…** to run it again.
 
-**Calibrate** offers Observe, Light, Heavy and Custom sessions under your current workload.
-Observe measures stalls using the internal sound device. For a stepped run, select Performance
-and set Auto to **Off · base curve** first. The calibration tool holds control through restoration
+**Calibrate** offers Observe, Light, Heavy and Custom sessions under your current workload, plus
+quick and full auto-tune. Observe measures stalls using the internal sound device. For a stepped
+run, select Performance and set the fan service to **Off · base curve** on the Overview first. The calibration tool holds control through restoration
 of the saved Performance curves and their enable flags. You can cancel a run, inspect per-step
 mean and peak stalls, and export the complete or partial sample CSV. Quitting the panel during a
 run waits for cleanup; closing the window only hides it to the tray. In panel dry-run mode, the start button previews the command.
@@ -481,8 +500,8 @@ This prints per-step JSON. On its own, analysis does not generate or apply an Au
 mixes by noise, or change the service's policy. Auto-tune (below) proposes a table from generated
 load, and you review it before anything is written.
 
-**Auto-tune** (Calibrate tab, or `tools/autotune.py`; about 60-110 minutes, loud). It generates heat
-itself and replaces manual calibration runs. Levels run hottest first, at GPU 160, 120, 80 and 40 W
+**Auto-tune** (Overview setup, Calibrate tab, or `tools/autotune.py`; full run about 60-110 minutes,
+loud). It generates heat itself and replaces manual calibration runs. Levels run hottest first, at GPU 160, 120, 80 and 40 W
 plus 4, 3, 2 and 2 CPU threads. At each level the fan floors step from loud to quiet along a fixed
 ladder: 180 s per step, judged on the last 120 s. The descent stops at the first step that stalls
 (more than 1 stall/s on the internal counter, or any USB drop in the service's status). The fans
@@ -494,6 +513,26 @@ the exact saved curves. The log goes to `data/logs/autotune-<time>.csv` (install
 proposed table next to the current one. **Write model…** installs it through pkexec
 (`rog_fand.py --write-model`, strictly validated) as `/etc/rog-fand/model.json` and restarts the
 service. Delete that file as root to go back to the default table.
+
+**Quick auto-tune** (`--preset quick`; about 20-40 minutes, loud). The hand calibration of
+2026-11-16 (a light and a heavy gaming load, a few fan mixes each), unattended, plus a low level so
+idle stays quiet:
+
+| | Quick | Full |
+|---|---|---|
+| Heat levels (GPU W : CPU threads) | 150:4, 80:2, 40:2 | 160:4, 120:3, 80:2, 40:2 |
+| Fan ladder (cpu/gpu/middle %) | 100, 80, 70/70/75, 50/50/70, 25/30/60, 0/0/50, 0/0/0 | 11 steps, 100 to 0/0/0 |
+| Step, judged on | 120 s, last 90 s | 180 s, last 120 s |
+| Quieter-mix shifts | 10 points | 10, then 20 points |
+| Stops after | 50 min | 150 min |
+
+Explicit options (`--levels`, `--step`, ...) override the preset. Quick steps are full-ladder steps,
+so the two runs compare. The table is coarser: each row covers a wider GPU-power range, so the
+middle of the range may run louder than after a full run. The proposal and the written
+`model.json` record which run produced them (`--model-preset`).
+
+Without the Volt 2 connected, the panel runs auto-tune with `--no-usb`: only the internal stall
+counter judges each step.
 
 **Quieter-mix search.** After a level's quietest clean ladder step, auto-tune moves 10, then 20
 points of airflow from the middle fan to the CPU and GPU fans, at the same heat and under the same

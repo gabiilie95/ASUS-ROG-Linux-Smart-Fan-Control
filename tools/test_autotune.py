@@ -65,13 +65,14 @@ class FakeMachine:
         return s
 
 
-def tuner(machine, levels="160:4,120:3,80:2,40:2", events=None, **kw):
+def tuner(machine, levels="160:4,120:3,80:2,40:2", events=None, ladder=at.LADDER, **kw):
     events = events if events is not None else []
     kw.setdefault("rebalance", ())     # the ladder alone; QuieterMixTest turns the search on
+    kw.setdefault("warmup_s", 0)
     out = io.StringIO()
-    t = at.Tuner(machine, at.parse_levels(levels), at.LADDER,
+    t = at.Tuner(machine, at.parse_levels(levels), ladder,
                  lambda kind, message, **v: events.append(dict(kind=kind, message=message, **v)),
-                 csv.writer(out), warmup_s=0, clock=lambda: "12:00:00", **kw)
+                 csv.writer(out), clock=lambda: "12:00:00", **kw)
     t.started = machine.now()
     t.csv = out
     return t
@@ -301,6 +302,46 @@ class QuieterMixTest(unittest.TestCase):
             self.assertEqual(at.main(["--plan"]), 0)
         self.assertIn("move 10 then 20 points from the middle fan", out.getvalue())
 
+    def test_quick_preset(self):
+        self.assertEqual(at.check_ladder(at.QUICK_LADDER), list(at.QUICK_LADDER))
+        self.assertTrue(set(at.QUICK_LADDER) <= set(at.LADDER) | {(100, 100, 100)},
+                        "quick steps are full-ladder steps, so both runs compare")
+        quick = at.PRESETS["quick"]
+        self.assertEqual([lv.gpu_w for lv in at.parse_levels(quick["levels"])], [150, 80, 40],
+                         "a low level keeps idle quiet: the coolest level's floors start at 0 W")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(at.main(["--plan", "--preset", "quick"]), 0)
+        text = out.getvalue()
+        self.assertIn("Preset: quick (about 20-40 minutes", text)
+        self.assertIn("Each step 120 s, judged on the last 90 s; first level warms up 60 s; stops after 50", text)
+        self.assertIn("GPU 150 W + 4 CPU threads, GPU 80 W + 2 CPU threads, GPU 40 W", text)
+        self.assertIn("move 10 points from the middle fan", text)
+        self.assertIn("up to 1 extra step per level", text)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(at.main(["--plan", "--preset", "quick", "--step", "150", "--levels", "100:2"]), 0)
+        self.assertIn("Each step 150 s, judged on the last 90 s", out.getvalue(), "explicit options win")
+        self.assertIn("Levels (hottest first): GPU 100 W + 2 CPU threads", out.getvalue())
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(at.main(["--plan"]), 0)
+        self.assertIn("Preset: full (about 60-110 minutes", out.getvalue())
+        self.assertIn("Each step 180 s, judged on the last 120 s; first level warms up 120 s; stops after 150",
+                      out.getvalue())
+
+    def test_quick_run_estimate(self):
+        """With the 2026-11-16 thresholds (heavy needs about 80/80/80 or more, light 70 % middle), a quick
+        run takes well under its 50-minute bound."""
+        m = MiddleHeavyMachine({150: 380, 80: 260, 40: 140})
+        quick = at.PRESETS["quick"]
+        t = tuner(m, quick["levels"], ladder=quick["ladder"], step_s=quick["step"], judge_s=quick["judge"],
+                  warmup_s=quick["warmup"], rebalance=quick["rebalance"])
+        table = t.run()
+        self.assertLess(m.clock / 60, 40)
+        self.assertEqual([r["floors"] for r in t.results], [[80, 80, 80], [60, 60, 60], [10, 10, 40]])
+        self.assertEqual(table[0], {"min_gpu_w": 0, "floors": [10, 10, 40]})
+
 
 class SafetyTest(unittest.TestCase):
     def stop_reason(self, **values):
@@ -518,6 +559,7 @@ class RunLifecycleTest(unittest.TestCase):
         self.assertEqual({r["phase"] for r in rows}, {"warmup", "settle", "judge"})
         proposal = json.loads(self.out.with_suffix(".model.json").read_text())
         self.assertEqual(proposal["table"], table)
+        self.assertEqual(proposal["preset"], "full", "a namespace without a preset is a full run")
         self.assertEqual(proposal["log"], self.out.name)
         events = self.events()
         self.assertEqual([e["kind"] for e in events[-3:]], ["restore", "proposal", "done"])

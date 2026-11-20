@@ -161,9 +161,14 @@ def validate_table(table):
     return table
 
 
-def write_model(text):
+MODEL_PRESETS = ("quick", "full")     # which auto-tune run produced a model, for the panel
+
+
+def write_model(text, preset=None):
     """Install an auto-tune table as model.json (root; the panel runs this through pkexec), then
     restart the service so it loads it. Accepts only whole numbers in the table's own shape."""
+    if preset is not None and preset not in MODEL_PRESETS:
+        raise ValueError("unknown auto-tune preset")
     if len(text) > 4096:
         raise ValueError("model too large")
     table = json.loads(text)
@@ -177,6 +182,8 @@ def write_model(text):
     validate_table(table)
     model = dict(version=1, source="auto-tune", table=table,
                  written=datetime.now(timezone.utc).isoformat(timespec="seconds"))
+    if preset:
+        model["preset"] = preset
     atomic_write(ETC / "model.json", json.dumps(model, indent=1) + "\n", 0o644)
     # try-restart: only a running service is restarted; a stopped one reads the model at start.
     subprocess.run(["/usr/bin/systemctl", "try-restart", "rog-fand.service"], check=True, timeout=180)
@@ -693,7 +700,11 @@ def main(argv=None):
     modes.add_argument("--restore-on-stop", action="store_true",
                        help="systemd cleanup: keep inactive-profile receipts for later recovery")
     parser.add_argument("--seconds", type=int, help="end the dry run after this many seconds")
+    parser.add_argument("--model-preset", choices=MODEL_PRESETS,
+                        help="with --write-model: the auto-tune run that produced it")
     args = parser.parse_args(argv)
+    if args.model_preset and args.write_model is None:
+        parser.error("--model-preset requires --write-model")
     if args.seconds is not None and (not args.dry_run or args.seconds <= 0):
         parser.error("--seconds requires --dry-run and a positive duration")
     if args.replay:
@@ -705,7 +716,7 @@ def main(argv=None):
         parser.error("live control requires root; use --dry-run or --replay")
     elif args.write_model is not None:
         try:
-            write_model(args.write_model)
+            write_model(args.write_model, args.model_preset)
         except ValueError as exc:
             print(f"invalid model: {exc}", file=sys.stderr)
             return 1

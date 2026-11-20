@@ -5,14 +5,18 @@ import sys
 import tempfile
 import time
 
-from PySide6.QtCore import QProcess, QSaveFile, QIODevice, Signal, Qt
+from PySide6.QtCore import QProcess, QSaveFile, QIODevice, QTimer, Signal, Qt
 from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QFileDialog, QFormLayout, QGroupBox,
                                QHBoxLayout, QHeaderView, QLineEdit, QMessageBox, QProgressBar,
                                QPushButton, QSpinBox, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 import rogcore as core
 from fan_auto import heading, label
 
-AUTOTUNE = "Auto-tune (about 60-110 min, loud)"
+QUICK_AUTOTUNE = "Quick auto-tune (about 20-40 min, loud)"
+AUTOTUNE = "Full auto-tune (about 60-110 min, loud)"
+AUTOTUNES = {QUICK_AUTOTUNE: "quick", AUTOTUNE: "full"}
+MINUTES = {"quick": "20-40", "full": "60-110"}
+OFF_WAIT_S = 20     # how long to wait for the fan service to acknowledge Off before a setup run
 SAFETY_EXIT = 3     # autotune.py stopped at a safety limit; the reason is in its progress
 STEP_COLUMNS = ["Step", "Samples", "Mean stalls/s", "Peak stalls/s", "GPU power (W)"]
 AUTOTUNE_COLUMNS = STEP_COLUMNS + ["USB drops", "Verdict"]
@@ -42,6 +46,7 @@ def fill_fan_table(widget, rows):
 
 class CalibrateTab(QWidget):
     runningChanged = Signal(bool)
+    proposalChanged = Signal(bool)     # an auto-tune proposal is waiting for review
 
     def __init__(self, dry_run, action_in_progress):
         super().__init__()
@@ -51,6 +56,13 @@ class CalibrateTab(QWidget):
         self.writer = None
         self.proposal = None
         self.autotune = False
+        self.autotune_kind = "full"
+        self.proposal_preset = None
+        self.restore_mode = None       # the fan mode to give back after a setup run switched to Off
+        self.mode_deadline = 0
+        self.mode_timer = QTimer(self)
+        self.mode_timer.setInterval(500)
+        self.mode_timer.timeout.connect(self.wait_for_off)
         self.noise = False
         self.index = self.total = 0
         self.step_duration = self.elapsed = 0
@@ -64,7 +76,7 @@ class CalibrateTab(QWidget):
         setup = QGroupBox("Session")
         form = QFormLayout(setup)
         self.preset = QComboBox()
-        self.preset.addItems(["Observe", "Light", "Heavy", "Custom", AUTOTUNE])
+        self.preset.addItems(["Observe", "Light", "Heavy", "Custom", QUICK_AUTOTUNE, AUTOTUNE])
         form.addRow("Run type", self.preset)
         self.seconds = QSpinBox()
         self.seconds.setRange(2, 86400)
@@ -145,7 +157,7 @@ class CalibrateTab(QWidget):
         layout.addWidget(self.results, 1)
 
     def preset_changed(self, preset):
-        auto = preset == AUTOTUNE
+        auto = preset in AUTOTUNES
         self.form.setRowVisible(self.custom, preset == "Custom")
         self.form.setRowVisible(self.seconds, not auto)
         if not auto:
@@ -155,14 +167,23 @@ class CalibrateTab(QWidget):
             "Light": "Seven measured steps for light gaming, including middle-fan and assisted cooling.",
             "Heavy": "Four heavy-load steps, starting with all fans at full speed.",
             "Custom": "Separate steps with a semicolon. Omitted fans follow their saved curves.",
+            QUICK_AUTOTUNE: "Unattended, like the first hand calibration: heats the GPU (150, 80 and 40 W) "
+                            "and CPU, and at each level steps the fans from loud to quiet in coarse steps of 2 "
+                            "minutes to find the quietest mix with clean audio. About 20-40 minutes with loud "
+                            "fans; the laptop speakers stay blocked. Needs Performance, the fan service set to "
+                            "Off and the power adapter. Nothing is written until you review the proposed table.",
             AUTOTUNE: "Unattended: heats the GPU (160, 120, 80 and 40 W) and CPU, and at each level steps "
-                      "the fans from loud to quiet to find the quietest mix with clean audio. About 60-110 "
-                      "minutes with loud fans; the laptop speakers stay blocked. Needs Performance, Auto set "
-                      "to Off, the power adapter and the USB audio interface. Nothing is written until you "
-                      "review the proposed table.",
+                      "the fans from loud to quiet to find the quietest mix with clean audio, then tries "
+                      "moving air away from the middle fan. About 60-110 minutes with loud fans; the laptop "
+                      "speakers stay blocked. Needs Performance, the fan service set to Off and the power "
+                      "adapter. Nothing is written until you review the proposed table.",
         }[preset])
-        self.description.setText(self.description.text() + (" Thermal trends need a stable workload."
-            if preset == "Observe" else " Keep the workload steady. A step may extend by up to 120 s to check thermal settling."))
+        if auto:
+            self.description.setText(self.description.text() + (
+                " USB audio drops on the %s are counted too when it is connected." % core.AUTOTUNE_USB))
+        else:
+            self.description.setText(self.description.text() + (" Thermal trends need a stable workload."
+                if preset == "Observe" else " Keep the workload steady. A step may extend by up to 120 s to check thermal settling."))
 
     def load_mics(self):
         """Off, then the PipeWire inputs; built-in ones are shown but cannot be chosen."""
@@ -180,50 +201,103 @@ class CalibrateTab(QWidget):
         index = self.mic.findData(current)
         self.mic.setCurrentIndex(index if index >= 0 else 0)
 
-    def begin(self):
-        if self.process:
+    def confirm_autotune(self, kind, switch_mode=False):
+        return QMessageBox.question(
+            self, "Start auto-tune?",
+            "Auto-tune heats the laptop and runs the fans loud for about %s minutes. The laptop speakers "
+            "stay blocked meanwhile. %sYou can cancel at any time; the saved fan curves are restored at the "
+            "end." % (MINUTES[kind], "The fan service switches to Off for the run and back afterwards. "
+                      if switch_mode else "")) == QMessageBox.Yes
+
+    def start_autotune(self, kind):
+        """The Overview's setup buttons: choose the run, switch the fan service to Off if it is not,
+        then start once the service has handed the fans over."""
+        if self.process or self.mode_timer.isActive():
+            return
+        self.preset.setCurrentText(QUICK_AUTOTUNE if kind == "quick" else AUTOTUNE)
+        state, s = core.fan_service()
+        switch = (not self.dry_run and state == "Running" and s is not None
+                  and (s["mode"] != "off" or core.manual_fan_problem() is not None))
+        if not switch:
+            self.begin()
             return
         if self.action_in_progress():
             self.message.setText("Wait for the current panel action to finish.")
             return
+        if not self.confirm_autotune(kind, switch_mode=True):
+            return
+        previous = s["mode"]
+        try:
+            core.request_fan_mode("off")
+        except (ValueError, OSError) as e:
+            self.message.setText("Could not set the fan service to Off: %s" % e)
+            return
+        self.restore_mode = previous if previous != "off" else None
+        self.mode_deadline = time.monotonic() + OFF_WAIT_S
+        self.message.setText("Setting the fan service to Off for auto-tune…")
+        self.mode_timer.start()
+
+    def wait_for_off(self):
+        if core.manual_fan_problem() is None:
+            self.mode_timer.stop()
+            if not self.begin(confirmed=True):
+                self.give_back_mode()
+        elif time.monotonic() > self.mode_deadline:
+            self.mode_timer.stop()
+            self.message.setText("The fan service did not switch to Off, so auto-tune was not started.")
+            self.give_back_mode()
+
+    def give_back_mode(self):
+        mode, self.restore_mode = self.restore_mode, None
+        if mode:
+            try:
+                core.request_fan_mode(mode)
+            except (ValueError, OSError) as e:
+                self.message.setText(self.message.text() + " Set %s again in the Overview (%s)."
+                                     % (core.FAND_MODES.get(mode, mode), e))
+
+    def begin(self, confirmed=False):
+        """Start the chosen run; True when it started."""
+        if self.process:
+            return False
+        if self.action_in_progress():
+            self.message.setText("Wait for the current panel action to finish.")
+            return False
         preset = self.preset.currentText()
-        auto = preset == AUTOTUNE
+        auto = preset in AUTOTUNES
+        kind = AUTOTUNES.get(preset, "full")
         new_workspace = None
         try:
             if auto:
                 output = core.log_dir() / time.strftime("autotune-%Y%m%d-%H%M%S.csv")
-                args = core.autotune_args(output, self.mic.currentData())
+                usb = core.usb_audio_card()
+                args = core.autotune_args(output, self.mic.currentData(), preset=kind, usb=usb)
             else:
                 args = core.calibration_args(preset, self.seconds.value(), self.custom.text(), "samples.csv",
                                              self.mic.currentData())
             if self.dry_run:
                 self.message.setText("Dry run · " + " ".join(args))
-                return
+                return False
             if core.sound_device_busy():
                 self.message.setText("The internal sound device is busy. Stop playback or the stall monitor first.")
-                return
+                return False
             if preset != "Observe":
                 problem = core.manual_fan_problem()
                 if problem:
                     self.message.setText(problem)
-                    return
+                    return False
             if auto:
-                if core.fan_service()[0] != "Running":
+                if usb and core.fan_service()[0] != "Running":
                     self.message.setText("Auto-tune counts USB drops through the fan service. Start the service first.")
-                    return
-                answer = QMessageBox.question(
-                    self, "Start auto-tune?",
-                    "Auto-tune heats the laptop and runs the fans loud for about 60-110 minutes. The "
-                    "laptop speakers stay blocked meanwhile. You can cancel at any time; the saved fan "
-                    "curves are restored at the end.")
-                if answer != QMessageBox.Yes:
-                    return
+                    return False
+                if not confirmed and not self.confirm_autotune(kind):
+                    return False
                 output.parent.mkdir(parents=True, exist_ok=True)
             else:
                 new_workspace = tempfile.TemporaryDirectory(prefix="rog-fan-cal-")
         except (ValueError, OSError) as e:
             self.message.setText(str(e))
-            return
+            return False
         if self.workspace:
             self.workspace.cleanup()
         self.workspace = new_workspace
@@ -234,6 +308,7 @@ class CalibrateTab(QWidget):
             args = core.calibration_args(preset, self.seconds.value(), self.custom.text(), self.output_path,
                                          self.mic.currentData())
         self.autotune = auto
+        self.autotune_kind = kind
         self.noise = bool(self.mic.currentData())
         self.discard_proposal()
         self.process = QProcess(self)
@@ -253,6 +328,7 @@ class CalibrateTab(QWidget):
         self.message.setText("Building the load generator and starting the counters…" if auto
                              else "Starting the stall counter…")
         self.process.start(sys.executable, args)
+        return True
 
     def set_running(self, running):
         for w in (self.preset, self.seconds, self.custom, self.start, self.mic, self.mic_refresh):
@@ -383,6 +459,7 @@ class CalibrateTab(QWidget):
                                           self.outcome]))
         self.message.setText(text)
         self.set_running(False)
+        self.give_back_mode()
 
     def stop(self):
         if self.process:
@@ -397,19 +474,22 @@ class CalibrateTab(QWidget):
         except ValueError as e:
             self.message.setText("Auto-tune proposed an invalid table: %s" % e)
             return
+        self.proposal_preset = self.autotune_kind
         current, source = core.current_table()
         self.current_box.setTitle("Current · " + source)
+        self.proposed_box.setTitle("Proposed by %s auto-tune" % self.autotune_kind)
         fill_fan_table(self.current_table, current)
         fill_fan_table(self.proposed_table, self.proposal)
         self.review_note.setText(
             "Nothing has been written yet. Each row's floors (percent of full speed) apply from its GPU "
             "power up to the next row; they raise the base curve, never lower it. Write model installs "
-            "the proposal as /etc/rog-fand/model.json (password needed) and restarts the fan service; "
-            "set Auto again afterwards." + (" Proposal and step results: %s" % path if path else ""))
+            "the proposal as /etc/rog-fand/model.json (password needed) and restarts the fan service."
+            + (" Proposal and step results: %s" % path if path else ""))
         self.review_status.setText("")
         self.write_model.setEnabled(True)
         self.discard.setEnabled(True)
         self.review.setVisible(True)
+        self.proposalChanged.emit(True)
 
     def discard_proposal(self):
         if self.writer:
@@ -417,11 +497,12 @@ class CalibrateTab(QWidget):
         self.proposal = None
         self.review.setVisible(False)
         self.proposed_table.setRowCount(0)
+        self.proposalChanged.emit(False)
 
     def write(self):
         if self.proposal is None or self.writer:
             return
-        command = core.model_command(self.proposal)
+        command = core.model_command(self.proposal, self.proposal_preset)
         if self.dry_run:
             self.review_status.setText("Dry run · " + " ".join(command))
             return
@@ -451,8 +532,9 @@ class CalibrateTab(QWidget):
         self.discard.setEnabled(True)
         if code == 0:
             self.proposal = None
+            self.proposalChanged.emit(False)
             self.review_status.setText("Written to /etc/rog-fand/model.json. The fan service restarted "
-                                       "with the new table; set Auto in the Auto tab to use it.")
+                                       "with the new table; check its mode on the Overview.")
             current, source = core.current_table()
             self.current_box.setTitle("Current · " + source)
             fill_fan_table(self.current_table, current)
