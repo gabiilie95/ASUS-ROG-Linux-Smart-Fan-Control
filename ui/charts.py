@@ -228,10 +228,15 @@ class Sparkline(QWidget):
         self.update()
 
     def paintEvent(self, _event):
-        if len(self.points) < 2:
-            return
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
+        track = QColor(self.palette().color(QPalette.Mid))
+        track.setAlpha(90)          # the five-minute frame, so a young history reads as filling in
+        p.setPen(QPen(track, 1))
+        p.drawLine(QPointF(3, self.height() - 2.5), QPointF(self.width() - 3, self.height() - 2.5))
+        if len(self.points) < 2:
+            p.end()
+            return
         end = self.points[-1][0]
         values = [v for _, v in self.points]
         lo, hi = min(values), max(values)
