@@ -287,6 +287,9 @@ def build_action(name, body):
         p = body.get("preset")
         if not isinstance(p, str) or p not in PRESETS:
             raise ValueError("unknown preset")
+        reason = curve_lock("performance")      # the preset scripts write Performance
+        if reason:
+            raise ValueError(reason)
         return ["bash", os.path.join(TOOLS, PRESETS[p][0])], 30, None
     if name == "fan-curve":
         prof, fan = body.get("profile"), body.get("fan")
@@ -295,6 +298,9 @@ def build_action(name, body):
         if not isinstance(fan, str) or fan not in FANS:
             raise ValueError("fan must be one of: " + ", ".join(FANS))
         pts = validate_points(body.get("points"))
+        reason = curve_lock(prof)
+        if reason:
+            raise ValueError(reason)
         data = ",".join("%dc:%d" % p for p in pts)
         return [["asusctl", "fan-curve", "--mod-profile", prof, "--fan", fan, "--data", data],
                 ["asusctl", "fan-curve", "--mod-profile", prof, "--enable-fan-curves", "true"]], 20, None
@@ -627,7 +633,29 @@ def manual_fan_problem(holding_lease=False):
                 os.close(fd)
         except OSError:
             pass
-    return "Set the fan service to Off on the Overview and wait for the base curve before editing Performance."
+    return "Set the fan service to Off on the Overview and wait for the base curve first."
+
+
+def curve_lock(profile, state=None, s=None, calibrating=False):
+    """Why the panel must not apply curves to `profile` now, or None. The fan service writes the
+    Performance curve itself (its base curve raised to the floors), so an edit there would soon be
+    replaced; Balanced and Quiet are raised only while their floors are above 0 and handed back
+    afterwards. A calibration run owns every curve until it has restored them."""
+    if state is None:
+        state, s = fan_service()
+    if calibrating or (s or {}).get("manual_control"):
+        return "A calibration run owns the fans. Edit curves after it finishes and restores them."
+    if state != "Running" or not s or profile not in s.get("profiles", ["performance"]):
+        return None
+    if profile == "performance":
+        return ("The fan service manages the Performance curve: it writes its own base curve and raises it "
+                "to the fan floors, so a curve applied here would soon be replaced. Calibrate on the Overview "
+                "to change how fast the fans run under load. Balanced and Quiet stay editable.")
+    if ((s.get("sensors") or {}).get("profile") == profile and s.get("applied")
+            and any(s.get("floors", {}).values())):
+        return ("The fan service is raising the %s curve right now. It gives your curve back when the floors "
+                "return to 0; apply changes then." % profile.capitalize())
+    return None
 
 
 HEAVY_STEPS = "cpu=100,gpu=100,mid=100;cpu=80,gpu=80,mid=80;mid=100;cpu=70,gpu=70,mid=70"

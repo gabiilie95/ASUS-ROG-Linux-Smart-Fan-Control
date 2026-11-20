@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Fan auto-tune: find the quietest fan floors that keep audio clean at several heat levels and
-propose a GPU-power table for rog-fand. Unattended and loud: about 60-110 minutes for the full run,
-about 20-40 minutes for the quick one.
+propose a GPU-power table for rog-fand. Unattended and loud: about 60-120 minutes for the full run,
+about 30-50 minutes for the quick one.
 
     python3 tools/autotune.py                    # full run, log in data/logs/autotune-<time>.csv
     python3 tools/autotune.py --preset quick     # quick run: three levels, a coarser ladder
@@ -9,13 +9,21 @@ about 20-40 minutes for the quick one.
     python3 tools/autotune.py --check-load 30    # hold each heat level 30 s; fans untouched
 
 Heat: GPU load from tools/gpuload.py (held at a target power on the NVIDIA GPU), CPU load from
-tools/loadgen.c (compiled into a temporary directory at start). Levels run hottest first. At each
-level the fan floors step from loud to quiet along a fixed ladder, 180 s per step, judged on the
-last 120 s (quick: 120 s judged on the last 90 s). The descent stops at the first combination that stalls: more than 1 stall/s on the
-internal counter, or any USB drop in the service's status. The fans then go straight back to the
-last clean combination (the safe curve between levels) and the next, cooler level starts from it.
-If a level's first combination already stalls, it steps back up until one is clean. Floors are
-applied the way the service applies them: each point of the saved curve raised to the floor.
+tools/loadgen.c (compiled into a temporary directory at start). Levels run coolest first, and each
+one starts from the quietest fans and only ever raises them:
+- The first step of a level is a heat soak: the quietest floors are held until the board and memory
+  temperatures stop changing (or a time limit), so the chipset area reaches the heat it would reach
+  in a long session. Chipset stalls build up over minutes at light load, where the saved curve keeps
+  the fans slow; a short check after loud fans would miss them.
+- Each step is then judged on its last window (full: 120 s, quick: 90 s). It stalls with more than
+  1 stall/s on the internal counter, or any USB drop in the service's status. A step that keeps
+  stalling while the board is not cooling is decided before its settling ends.
+- A stall raises the floors one ladder step, which settles again (at least 180 s, quick 120 s,
+  longer while temperatures still move) before it is judged. The first clean step is the level's
+  result. Measuring too early can only make a result louder, never let it crackle.
+Floors are applied the way the service applies them: each point of the saved curve raised to the
+floor. Light load can need higher floors than heavy load, because the saved curve runs the fans
+slower when the CPU and GPU are cooler; the table keeps floors from falling as power rises.
 
 Needs the Performance profile, the fan service in Off (Overview tab), mains power, a free internal
 sound device (the stall counter plays silence on it, so the laptop speakers are blocked) and the
@@ -50,17 +58,17 @@ _spec = importlib.util.spec_from_file_location("fan_calibrate", HERE / "fan-cali
 cal = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(cal)
 import noise_meter  # noqa: E402  (fan-calibrate put this directory on the path)
+import fan_analysis  # noqa: E402
 core = cal.core
 FANS = cal.FANS
 PROFILE = "/sys/firmware/acpi/platform_profile"
 
-# Heat levels as GPU watts:CPU threads, run hottest first. On the G814JZ (2026-11-17) one loadgen
+# Heat levels as GPU watts:CPU threads, run coolest first. On the G814JZ (2026-11-17) one loadgen
 # thread is about 15 W of CPU package power; 4 threads about 57 W at 77 C on their own.
 LEVELS = "160:4,120:3,80:2,40:2"
-# Fan floors (cpu, gpu, middle %), loud to quiet. Every fan only ever goes down, so a cooler level
-# can start where a hotter one ended. Weighted by the noise cost (middle fan twice), each rung is
-# quieter than the one before. Earlier calibration: 80/80/80 clean at 150 W GPU, 70/70/70
-# marginal; middle 70 clean at 63-84 W.
+# Fan floors (cpu, gpu, middle %), written loud to quiet; a level climbs it from the quiet end.
+# Weighted by the noise cost (middle fan twice), each rung is quieter than the one before. Earlier
+# calibration: 80/80/80 clean at 150 W GPU, 70/70/70 marginal; middle 70 clean at 63-84 W.
 LADDER = ((100, 100, 100), (90, 90, 90), (80, 80, 80), (75, 75, 75), (70, 70, 75), (60, 60, 70),
           (50, 50, 70), (35, 40, 70), (25, 30, 60), (0, 0, 50), (0, 0, 0))
 LIMITS = {"cpu_c": 95, "gpu_c": 85, "board_c": 90}
@@ -71,15 +79,23 @@ LIMITS = {"cpu_c": 95, "gpu_c": 85, "board_c": 90}
 REBALANCE = (10, 20)
 # The quick run repeats the hand calibration of 2026-11-16 (a light and a heavy gaming load, a few
 # fan mixes each) unattended, plus a low level so idle stays quiet: three levels, every other ladder
-# rung plus the quiet end, shorter steps and one quieter-mix shift.
+# rung plus the quiet end, shorter settling and one quieter-mix shift.
 QUICK_LADDER = ((100, 100, 100), (80, 80, 80), (70, 70, 75), (50, 50, 70), (25, 30, 60), (0, 0, 50),
                 (0, 0, 0))
+# Steps: settle at least `settle` s, longer while the board temperatures still move (up to
+# `settle_max` s; a level's first step soaks up to `soak` s), then judge the next `judge` s.
 PRESETS = {
-    "full": dict(levels=LEVELS, ladder=LADDER, step=180, judge=120, warmup=120, max_minutes=150,
-                 rebalance=REBALANCE, minutes="60-110"),
-    "quick": dict(levels="150:4,80:2,40:2", ladder=QUICK_LADDER, step=120, judge=90, warmup=60,
-                  max_minutes=50, rebalance=(10,), minutes="20-40"),
+    "full": dict(levels=LEVELS, ladder=LADDER, settle=180, settle_max=360, soak=720, judge=120,
+                 warmup=0, max_minutes=180, rebalance=REBALANCE, minutes="60-120"),
+    "quick": dict(levels="150:4,80:2,40:2", ladder=QUICK_LADDER, settle=120, settle_max=240, soak=480,
+                  judge=90, warmup=0, max_minutes=75, rebalance=(10,), minutes="30-50"),
 }
+# Settled: every board-area temperature (SEN3, the memory modules) changes by at most this much over
+# the last SETTLE_WINDOW seconds (Theil-Sen slope, robust to SEN3's whole-degree steps). A sensor
+# with too few readings is left out; with none at all a step settles only at its limit.
+SETTLE_SENSORS = ("board_c", "dimm_a_c", "dimm_b_c")
+SETTLE_SLOPE = 0.4      # C per minute
+SETTLE_WINDOW = 120     # seconds
 NOISE_EXPONENT = 5      # fan sound power grows roughly with speed^5 (fan affinity laws)
 MIC_MARGIN_DB = 0.5     # with a microphone, a mix must measure this much quieter to replace another
 STALL_LIMIT = 1.0       # stalls per second on the internal counter, mean of the judged window
@@ -118,7 +134,7 @@ def parse_levels(text):
         levels.append(level)
     if not 1 <= len(levels) <= 8 or len({lv.gpu_w for lv in levels}) != len(levels):
         raise ValueError("Use one to eight levels with different GPU watts")
-    return sorted(levels, key=lambda lv: -lv.gpu_w)
+    return sorted(levels, key=lambda lv: lv.gpu_w)
 
 
 def parse_ladder(text):
@@ -228,18 +244,45 @@ def build_table(results):
     return table
 
 
+def board_slopes(history, window=SETTLE_WINDOW):
+    """{sensor: C per minute} over the last `window` seconds of [(elapsed, sample)], for the
+    board-area sensors with enough readings."""
+    if not history:
+        return {}
+    end = history[-1][0]
+    out = {}
+    for key in SETTLE_SENSORS:
+        pts = [(t, s[key]) for t, s in history if t >= end - window and s.get(key) is not None]
+        if len(pts) >= max(6, 0.6 * window / PERIOD) and pts[-1][0] - pts[0][0] >= 0.8 * window:
+            value = fan_analysis.slope(pts)
+            if value is not None:
+                out[key] = value
+    return out
+
+
+def settled(history, limit=SETTLE_SLOPE):
+    slopes = board_slopes(history)
+    return bool(slopes) and all(abs(v) <= limit for v in slopes.values())
+
+
+def cooling(history, limit=SETTLE_SLOPE):
+    return any(v <= -limit for v in board_slopes(history).values())
+
+
 class Tuner:
     """The stepping logic. `machine` provides now(), wait(seconds) -> cancelled, sample(),
     set_floors(floors), start_load(level) and stop_load(); tests pass a fake one."""
 
-    def __init__(self, machine, levels, ladder, report, writer, *, step_s=180, judge_s=120,
-                 warmup_s=120, period=PERIOD, threshold=STALL_LIMIT, limits=LIMITS, max_s=None,
-                 clock=lambda: time.strftime("%H:%M:%S"), rebalance=REBALANCE, weights=NOISE_WEIGHTS):
-        if not period <= judge_s <= step_s:
-            raise ValueError("The judged part must be at least one sample and at most the step")
+    def __init__(self, machine, levels, ladder, report, writer, *, settle_s=180, settle_max_s=360,
+                 soak_s=720, judge_s=120, warmup_s=0, period=PERIOD, threshold=STALL_LIMIT, limits=LIMITS,
+                 max_s=None, clock=lambda: time.strftime("%H:%M:%S"), rebalance=REBALANCE,
+                 weights=NOISE_WEIGHTS):
+        if not period <= judge_s or not 0 < settle_s <= settle_max_s <= soak_s:
+            raise ValueError("Need a judged window of at least one sample and settle <= settle max <= soak")
         self.machine, self.levels, self.ladder = machine, levels, check_ladder(ladder)
         self.report, self.writer, self.clock = report, writer, clock
-        self.step_s, self.judge_s, self.warmup_s, self.period = step_s, judge_s, warmup_s, period
+        self.settle_s, self.settle_max_s, self.soak_s = settle_s, settle_max_s, soak_s
+        self.judge_s, self.warmup_s, self.period = judge_s, warmup_s, period
         self.threshold, self.limits, self.max_s = threshold, limits, max_s
         self.rebalance, self.weights = tuple(rebalance or ()), weights
         self.results, self.steps = [], []
@@ -278,10 +321,12 @@ class Tuner:
                    **{f + "_rpm": s.get(f + "_rpm") for f in FANS}, noise_db=s.get("noise_db"),
                    **{k: s.get(k) for k in core.BOARD_TEMPS})
         self.writer.writerow([row[c] for c in COLUMNS])
-        within = min(0.95, (max(0, self.level_steps - 1) + min(1, elapsed / self.step_s)) / 4)
+        # A rough share of the level: about three steps per level, each settle plus judge long.
+        typical = self.settle_s + self.judge_s
+        within = min(0.95, (max(0, self.level_steps - 1) + min(1, elapsed / typical)) / 3)
         drops = "--" if s["usb_drops"] is None else s["usb_drops"]
-        self.report("sample", "%s · %s · %.0f s · %s stalls/s · %s USB drops" % (
-            self.level_label(level), label, elapsed, row["stalls_per_s"], drops),
+        self.report("sample", "%s · %s · %s %.0f s · %s stalls/s · %s USB drops" % (
+            self.level_label(level), label, phase, elapsed, row["stalls_per_s"], drops),
             row=row, elapsed=elapsed, phase=phase,
             run_s=round(self.machine.now() - self.started, 1),
             progress=round((self.level_index - 1 + within) / len(self.levels), 3))
@@ -299,68 +344,88 @@ class Tuner:
             if elapsed >= seconds:
                 return
 
-    def step(self, level, rung, watts, floors=None):
-        """Judge one fan mix: a ladder rung, or `floors` (a quieter mix tried after that rung)."""
+    def step(self, level, rung, watts, floors=None, soak=False):
+        """Judge one fan mix: a ladder rung, or `floors` (a quieter mix tried after that rung).
+
+        The mix first settles: at least settle_s, then until the board temperatures stop changing,
+        up to settle_max_s (soak_s for a level's first step). The judged window follows. A mix that
+        keeps stalling while the board is not cooling is decided during settling."""
         mix = floors is not None
         floors = tuple(floors) if mix else self.ladder[rung]
         self.step_no += 1
         self.level_steps += 1
         label = ("quieter mix %d/%d/%d %%" if mix else "%d/%d/%d %%") % floors
-        self.report("step", "%s · fans %s" % (self.level_label(level), label), level=self.level_index,
-                    index=self.step_no, rung=rung, floors=list(floors))
+        self.report("step", "%s · fans %s%s" % (self.level_label(level), label,
+                                                " · heat soak" if soak else ""),
+                    level=self.level_index, index=self.step_no, rung=rung, floors=list(floors), soak=soak)
         self.machine.set_floors(floors)
         start = self.machine.now()
+        longest = self.soak_s if soak else self.settle_max_s
         expected = self.judge_s / self.period
-        window = []
-        early = False
+        history, window = [], []
+        settle_end = None
+        early = is_settled = False
         while True:
             s = self.tick()
             elapsed = self.machine.now() - start
-            judged = elapsed > self.step_s - self.judge_s
-            self.record(s, level, floors, "judge" if judged else "settle", elapsed, label)
-            if judged:
-                window.append(s)
-                watts.append(s.get("gpu_w"))
-                if stall_certain(window, expected, self.threshold):
-                    early = True
+            if settle_end is None:
+                history.append((elapsed, s))
+                self.record(s, level, floors, "soak" if soak else "settle", elapsed, label)
+                if elapsed < self.settle_s:
+                    continue
+                recent = [x for t, x in history if t > elapsed - self.judge_s]
+                rate = mean(x["stalls_per_s"] for x in recent)
+                if rate is not None and rate > self.threshold and not cooling(history):
+                    window, early = recent, True      # stalling and not getting better
+                    watts.extend(x.get("gpu_w") for x in recent)
                     break
-            if elapsed >= self.step_s:
+                if settled(history):
+                    settle_end, is_settled = elapsed, True
+                elif elapsed >= longest:
+                    settle_end = elapsed
+                continue
+            self.record(s, level, floors, "judge", elapsed, label)
+            window.append(s)
+            watts.append(s.get("gpu_w"))
+            if stall_certain(window, expected, self.threshold):
+                early = True
+                break
+            if elapsed - settle_end >= self.judge_s:
                 break
         verdict = judge(window, self.threshold)
+        slopes = board_slopes(history)
         verdict.update(name="Level %d · %s" % (self.level_index, label), level=self.level_index,
-                       step=self.step_no, rung=rung, floors=list(floors), early=early, mix=mix,
+                       step=self.step_no, rung=rung, floors=list(floors), early=early, mix=mix, soak=soak,
+                       settle_s=round(settle_end if settle_end is not None else elapsed, 1),
+                       settled=is_settled,
+                       board_slope=round(max(slopes.values(), key=abs), 2) if slopes else None,
                        watts=mean(r.get("gpu_w") for r in window), cpu_w=mean(r.get("cpu_w") for r in window),
                        board_c=window[-1].get("board_c") if window else None)
         self.steps.append(verdict)
-        self.report("result", "%s · %s · mean %s · peak %s stalls/s · %s USB drops%s%s" % (
+        self.report("result", "%s · %s · mean %s · peak %s stalls/s · %s USB drops · settled %s%s%s" % (
             verdict["name"], "stalls" if verdict["stalled"] else "clean",
             fmt(verdict["mean"]), fmt(verdict["peak"]), verdict["usb_drops"],
+            "in %.0f s" % verdict["settle_s"] if is_settled else "not reached by %.0f s" % verdict["settle_s"],
             "" if verdict["noise_db"] is None else " · noise %.1f dB(A)" % verdict["noise_db"],
             " (decided early)" if early else ""), **verdict)
         return verdict
 
-    def level(self, level, start):
+    def level(self, level):
         self.level_steps = 0
         self.report("level", "%s, CPU %d threads" % (self.level_label(level), level.cpu_threads),
                     index=self.level_index, total=len(self.levels), gpu_w=level.gpu_w,
                     cpu_threads=level.cpu_threads)
         self.machine.start_load(level)
+        quietest = len(self.ladder) - 1
         if self.level_index == 1 and self.warmup_s:
-            self.hold(level, self.ladder[start], self.warmup_s, "warmup")
+            self.hold(level, self.ladder[quietest], self.warmup_s, "warmup")
         watts = []
         clean = None
-        rung = start
-        while rung < len(self.ladder):
-            if self.step(level, rung, watts)["stalled"]:
+        # Quiet to loud: the first step soaks at the quietest floors, each stall raises them.
+        for rung in range(quietest, -1, -1):
+            if not self.step(level, rung, watts, soak=rung == quietest)["stalled"]:
+                clean = rung
                 break
-            clean = rung
-            rung += 1
-        if clean is None:
-            # Even the starting combination stalls at this level: go louder until one is clean.
-            for rung in range(start - 1, -1, -1):
-                if not self.step(level, rung, watts)["stalled"]:
-                    clean = rung
-                    break
         floors = self.ladder[clean] if clean is not None else (100, 100, 100)
         chosen, tried = floors, []
         # The clean ladder step's own measurement, when a microphone is in use.
@@ -408,11 +473,9 @@ class Tuner:
 
     def run(self):
         self.started = self.machine.now()
-        start = 0
         for index, level in enumerate(self.levels, 1):
             self.level_index = index
-            result = self.level(level, start)
-            start = result["rung"] if result["clean"] else 0
+            self.level(level)
         return build_table(self.results)
 
 
@@ -710,7 +773,8 @@ def run(a, levels, ladder, stop):
         writer = csv.writer(fh)
         writer.writerow(COLUMNS)
         preset = PRESETS[getattr(a, "preset", "full")]
-        tuner = Tuner(hw, levels, ladder, report, writer, step_s=a.step, judge_s=a.judge,
+        tuner = Tuner(hw, levels, ladder, report, writer, settle_s=a.settle, settle_max_s=a.settle_max,
+                      soak_s=a.soak, judge_s=a.judge,
                       rebalance=() if getattr(a, "no_rebalance", False) else preset["rebalance"],
                       warmup_s=a.warmup, max_s=a.max_minutes * 60)
         try:
@@ -742,8 +806,9 @@ def run(a, levels, ladder, stop):
             proposal = dict(version=1, source="tools/autotune.py", preset=getattr(a, "preset", "full"),
                             created=datetime.now(timezone.utc).isoformat(timespec="seconds"),
                             table=table, levels=tuner.results, steps=tuner.steps,
-                            ladder=[list(f) for f in tuner.ladder], step_s=a.step, judge_s=a.judge,
-                            stall_limit=STALL_LIMIT, log=out.name)
+                            ladder=[list(f) for f in tuner.ladder], method="quiet-first, heat-soaked",
+                            settle_s=a.settle, settle_max_s=a.settle_max, soak_s=a.soak, judge_s=a.judge,
+                            settle_slope=SETTLE_SLOPE, stall_limit=STALL_LIMIT, log=out.name)
             atomic_json(model_out, proposal)
             report("proposal", "Proposed table saved to %s" % model_out, table=table, levels=tuner.results,
                    path=str(model_out), log=str(out))
@@ -792,11 +857,15 @@ def check_load(a, levels, stop):
 def plan(a, levels, ladder):
     preset = PRESETS[a.preset]
     print("Preset: %s (about %s minutes, loud)." % (a.preset, preset["minutes"]))
-    print("Levels (hottest first): " + ", ".join("GPU %g W + %d CPU threads" % (lv.gpu_w, lv.cpu_threads)
+    print("Levels (coolest first): " + ", ".join("GPU %g W + %d CPU threads" % (lv.gpu_w, lv.cpu_threads)
                                                   for lv in levels))
-    print("Fan ladder (cpu/gpu/middle %), loud to quiet: " + "  ".join("%d/%d/%d" % f for f in ladder))
-    print("Each step %d s, judged on the last %d s; first level warms up %d s; stops after %d minutes."
-          % (a.step, a.judge, a.warmup, a.max_minutes))
+    print("Fan ladder (cpu/gpu/middle %), climbed from quiet to loud: "
+          + "  ".join("%d/%d/%d" % f for f in reversed(ladder)))
+    print("Each level starts at the quietest floors and soaks up to %d s until the board and memory "
+          "temperatures change by at most %.1f C/min; a stall raises the floors one step." % (a.soak, SETTLE_SLOPE))
+    print("Steps settle %d-%d s, then are judged on the next %d s%s; stops after %d minutes."
+          % (a.settle, a.settle_max, a.judge, "; first level warms up %d s" % a.warmup if a.warmup else "",
+             a.max_minutes))
     print("Limits: CPU %(cpu_c)d C, GPU %(gpu_c)d C, board %(board_c)d C; mains power; Performance profile."
           % LIMITS)
     print("Stall rule: mean above %.1f/s on the internal counter, or any USB drop%s." % (
@@ -821,14 +890,16 @@ def plan(a, levels, ladder):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--preset", choices=sorted(PRESETS), default="full",
-                    help="full (about 60-110 min) or quick (about 20-40 min); sets the defaults below")
+                    help="full (about 60-120 min) or quick (about 30-50 min); sets the defaults below")
     ap.add_argument("--levels", help="GPU watts:CPU threads, comma separated (full: %s; quick: %s)"
                     % (LEVELS, PRESETS["quick"]["levels"]))
-    ap.add_argument("--ladder", help="fan floors loud to quiet, cpu,gpu,mid;... (default: the preset's ladder)")
-    ap.add_argument("--step", type=int, help="seconds per fan combination (full 180, quick 120)")
-    ap.add_argument("--judge", type=int, help="judge each step on its last N seconds (full 120, quick 90)")
-    ap.add_argument("--warmup", type=int, help="seconds of heat before the first step (full 120, quick 60)")
-    ap.add_argument("--max-minutes", type=int, help="stop if the run takes longer (full 150, quick 50)")
+    ap.add_argument("--ladder", help="fan floors written loud to quiet, cpu,gpu,mid;... and climbed from the quiet end (default: the preset's ladder)")
+    ap.add_argument("--settle", type=int, help="minimum seconds a fan mix settles before judging (full 180, quick 120)")
+    ap.add_argument("--settle-max", type=int, help="longest settling while temperatures move (full 360, quick 240)")
+    ap.add_argument("--soak", type=int, help="longest heat soak at a level's quietest floors (full 720, quick 480)")
+    ap.add_argument("--judge", type=int, help="judge each step on the next N seconds (full 120, quick 90)")
+    ap.add_argument("--warmup", type=int, help="extra seconds of heat before the first level (default 0)")
+    ap.add_argument("--max-minutes", type=int, help="stop if the run takes longer (full 180, quick 75)")
     ap.add_argument("--usb", default="Volt 2", help="ALSA card name of the USB audio interface")
     ap.add_argument("--no-usb", dest="usb", action="store_const", const="", help="do not measure USB drops")
     ap.add_argument("--out", default=str(core.log_dir() / time.strftime("autotune-%Y%m%d-%H%M.csv")))
@@ -844,7 +915,7 @@ def main(argv=None):
     mode.add_argument("--check-load", type=int, metavar="SECONDS", help="hold each level; fans untouched")
     a = ap.parse_args(argv)
     preset = PRESETS[a.preset]
-    for key in ("levels", "step", "judge", "warmup", "max_minutes"):
+    for key in ("levels", "settle", "settle_max", "soak", "judge", "warmup", "max_minutes"):
         if getattr(a, key) is None:          # explicit options win over the preset
             setattr(a, key, preset[key])
     try:
@@ -852,8 +923,10 @@ def main(argv=None):
         ladder = parse_ladder(a.ladder) if a.ladder else check_ladder(preset["ladder"])
     except ValueError as exc:
         ap.error(str(exc))
-    if not PERIOD <= a.judge <= a.step or a.warmup < 0 or a.max_minutes <= 0:
-        ap.error("need 2 <= --judge <= --step, --warmup >= 0 and a positive --max-minutes")
+    if (a.judge < PERIOD or not 0 < a.settle <= a.settle_max <= a.soak or a.warmup < 0
+            or a.max_minutes <= 0):
+        ap.error("need --judge >= 2, 0 < --settle <= --settle-max <= --soak, --warmup >= 0 "
+                 "and a positive --max-minutes")
     if a.check_load is not None and a.check_load < 2 * PERIOD:
         ap.error("--check-load needs at least 4 seconds")
     if a.plan:

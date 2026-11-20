@@ -5,6 +5,7 @@ import csv
 import importlib.util
 import io
 import json
+import math
 from pathlib import Path
 import sys
 import tempfile
@@ -68,7 +69,9 @@ class FakeMachine:
 def tuner(machine, levels="160:4,120:3,80:2,40:2", events=None, ladder=at.LADDER, **kw):
     events = events if events is not None else []
     kw.setdefault("rebalance", ())     # the ladder alone; QuieterMixTest turns the search on
-    kw.setdefault("warmup_s", 0)
+    for key, value in (("warmup_s", 0), ("settle_s", 120), ("settle_max_s", 240), ("soak_s", 480),
+                       ("judge_s", 120)):
+        kw.setdefault(key, value)
     out = io.StringIO()
     t = at.Tuner(machine, at.parse_levels(levels), ladder,
                  lambda kind, message, **v: events.append(dict(kind=kind, message=message, **v)),
@@ -79,17 +82,21 @@ def tuner(machine, levels="160:4,120:3,80:2,40:2", events=None, ladder=at.LADDER
 
 
 class SteppingTest(unittest.TestCase):
-    def test_descends_to_first_stall_per_level_and_builds_table(self):
+    def test_climbs_from_quiet_per_level_and_builds_table(self):
         m = FakeMachine({160: 300, 120: 260, 80: 215, 40: 0})
         events = []
         t = tuner(m, events=events)
         table = t.run()
-        floors = [r["floors"] for r in t.results]
-        self.assertEqual(floors, [[75, 75, 75], [60, 60, 70], [35, 40, 70], [0, 0, 0]])
-        # Each cooler level starts at the hotter level's clean rung, never above it.
-        self.assertEqual([s["rung"] for s in t.steps if s["level"] == 2][0], 3)
-        self.assertEqual([s["stalled"] for s in t.steps if s["level"] == 1],
-                         [False, False, False, False, True])
+        self.assertEqual([lv.gpu_w for lv in t.levels], [40, 80, 120, 160], "coolest first")
+        self.assertEqual([r["floors"] for r in t.results], [[0, 0, 0], [35, 40, 70], [60, 60, 70], [75, 75, 75]])
+        for level in (1, 2, 3, 4):
+            steps = [s for s in t.steps if s["level"] == level]
+            # Each level soaks at the quietest floors first, then only ever goes louder.
+            self.assertEqual((steps[0]["floors"], steps[0]["soak"]), ([0, 0, 0], True))
+            self.assertFalse(any(s["soak"] for s in steps[1:]))
+            rungs = [s["rung"] for s in steps]
+            self.assertEqual(rungs, list(range(len(at.LADDER) - 1, len(at.LADDER) - 1 - len(rungs), -1)))
+            self.assertEqual([s["stalled"] for s in steps], [True] * (len(steps) - 1) + [False])
         self.assertEqual(table, [{"min_gpu_w": 0, "floors": [0, 0, 0]},
                                  {"min_gpu_w": 35, "floors": [35, 40, 70]},
                                  {"min_gpu_w": 75, "floors": [60, 60, 70]},
@@ -103,6 +110,7 @@ class SteppingTest(unittest.TestCase):
         self.assertEqual(kinds.count("level-result"), 4)
         self.assertEqual(kinds.count("result"), len(t.steps))
         self.assertTrue(all(0 <= e["progress"] <= 1 for e in events if e["kind"] == "sample"))
+        self.assertEqual({e["phase"] for e in events if e["kind"] == "sample"}, {"soak", "settle", "judge"})
         rows = list(csv.reader(io.StringIO(t.csv.getvalue())))
         self.assertEqual(len(rows), sum(1 for e in events if e["kind"] == "sample"))
 
@@ -110,30 +118,32 @@ class SteppingTest(unittest.TestCase):
         m = FakeMachine({160: 300, 40: 0})
         t = tuner(m, "160:4,40:2")
         t.run()
-        stall = m.log.index(("floors", (70, 70, 75)))
-        # Right after the stalling step: the last clean floors, then the load stops.
-        self.assertEqual(m.log[stall + 1:stall + 3], [("floors", (75, 75, 75)), ("stop",)])
-        self.assertEqual(m.log[stall + 3], ("start", 40.0))
+        hot = m.log.index(("start", 160.0))
+        # The cooler level ends on its clean floors, then its load stops before the next one starts.
+        self.assertEqual(m.log[hot - 2:hot], [("floors", (0, 0, 0)), ("stop",)])
+        self.assertEqual(m.log[hot + 1], ("floors", (0, 0, 0)), "and the next level starts quiet again")
+        self.assertEqual(m.log[-2:], [("floors", (75, 75, 75)), ("stop",)])
 
-    def test_clean_steps_take_the_full_step_and_stalls_end_early(self):
+    def test_steps_settle_then_judge_and_stalls_are_decided_while_settling(self):
         m = FakeMachine({160: 300})
         t = tuner(m, "160:4")
         t.run()
-        clean, stalled = t.steps[0], t.steps[-1]
-        self.assertEqual(clean["samples"], 60)          # last 120 s of 180, every 2 s
-        self.assertFalse(clean["early"])
+        stalled, clean = t.steps[0], t.steps[-1]
         self.assertTrue(stalled["stalled"] and stalled["early"])
-        self.assertLess(stalled["samples"], 10)         # 8 stalls/s settles it within seconds
-        self.assertEqual(stalled["mean"], 8.0)
+        self.assertEqual((stalled["settle_s"], stalled["samples"], stalled["mean"]), (120, 60, 8.0),
+                         "stalling and not cooling after the minimum settle: no judged window needed")
+        self.assertFalse(clean["stalled"] or clean["early"])
+        self.assertEqual((clean["settle_s"], clean["settled"], clean["samples"]), (120, True, 60),
+                         "a steady board settles at the minimum, then the next 120 s are judged")
 
     def test_one_usb_drop_in_the_judged_part_is_a_stall(self):
         m = FakeMachine({160: 0})
-        m.usb_at = {100.0}                              # inside the first step's judged window
+        m.usb_at = {150.0}                              # inside the first step's judged window
         t = tuner(m, "160:4")
         t.run()
-        self.assertTrue(t.steps[0]["stalled"])
+        self.assertTrue(t.steps[0]["stalled"] and t.steps[0]["early"])
         self.assertEqual(t.steps[0]["usb_drops"], 1)
-        self.assertTrue(t.steps[0]["early"])
+        self.assertEqual(t.results[0]["floors"], [0, 0, 50], "the next louder step is clean")
 
     def test_usb_drop_while_settling_is_not_judged(self):
         m = FakeMachine({160: 0})
@@ -149,21 +159,12 @@ class SteppingTest(unittest.TestCase):
         self.assertFalse(at.stall_certain(window[:30], 60))
         self.assertTrue(at.stall_certain([dict(stalls_per_s=62.0, usb_drops=0)], 60))
 
-    def test_first_combination_stalls_goes_louder(self):
-        m = FakeMachine({160: 300, 120: 330})
-        t = tuner(m, "160:4,120:3")
-        t.run()
-        second = [s for s in t.steps if s["level"] == 2]
-        self.assertEqual([s["rung"] for s in second], [3, 2, 1])
-        self.assertEqual(t.results[1]["floors"], [90, 90, 90])
-        # Floors never fall as power rises: the hotter row takes the louder result too.
-        self.assertEqual(at.build_table(t.results)[-1]["floors"], [90, 90, 90])
-
     def test_never_clean_uses_full_fans(self):
         m = FakeMachine({160: 1000})
         t = tuner(m, "160:4")
         table = t.run()
         self.assertFalse(t.results[0]["clean"])
+        self.assertEqual(len(t.steps), len(at.LADDER))
         self.assertEqual(table, [{"min_gpu_w": 0, "floors": [100, 100, 100]}])
         self.assertEqual(m.log[-2], ("floors", (100, 100, 100)))
 
@@ -187,6 +188,100 @@ class MiddleHeavyMachine(FakeMachine):
         return s
 
 
+class ThermalMachine(FakeMachine):
+    """The board relaxes toward an equilibrium set by heat and airflow (time constant `tau`) and the
+    chipset stalls above 70 C. Each fan runs at the higher of the saved curve's speed for the level
+    and its floor; the middle fan counts double. The saved curve runs the fans fast only when the
+    GPU is hot, so light load with quiet floors heats the board more than heavy load does."""
+    STALL_C = 70.0
+    BASE = {40: (20, 20, 30), 80: (30, 30, 40), 150: (90, 95, 95)}
+    HEAT = {40: 45, 80: 80, 150: 120}
+
+    def __init__(self, board=50.0, tau=180.0):
+        super().__init__({})
+        self.board, self.tau = board, tau
+
+    def equilibrium(self):
+        if self.level is None or self.floors is None:
+            return 45.0
+        c, g, m = (max(b, f) for b, f in zip(self.BASE[self.level.gpu_w], self.floors))
+        return 40 + self.HEAT[self.level.gpu_w] - 0.25 * (c + g + 2 * m)
+
+    def wait(self, seconds):
+        target = self.equilibrium()
+        self.board = target + (self.board - target) * math.exp(-seconds / self.tau)
+        return super().wait(seconds)
+
+    def sample(self):
+        s = dict(stalls_per_s=8.0 if self.board > self.STALL_C else 0.03, usb_drops=0, cpu_w=40.0,
+                 gpu_w=(self.level.gpu_w - 1) if self.level else 15.0, gpu_c=70, cpu_c=80,
+                 board_c=round(self.board, 2), dimm_a_c=round(self.board - 3, 2), profile="performance",
+                 ac=True, cpu_rpm=4000, gpu_rpm=4200, mid_rpm=5000)
+        s.update(self.override(self))
+        return s
+
+
+class HeatSoakTest(unittest.TestCase):
+    def quick(self, machine, **kw):
+        q = at.PRESETS["quick"]
+        kw = dict(dict(ladder=q["ladder"], settle_s=q["settle"], settle_max_s=q["settle_max"],
+                       soak_s=q["soak"], judge_s=q["judge"], rebalance=q["rebalance"]), **kw)
+        return tuner(machine, q["levels"], **kw)
+
+    def test_light_load_needs_more_than_heavy(self):
+        """The case the first quick run (2026-11-20) missed: heavy load is clean at 0 % floors because
+        the saved curve already runs the fans fast, while light load stalls once the board has
+        heated up with slow fans."""
+        m = ThermalMachine()
+        t = self.quick(m)
+        table = t.run()
+        r40, r80, r150 = t.results
+        self.assertEqual((r40["floors"], r150["floors"]), ([0, 0, 0], [0, 0, 0]))
+        self.assertGreaterEqual(r80["floors"][2], 60, "light load needs the middle fan")
+        quiet80 = [s for s in t.steps if s["level"] == 2][0]
+        self.assertTrue(quiet80["soak"] and quiet80["stalled"],
+                        "the heat soak at quiet floors finds the light-load stall")
+        # Floors never fall as power rises: the heavy row keeps the light-load floors.
+        self.assertEqual(table, [{"min_gpu_w": 0, "floors": [0, 0, 0]},
+                                 {"min_gpu_w": 35, "floors": r80["floors"]}])
+        self.assertLess(m.clock / 60, 50, "the quick run's estimate (about 30-50 minutes)")
+
+    def test_cooling_stalls_are_not_decided_early(self):
+        m = ThermalMachine()
+        t = self.quick(m, rebalance=())
+        t.run()
+        cleared = [s for s in t.steps if s["level"] == 2][-1]
+        self.assertEqual(cleared["floors"], [50, 50, 70])
+        self.assertFalse(cleared["stalled"] or cleared["early"],
+                         "stalls left over from the quieter step fade while the board cools")
+
+    def test_soak_waits_for_the_board_to_settle(self):
+        m = ThermalMachine()
+        t = tuner(m, "40:2", ladder=at.QUICK_LADDER)
+        t.run()
+        soak = t.steps[0]
+        self.assertTrue(soak["settled"])
+        self.assertTrue(300 < soak["settle_s"] < 480, soak["settle_s"])
+        self.assertLessEqual(abs(soak["board_slope"]), at.SETTLE_SLOPE)
+
+    def test_soak_limit(self):
+        m = ThermalMachine(board=20.0, tau=3000.0)       # still heating at about 0.8 C/min after 8 min
+        t = tuner(m, "40:2", ladder=at.QUICK_LADDER)
+        t.run()
+        self.assertEqual((t.steps[0]["settle_s"], t.steps[0]["settled"]), (480, False),
+                         "a board still heating at the limit is judged anyway")
+
+    def test_settling_helpers(self):
+        flat = [(t, dict(board_c=60.0, dimm_a_c=None)) for t in range(0, 122, 2)]
+        self.assertTrue(at.settled(flat))
+        rising = [(t, dict(board_c=50 + t / 60, dimm_a_c=40.0)) for t in range(0, 122, 2)]
+        self.assertFalse(at.settled(rising), "1 C/min is still heating")
+        falling = [(t, dict(board_c=60 - t / 60)) for t in range(0, 122, 2)]
+        self.assertTrue(at.cooling(falling))
+        self.assertFalse(at.settled([(t, dict(board_c=60.0)) for t in range(0, 40, 2)]), "too short to tell")
+        self.assertFalse(at.settled([(t, {}) for t in range(0, 122, 2)]), "no board sensor: not settled")
+
+
 class QuieterMixTest(unittest.TestCase):
     def test_noise_score(self):
         self.assertEqual(at.NOISE_WEIGHTS, (1, 1, 2), "taken from the service's noise_weights")
@@ -208,7 +303,7 @@ class QuieterMixTest(unittest.TestCase):
         events = []
         t = tuner(m, "160:4,120:3,40:2", events=events, rebalance=at.REBALANCE)
         table = t.run()
-        r160, r120, r40 = t.results
+        r40, r120, r160 = t.results
         self.assertEqual((r160["floors"], r160["rebalanced"]), ([35, 40, 70], False))
         self.assertEqual([x["stalled"] for x in r160["tried"]], [True])
         self.assertEqual((r120["floors"], r120["ladder_floors"], r120["rebalanced"]),
@@ -223,8 +318,8 @@ class QuieterMixTest(unittest.TestCase):
                                  {"min_gpu_w": 35, "floors": [45, 50, 60]},
                                  {"min_gpu_w": 115, "floors": [45, 50, 70]}])
         fand.validate_table(table)
-        # A cooler level still starts from the hotter level's clean ladder rung.
-        self.assertEqual([s["rung"] for s in t.steps if s["level"] == 2][0], r160["rung"])
+        # Every level starts again at the quietest floors.
+        self.assertEqual([s["rung"] for s in t.steps if s["level"] == 3][0], len(at.LADDER) - 1)
         mixes = [s for s in t.steps if s["mix"]]
         self.assertEqual(len(mixes), 3)
         self.assertTrue(all(s["name"].startswith("Level") and "quieter mix" in s["name"] for s in mixes))
@@ -307,40 +402,31 @@ class QuieterMixTest(unittest.TestCase):
         self.assertTrue(set(at.QUICK_LADDER) <= set(at.LADDER) | {(100, 100, 100)},
                         "quick steps are full-ladder steps, so both runs compare")
         quick = at.PRESETS["quick"]
-        self.assertEqual([lv.gpu_w for lv in at.parse_levels(quick["levels"])], [150, 80, 40],
-                         "a low level keeps idle quiet: the coolest level's floors start at 0 W")
+        self.assertEqual([lv.gpu_w for lv in at.parse_levels(quick["levels"])], [40, 80, 150],
+                         "coolest first; a low level keeps idle quiet")
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             self.assertEqual(at.main(["--plan", "--preset", "quick"]), 0)
         text = out.getvalue()
-        self.assertIn("Preset: quick (about 20-40 minutes", text)
-        self.assertIn("Each step 120 s, judged on the last 90 s; first level warms up 60 s; stops after 50", text)
-        self.assertIn("GPU 150 W + 4 CPU threads, GPU 80 W + 2 CPU threads, GPU 40 W", text)
+        self.assertIn("Preset: quick (about 30-50 minutes", text)
+        self.assertIn("climbed from quiet to loud: 0/0/0  0/0/50", text)
+        self.assertIn("soaks up to 480 s", text)
+        self.assertIn("Steps settle 120-240 s, then are judged on the next 90 s; stops after 75 minutes", text)
+        self.assertIn("GPU 40 W + 2 CPU threads, GPU 80 W + 2 CPU threads, GPU 150 W", text)
         self.assertIn("move 10 points from the middle fan", text)
         self.assertIn("up to 1 extra step per level", text)
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            self.assertEqual(at.main(["--plan", "--preset", "quick", "--step", "150", "--levels", "100:2"]), 0)
-        self.assertIn("Each step 150 s, judged on the last 90 s", out.getvalue(), "explicit options win")
-        self.assertIn("Levels (hottest first): GPU 100 W + 2 CPU threads", out.getvalue())
+            self.assertEqual(at.main(["--plan", "--preset", "quick", "--settle", "150", "--levels", "100:2"]), 0)
+        self.assertIn("Steps settle 150-240 s", out.getvalue(), "explicit options win")
+        self.assertIn("Levels (coolest first): GPU 100 W + 2 CPU threads", out.getvalue())
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             self.assertEqual(at.main(["--plan"]), 0)
-        self.assertIn("Preset: full (about 60-110 minutes", out.getvalue())
-        self.assertIn("Each step 180 s, judged on the last 120 s; first level warms up 120 s; stops after 150",
-                      out.getvalue())
-
-    def test_quick_run_estimate(self):
-        """With the 2026-11-16 thresholds (heavy needs about 80/80/80 or more, light 70 % middle), a quick
-        run takes well under its 50-minute bound."""
-        m = MiddleHeavyMachine({150: 380, 80: 260, 40: 140})
-        quick = at.PRESETS["quick"]
-        t = tuner(m, quick["levels"], ladder=quick["ladder"], step_s=quick["step"], judge_s=quick["judge"],
-                  warmup_s=quick["warmup"], rebalance=quick["rebalance"])
-        table = t.run()
-        self.assertLess(m.clock / 60, 40)
-        self.assertEqual([r["floors"] for r in t.results], [[80, 80, 80], [60, 60, 60], [10, 10, 40]])
-        self.assertEqual(table[0], {"min_gpu_w": 0, "floors": [10, 10, 40]})
+        self.assertIn("Preset: full (about 60-120 minutes", out.getvalue())
+        self.assertIn("Steps settle 180-360 s, then are judged on the next 120 s; stops after 180", out.getvalue())
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            at.main(["--plan", "--settle", "300", "--settle-max", "200"])
 
 
 class SafetyTest(unittest.TestCase):
@@ -377,7 +463,7 @@ class SafetyTest(unittest.TestCase):
 
     def test_time_limit(self):
         with self.assertRaisesRegex(at.SafetyStop, "longer than 10 minutes"):
-            tuner(FakeMachine({160: 0}), "160:4", max_s=600).run()
+            tuner(FakeMachine({160: 1000}), "160:4", max_s=600).run()
 
 
 class TableAndInputTest(unittest.TestCase):
@@ -388,7 +474,7 @@ class TableAndInputTest(unittest.TestCase):
                                                    {"min_gpu_w": 75, "floors": [60, 60, 70]}])
 
     def test_levels_and_ladder(self):
-        self.assertEqual([lv.gpu_w for lv in at.parse_levels("40:2,160:4")], [160, 40])
+        self.assertEqual([lv.gpu_w for lv in at.parse_levels("160:4,40:2")], [40, 160])
         for bad in ("", "160", "160:4,160:2", "300:4", "160:-1", "a:b"):
             with self.subTest(levels=bad), self.assertRaises(ValueError):
                 at.parse_levels(bad)
@@ -520,8 +606,8 @@ class RunLifecycleTest(unittest.TestCase):
         self.addCleanup(stack.close)
         tmp = Path(stack.enter_context(tempfile.TemporaryDirectory()))
         self.out = tmp / "logs" / "autotune.csv"
-        self.args = argparse.Namespace(out=str(self.out), model_out=None, step=20, judge=10, warmup=4,
-                                       max_minutes=60, usb="Volt 2", panel_json=True)
+        self.args = argparse.Namespace(out=str(self.out), model_out=None, settle=20, settle_max=30, soak=40,
+                                       judge=10, warmup=4, max_minutes=60, usb="Volt 2", panel_json=True)
         self.saved = ({f: [(40, 0)] * 8 for f in at.FANS}, dict.fromkeys(at.FANS, True))
         FakeHardware.instances = []
         stack.enter_context(patch.object(at, "Hardware", FakeHardware))
@@ -556,7 +642,7 @@ class RunLifecycleTest(unittest.TestCase):
         with self.out.open() as f:
             rows = list(csv.DictReader(f))
         self.assertEqual(list(rows[0]), list(at.COLUMNS))
-        self.assertEqual({r["phase"] for r in rows}, {"warmup", "settle", "judge"})
+        self.assertEqual({r["phase"] for r in rows}, {"warmup", "soak", "settle", "judge"})
         proposal = json.loads(self.out.with_suffix(".model.json").read_text())
         self.assertEqual(proposal["table"], table)
         self.assertEqual(proposal["preset"], "full", "a namespace without a preset is a full run")

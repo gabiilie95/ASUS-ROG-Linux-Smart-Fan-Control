@@ -242,7 +242,7 @@ def autotune_tests(w):
     w.tabs.setCurrentIndex(4)
     cal.preset.setCurrentText(fan_calibration.AUTOTUNE)
     check(not cal.form.isRowVisible(cal.seconds) and not cal.form.isRowVisible(cal.custom)
-          and "60-110" in cal.description.text(), "auto-tune hides step settings and explains the run")
+          and "60-120" in cal.description.text(), "auto-tune hides step settings and explains the run")
     with patch.object(core, "log_dir", return_value=logs):
         cal.start.click()
     check("autotune.py" in cal.message.text() and "--panel-json" in cal.message.text() and cal.process is None,
@@ -506,7 +506,7 @@ def overview_tests(w):
         check(w.tabs.currentWidget() is w.cal_scroll and cal.preset.currentText() == fan_calibration.QUICK_AUTOTUNE
               and requests == ["off"] and cal.mode_timer.isActive(), "setup start: asks, then requests Off")
         check(wait_for(lambda: not cal.mode_timer.isActive(), 3000) and begin.call_args.kwargs == dict(confirmed=True)
-              and cal.restore_mode == "auto" and "about 20-40 minutes" in box.question.call_args.args[2]
+              and cal.restore_mode == "auto" and "about 30-50 minutes" in box.question.call_args.args[2]
               and "switches to Off" in box.question.call_args.args[2], "setup start: begins once Off is acknowledged")
         cal.give_back_mode()
         check(requests == ["off", "auto"] and cal.restore_mode is None, "the previous mode comes back after the run")
@@ -521,11 +521,41 @@ def overview_tests(w):
         card.startRequested.emit("full")
         check(wait_for(lambda: not cal.mode_timer.isActive(), 3000) and requests == ["off", "auto"]
               and "did not switch to Off" in cal.message.text(), "no acknowledgement: not started, mode given back")
+    # ---- Start session in the Calibrate tab switches to Off the same way (after a stopped run too) ----
+    state["off"] = False
+    requests.clear()
+    box.question.reset_mock()
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(patch.object(core, "fan_service", return_value=("Running", sample)))
+        stack.enter_context(patch.object(core, "request_fan_mode", side_effect=request))
+        stack.enter_context(patch.object(core, "manual_fan_problem",
+                                         side_effect=lambda *a: None if state["off"] else "Set Off first"))
+        stack.enter_context(patch.object(fan_calibration, "QMessageBox", box))
+        begin = stack.enter_context(patch.object(cal, "begin", return_value=True))
+        cal.preset.setCurrentText(fan_calibration.QUICK_AUTOTUNE)
+        cal.start.click()
+        check(requests == ["off"] and wait_for(lambda: not cal.mode_timer.isActive(), 3000)
+              and begin.call_args.kwargs == dict(confirmed=True) and "30-50" in box.question.call_args.args[2],
+              "Start session: auto-tune switches to Off itself instead of refusing")
+        cal.give_back_mode()
+        state["off"] = False
+        requests.clear()
+        cal.preset.setCurrentText("Heavy")
+        cal.start.click()
+        check(box.question.call_args.args[1] == "Set the fan service to Off?" and requests == ["off"]
+              and wait_for(lambda: not cal.mode_timer.isActive(), 3000) and cal.restore_mode == "auto",
+              "Start session: a stepped run asks, switches to Off and will give the mode back")
+        cal.give_back_mode()
+        requests.clear()
+        begin.reset_mock()
+        cal.preset.setCurrentText("Observe")
+        cal.start.click()
+        check(requests == [] and begin.call_count == 1, "Observe leaves the fan service alone")
     cal.dry_run = True
     with patch.object(core, "log_dir", return_value=Path(OUT) / "logs"):
         cal.preset.setCurrentText(fan_calibration.QUICK_AUTOTUNE)
         cal.start.click()
-    check("--preset quick" in cal.message.text() and "20-40" in cal.description.text(),
+    check("--preset quick" in cal.message.text() and "30-50" in cal.description.text(),
           "Calibrate tab: quick auto-tune passes its preset")
     check(core.model_command([{"min_gpu_w": 0, "floors": [0, 0, 0]}], "quick")[-2:] == ["--model-preset", "quick"],
           "the written model records which run produced it")
@@ -1093,6 +1123,45 @@ def main():
     check(("--fan cpu --data " + exp) in txt, "apply sends exact stored cpu curve: " + exp)
     check("--mod-profile %s" % w.ed_prof in txt and "--enable-fan-curves true" in txt, "apply includes profile and enable command")
     screenshot(w, "5-after-apply.png")
+
+    # ---- curves the fan service or a calibration owns are locked, with the reason shown ----
+    profile = w.ed_prof
+    managed = fand_sample(profiles=["performance", "balanced", "quiet"])
+    with patch.object(core, "fan_service", return_value=("Running", managed)):
+        w.ed_prof = "performance"
+        w.apply_locks()
+        check(not w.apply_btns["cpu"].isEnabled() and not w.apply_all.isEnabled()
+              and w.curve_lock.isVisibleTo(w) and "manages the Performance curve" in w.curve_lock.text()
+              and not w.preset_buttons["max"].isEnabled() and not w.preset_lock.isHidden(),
+              "Performance: apply and fan presets locked while the fan service manages it")
+        w.out.setPlainText("")
+        w.act_many([("fan-curve", {"profile": "performance", "fan": "cpu", "points": w.send_pts("cpu")}, None)])
+        check("manages the Performance curve" in w.out.toPlainText() and not w.acting,
+              "a locked apply is refused even if requested directly")
+        res = q.run_one("fan-preset", {"preset": "max"}, True)
+        check(res.get("ok") is False and "manages the Performance curve" in res.get("error", ""),
+              "the shared action code (web panel too) refuses a locked apply")
+        w.set_busy(True)
+        w.set_busy(False)
+        check(not w.apply_btns["cpu"].isEnabled(), "finishing another action keeps the lock")
+        w.ed_prof = "balanced"
+        w.apply_locks()
+        check(w.apply_btns["cpu"].isEnabled() and not w.curve_lock.isVisibleTo(w),
+              "Balanced stays editable while the service is not raising it")
+    raising = fand_sample(profiles=["performance", "balanced"], floors=dict(cpu=0, gpu=20, mid=40),
+                          sensors=dict(managed["sensors"], profile="balanced"))
+    with patch.object(core, "fan_service", return_value=("Running", raising)):
+        w.apply_locks()
+        check(not w.apply_btns["cpu"].isEnabled() and "raising the Balanced curve" in w.curve_lock.text(),
+              "Balanced is locked while the service raises it")
+    with patch.object(core, "fan_service", return_value=("Running", dict(managed, manual_control=True))):
+        w.ed_prof = "quiet"
+        w.apply_locks()
+        check(not w.apply_btns["cpu"].isEnabled() and "calibration run owns" in w.curve_lock.text(),
+              "every profile is locked while a calibration owns the fans")
+    w.ed_prof = profile
+    w.apply_locks()
+    check(w.apply_btns["cpu"].isEnabled() and w.preset_buttons["max"].isEnabled(), "unlocked again without the service")
 
     # ---- custom preset save/delete through the shared code path (writes then removes ui/custom-presets.json)
     existed = os.path.exists(core.PRESET_FILE)
