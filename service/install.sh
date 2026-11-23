@@ -6,8 +6,9 @@ app=/usr/local/lib/rog-fand
 etc=/etc/rog-fand
 state=/var/lib/rog-fand
 unit=/etc/systemd/system/rog-fand.service
+usb_audio_conf=/etc/modprobe.d/rog-fand-usb-audio.conf   # written only by the panel's Keep on
 launcher=/usr/local/share/applications/rog-panel-qt.desktop
-panel_files=(ui/{rog-panel-qt,rogcore,fan_auto,fan_calibration,fan_tray,panel_settings,sensor_scan,charts,calibration_card}.py
+panel_files=(ui/{rog-panel-qt,rogcore,fan_auto,fan_calibration,fan_tray,panel_settings,sensor_scan,charts,calibration_card,usb_fix}.py
              tools/{fan-calibrate,fan_analysis,stall-counter,autotune,gpuload,noise_meter}.py tools/loadgen.c
              tools/fans-{balanced,max,mid-max,original,ramped}.sh
              tools/jellyfin-software-ui.sh root-tests/{setup-cool-performance,usb-drop-count}.sh
@@ -54,7 +55,7 @@ case "${1:-}" in
                 echo "note: $desk_home/.local/share/applications/rog-panel-qt.desktop hides the installed" \
                      "launcher in the menu; remove it to use the installed panel." >&2
             fi
-            for file in rog_fand.py rog_sensors.py rog_update.py config.example.json; do
+            for file in rog_fand.py rog_sensors.py rog_update.py rog_usbaudio.py config.example.json; do
                 copy_atomic "$src/$file" "$app/$file"
             done
             if [[ ! -e $etc/config.json ]]; then
@@ -96,7 +97,12 @@ PY
             if [[ -f $unit ]]; then systemctl disable rog-fand.service; fi
             for file in "${panel_files[@]}"; do rm -f -- "$app/$file"; done
             rm -f -- "$launcher" "$unit" "$app/rog_fand.py" "$app/rog_sensors.py" "$app/rog_update.py" \
-                  "$app/config.example.json" "$app/VERSION"
+                  "$app/rog_usbaudio.py" "$app/config.example.json" "$app/VERSION"
+            if [[ -f $usb_audio_conf ]]; then
+                rm -f -- "$usb_audio_conf"
+                echo "note: removed the USB audio driver fix ($usb_audio_conf); the driver keeps it" \
+                     "until the next restart." >&2
+            fi
             rm -rf -- "$state/update"
             rm -f -- "$etc/config.json" "$etc/model.json" "$state/state.json"
             rm -f -- /var/log/rog-fand/*.csv /run/rog-fand/mode /run/rog-fand/status.json

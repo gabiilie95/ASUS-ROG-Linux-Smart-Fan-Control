@@ -16,6 +16,7 @@ from fan_auto import AutoTab, heading
 from fan_calibration import CalibrateTab
 from fan_tray import FanTray
 from panel_settings import PanelSettings, SettingsTab, Updater
+from usb_fix import UsbFixCard
 
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, Qt, Signal, QPointF, QRectF  # noqa: E402
 from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPen, QPolygonF  # noqa: E402
@@ -348,7 +349,8 @@ def lock_note():
     """A visible reason why some controls are locked (hidden while nothing is)."""
     l = QLabel("")
     l.setWordWrap(True)
-    l.setStyleSheet("border-left: 3px solid #388ab9; padding: 4px 8px;")
+    # Qt draws a lone border-left only after "border: 0" gives every edge a style.
+    l.setStyleSheet("border: 0; border-left: 3px solid #388ab9; padding: 4px 8px;")
     l.hide()
     return l
 
@@ -422,7 +424,7 @@ class MainWindow(QMainWindow):
         root.addWidget(self.tabs, 1)
         self.auto_tab = AutoTab(dry_run)
         self.auto_tab.timer.stop()   # status timers run only while the window is shown
-        self.cal_tab = CalibrateTab(dry_run, lambda: self.acting)
+        self.cal_tab = CalibrateTab(dry_run, lambda: self.acting or self.usb_fix.busy())
         self.close_after_calibration = False
         self.cal_tab.runningChanged.connect(self.calibration_changed)
         self.prefs = PanelSettings(self)
@@ -783,6 +785,9 @@ class MainWindow(QMainWindow):
         self.mon_chart = MonitorChart()
         bl.addWidget(self.mon_chart, 1)
         lay.addWidget(box, 2)
+        self.usb_fix = UsbFixCard(self.dry_run, self.usb_fix_blocked)
+        self.usb_fix.runningChanged.connect(lambda _running: self.background_finished())
+        lay.addWidget(self.usb_fix)
 
         box, ul = card("USB drop check")
         row = QHBoxLayout()
@@ -802,6 +807,14 @@ class MainWindow(QMainWindow):
         ul.addWidget(note_label("Percent and counts are estimates: usbmon's text interface shows only the first 5 packets of each URB."))
         lay.addWidget(box, 1)
         return w
+
+    def usb_fix_blocked(self):
+        """Why the USB audio fix cannot run now (another action owns the fans or a password dialog)."""
+        if self.cal_tab.process or self.cal_tab.mode_timer.isActive():
+            return "Wait for the calibration run to finish."
+        if self.acting or self.usb_busy:
+            return "Wait for the current panel action to finish."
+        return None
 
     def monitor_running(self):
         return self.mon_proc is not None
@@ -924,7 +937,12 @@ class MainWindow(QMainWindow):
         self.auto_tab.calibrating = running
         self.auto_tab.refresh()
         self.apply_locks()
-        if not running and self.close_after_calibration:
+        if not running:
+            self.background_finished()
+
+    def background_finished(self):
+        """Quit once a calibration run and a USB audio fix test have both put things back."""
+        if self.close_after_calibration and not self.cal_tab.process and not self.usb_fix.running:
             QTimer.singleShot(0, self.quit_app)
 
     def closeEvent(self, e):
@@ -937,11 +955,13 @@ class MainWindow(QMainWindow):
         e.setAccepted(self.quit_app())
 
     def quit_app(self):
-        """Quit now, or after a running calibration has restored the exact curve (returns False then)."""
+        """Quit now, or after a running calibration has restored the exact curve and a USB audio fix
+        test has put the device back (returns False then)."""
         self.quitting = True
-        if self.cal_tab.process:
+        if self.cal_tab.process or self.usb_fix.running:
             self.close_after_calibration = True
             self.cal_tab.stop()
+            self.usb_fix.stop()
             return False
         self.shutdown()
         self.hide()
@@ -950,6 +970,7 @@ class MainWindow(QMainWindow):
 
     def shutdown(self):
         self.auto_tab.shutdown()
+        self.usb_fix.shutdown()
         self.updater.stop()
         self.monitor_stop("Stopped.")
         if self.tray is not None:

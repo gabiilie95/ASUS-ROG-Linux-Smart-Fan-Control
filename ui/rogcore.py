@@ -786,6 +786,40 @@ def model_command(table, preset=None):
             + (["--model-preset", preset] if preset else []))
 
 
+USBAUDIO_INSTALLED = Path("/usr/local/lib/rog-fand/rog_usbaudio.py")   # the root-owned copy pkexec runs
+USBAUDIO_ACTIONS = ("try", "keep", "off", "test")
+USBAUDIO_PHASES = (120, 240)     # seconds without the fix per test (twice as long with it)
+_usbaudio = None
+
+
+def usbaudio_module():
+    """The USB audio fix helper (repository or installed copy) for reading what is set, loaded once."""
+    global _usbaudio
+    if _usbaudio is None:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("rog_usbaudio", FAND_PROGRAM.parent / "rog_usbaudio.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _usbaudio = module
+    return _usbaudio
+
+
+def usbaudio_command(action, device, phase_s=None):
+    """pkexec argv for the installed helper: try, keep or off for one device, or the A/B test."""
+    if action not in USBAUDIO_ACTIONS:
+        raise ValueError("unknown USB audio action")
+    if not isinstance(device, str) or not re.fullmatch(r"[0-9a-f]{4}:[0-9a-f]{4}", device):
+        raise ValueError("device must be vendor:product")
+    argv = ["pkexec", "/usr/bin/python3", "-IB", str(USBAUDIO_INSTALLED), action, device]
+    if action == "test":
+        if phase_s not in USBAUDIO_PHASES:
+            raise ValueError("unknown test length")
+        argv += ["--phase-s", str(phase_s)]
+    elif phase_s is not None:
+        raise ValueError("only the test takes a length")
+    return argv
+
+
 def calibration_state(path=None):
     """None while no auto-tune model is installed, else {"preset": "quick"/"full"/None (written by
     an older panel), "written": aware datetime or None, "rows": n}, or {"error": text}."""
