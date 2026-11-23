@@ -282,7 +282,8 @@ Click counting in recordings (mono 16-bit 48 kHz WAV, high-passed at 17.5 kHz fi
 - `root-tests/` – scripts that need sudo (`setup-cool-performance.sh`, `chipset-probe.sh`,
   `usb-audio-check.sh`, and two older ones)
 - `report/` – drafts for reporting this (kernel mailing list and ASUS), a redacted evidence
-  bundle, and `HOW-TO-SEND.md`. Nothing has been sent.
+  bundle, and `HOW-TO-SEND.md`. The kernel report was sent on 2026-11-16; see
+  [USB audio driver fix](#usb-audio-driver-fix-playback_urb_fixup) for the reply.
 - `data/logs/` – stall/temperature logs from the tests above
 - `data/system-config/` – copies of the tuned profile and mapping, asusd fan curves and the old
   cap unit as they were on 2026-11-16
@@ -399,6 +400,57 @@ Things to know once it is installed:
 - `/run` is cleared at boot, so the mode starts as `auto` after every reboot.
 - Install with `sudo` or `pkexec`; the installer takes the desktop user from either. Without one,
   the mode can only be changed by root.
+
+## USB audio driver fix (PLAYBACK_URB_FIXUP)
+
+A Linux USB developer answered the kernel report. The stall itself is not a known chipset
+behaviour, and better cooling is the real fix (what the fan service does). For the question about
+sending late packets instead of dropping them, he pointed at a quirk flag that Linux 7.3 added to
+the USB audio driver: `PLAYBACK_URB_FIXUP` queues the most transfers the driver allows (12) and
+submits them with `URB_ISO_ASAP`, so the USB controller starts each one as soon as it can (SIA)
+instead of in a fixed frame. He doubts it makes the dropouts inaudible: a packet whose slot was
+missed cannot be sent later. At best each dropout gets shorter.
+
+The panel's Monitor tab has a **USB audio driver fix** card to find out, per USB audio interface:
+
+- It shows whether the running kernel's driver has the flag (read from the module) and whether it
+  is set for the chosen interface: off, on until restart, or kept on at every start.
+- **Run test** (about 10 or 17 minutes, asks for the password). While your own audio plays, it
+  counts dropouts without the flag, with it for twice as long, and without it again, then puts
+  the interface back as it was. That order cancels out a temperature that drifts steadily. Run it
+  hot (a game running). The fan service switches to Off for the test, so its drop boost cannot
+  speed up the fans and hide the difference, and back afterwards. Each step reports lost audio
+  (ms per minute), dropouts per minute, their average length and the board temperature. The
+  verdict:
+
+  | Verdict | When |
+  |---|---|
+  | Helped | lost audio fell by a third or more; **Keep on** is then highlighted |
+  | No clear difference | anything in between |
+  | Worse | lost audio rose by half or more |
+  | Inconclusive | fewer than 20 dropouts without the fix, no audio reached the interface, or audio stopped for part of the test |
+
+  Listen as well: shorter dropouts can still be audible.
+- **Try until restart**; **Keep on**, which writes `/etc/modprobe.d/rog-fand-usb-audio.conf`
+  (`options snd_usb_audio quirk_flags=VID:PID:PLAYBACK_URB_FIXUP`); **Turn off**, which removes it.
+  Keep on refuses while another modprobe file or the kernel command line sets the driver's
+  `quirk_flags`, because only one setting applies. Uninstalling removes the file.
+- The driver reads quirk flags only when it binds a device, so every change reconnects the
+  interface (USB `authorized` 0, then 1). Its sound pauses for a second or two.
+
+The panel runs the root helper `service/rog_usbaudio.py` through `pkexec`. From a terminal:
+
+    python3 service/rog_usbaudio.py status                      # no root needed
+    sudo python3 -I service/rog_usbaudio.py test 2b5a:0021      # Ctrl+C stops and puts it back
+    sudo python3 -I service/rog_usbaudio.py keep 2b5a:0021      # also: try, off
+
+By hand, until restart: `echo -n 2b5a:0021:PLAYBACK_URB_FIXUP | sudo tee
+/sys/module/snd_usb_audio/parameters/quirk_flags`, then reconnect the interface. Keep `-n`: the
+driver does not strip the newline and would reject the flag's name.
+
+Checked on 2026-11-22: the status reading on the G814JZ (Linux 7.3.4 has the flag; the Volt 2 and
+the dock's audio are listed). Everything else is covered by tests against a fake sysfs tree and
+the panel's offscreen self-test. Not yet run for real: a test, Try, Keep on or Turn off.
 
 ## Settings panel
 
@@ -684,7 +736,8 @@ Native version (PySide6, launched as the desktop user):
 It does the same as the web panel (readings every 2 s, presets, Jellyfin, CPU cap, stall test, fan-curve editor with
 presets) using the same code (`ui/rogcore.py`), plus a "Monitor" tab: a live stall monitor (plays silence on the
 internal sound device while on, so the internal speakers cannot play other sound; chart of stalls/s with the board
-sensor temperature) and an on-demand "Check USB drops" (root, `pkexec`, runs `root-tests/usb-drop-count.sh`).
+sensor temperature), the [USB audio driver fix](#usb-audio-driver-fix-playback_urb_fixup) card, and an
+on-demand "Check USB drops" (root, `pkexec`, runs `root-tests/usb-drop-count.sh`).
 The web version still works unchanged. `ui/test_qt_offscreen.py` is an offscreen self-test (dry run only).
 
 Checked on 2026-11-16: page rendering and polling in a browser; every button in `--dry-run`;

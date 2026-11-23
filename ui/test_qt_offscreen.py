@@ -566,6 +566,139 @@ def overview_tests(w):
     screenshot(w, "overview.png")
 
 
+FAKE_USB_HELPER = r"""
+import json, sys
+sys.path.insert(0, sys.argv[2])
+import rog_usbaudio as ua
+def emit(e):
+    print(json.dumps(e), flush=True)
+emit(dict(kind="start", device="2b5a:0021", name="Volt 2", phases=3, total_s=540, original=False))
+emit(dict(kind="phase-start", index=1, fix=False, seconds=120, settle_s=20, elapsed=0))
+emit(dict(kind="progress", index=1, fix=False, seconds=120, phase_elapsed=10, elapsed=30, total_s=540,
+          packets=80000, lost=900, events=150))
+if sys.argv[1] == "stop":
+    for line in sys.stdin:
+        if line.strip() == "stop":
+            break
+    emit(dict(kind="cancelled", restored=False))
+    sys.exit(0)
+rows = [dict(index=1, fix=False, seconds=120, packets=960000, lost=24000, events=5040, board_c=81.2),
+        dict(index=2, fix=True, seconds=240, packets=1920000, lost=12000, events=9900, board_c=82.0),
+        dict(index=3, fix=False, seconds=120, packets=960000, lost=23000, events=4980, board_c=82.6)]
+for r in rows:
+    emit(dict(r, kind="phase"))
+emit(dict(ua.verdict(rows), kind="result", phases=rows, restored=False))
+"""
+
+
+def usb_state(**changes):
+    volt = dict(device="2b5a:0021", path="1-1.4.3", name="Volt 2", card="V2", playback=True)
+    dock = dict(device="17ef:30bb", path="1-1.4.4.4", name="Dock audio", card="USB", playback=True)
+    st = dict(support=True, support_text="Linux 7.3.4's USB audio driver has PLAYBACK_URB_FIXUP.", loaded=True,
+              now=[], kept=[], conf="/etc/modprobe.d/rog-fand-usb-audio.conf", conf_exists=False, problem=None,
+              conflicts=[], devices=[dock, volt])
+    st.update(changes)
+    return st
+
+
+def usb_fix_tests(w):
+    card = w.usb_fix
+    module = core.usbaudio_module()
+    buttons = lambda: {b.text(): b.isEnabled() for b in (card.test, card.try_btn, card.keep, card.off)}
+    ours = "2b5a:0021:PLAYBACK_URB_FIXUP"
+    with patch.object(module, "state", return_value=usb_state()):
+        card.refresh()
+        check(card.device.count() == 2 and card.device.currentData() == "17ef:30bb",
+              "usb fix: interfaces listed; the first that plays is chosen")
+        card.device.setCurrentIndex(1)
+        check("Off." in card.status.text() and "✓" in card.status.text(), "usb fix: supported, off")
+        check(buttons() == {"Run test": True, "Try until restart": True, "Keep on": True, "Turn off": False},
+              "usb fix: test, try and keep offered while off")
+        card.test.click()
+        check(card.process is None and card.message.text().startswith("Dry run · pkexec /usr/bin/python3 -IB "
+              "/usr/local/lib/rog-fand/rog_usbaudio.py test 2b5a:0021 --phase-s 120"),
+              "usb fix: dry run shows the test command and starts nothing")
+        card.keep.click()
+        check(card.action is None and card.message.text().endswith("keep 2b5a:0021"), "usb fix: dry-run keep")
+        w.acting = True
+        card.test.click()
+        check("Wait for the current panel action" in card.message.text(), "usb fix: waits for other actions")
+        w.acting = False
+        card.refresh()
+        check(card.device.currentData() == "2b5a:0021", "usb fix: refresh keeps the chosen interface")
+    with patch.object(module, "state", return_value=usb_state(now=[ours], kept=[ours])):
+        card.refresh()
+        check("kept on at every start" in card.status.text(), "usb fix: kept and on")
+        check(buttons() == {"Run test": True, "Try until restart": False, "Keep on": False, "Turn off": True},
+              "usb fix: kept: turn off offered")
+    with patch.object(module, "state", return_value=usb_state(now=[ours])):
+        card.refresh()
+        check("until the next restart" in card.status.text() and card.keep.isEnabled() and card.off.isEnabled(),
+              "usb fix: on until restart: keep or turn off")
+    with patch.object(module, "state", return_value=usb_state(now=["*:*:PLAYBACK_URB_FIXUP"])):
+        card.refresh()
+        check("outside this panel" in card.status.text() and not card.test.isEnabled() and not card.off.isEnabled(),
+              "usb fix: set elsewhere: no test, nothing to turn off")
+    with patch.object(module, "state", return_value=usb_state(conflicts=["/etc/modprobe.d/audio.conf"])):
+        card.refresh()
+        check("audio.conf" in card.status.text() and not card.keep.isEnabled() and card.test.isEnabled(),
+              "usb fix: another quirk_flags setting blocks keep only")
+    with patch.object(module, "state", return_value=usb_state(
+            support=False, support_text="Linux 7.2's USB audio driver does not have PLAYBACK_URB_FIXUP; it "
+            "arrived in Linux 7.3.")):
+        card.refresh()
+        check("✗" in card.status.text() and not any(buttons().values()), "usb fix: unsupported kernel")
+    with patch.object(module, "state", return_value=usb_state(devices=[], kept=[ours], loaded=False)):
+        card.refresh()
+        check(card.device.itemText(0) == "2b5a:0021 · not connected" and buttons()["Turn off"]
+              and not buttons()["Run test"], "usb fix: a kept device that is unplugged can be turned off")
+
+    # A full test with a stand-in helper: events, results, fan mode switched and given back.
+    script = os.path.join(OUT, "fake_usbaudio.py")
+    Path(script).write_text(FAKE_USB_HELPER)
+    service = os.path.join(os.path.dirname(HERE), "service")
+    requests, running = [], []
+    card.runningChanged.connect(running.append)
+    card.dry_run = False
+    with patch.object(module, "state", return_value=usb_state()), \
+            patch.object(core, "root_owned", return_value=True), \
+            patch.object(core, "fan_service", return_value=("Running", {"mode": "auto"})), \
+            patch.object(core, "request_fan_mode", side_effect=requests.append), \
+            patch.object(q_message_box(), "question", return_value=q_message_box().Yes):
+        card.refresh()
+        card.device.setCurrentIndex(1)
+        with patch.object(core, "usbaudio_command",
+                          side_effect=lambda *a: [sys.executable, "-I", script, "done", service]):
+            card.test.click()
+            check(card.running and requests == ["off"] and w.cal_tab.action_in_progress(),
+                  "usb fix: test started, fan service set to Off, calibration held")
+            check(wait_for(lambda: not card.running), "usb fix: stand-in test finished")
+        check(card.table.rowCount() == 3 and card.table.item(1, 1).text() == "On"
+              and card.table.item(0, 3).text() == "1,500 ms/min", "usb fix: results table")
+        check(card.verdict.isVisibleTo(card) and card.verdict.text().startswith("The fix helped")
+              and card.keep.objectName() == "primaryAction" and card.test.objectName() == "",
+              "usb fix: a helpful result points at Keep on")
+        check(requests == ["off", "auto"] and running == [True, False], "usb fix: fan mode given back")
+        screenshot(card, "usb-fix-result.png")
+        with patch.object(core, "usbaudio_command",
+                          side_effect=lambda *a: [sys.executable, "-I", script, "stop", service]):
+            card.test.click()
+            check(wait_for(lambda: "left in this step" in card.phase.text()), "usb fix: live progress")
+            check(card.test.text() == "Stop test" and card.bar.value() == int(1000 * 30 / 540),
+                  "usb fix: stop offered, overall progress")
+            card.test.click()
+            check(wait_for(lambda: not card.running) and "Test stopped" in card.message.text()
+                  and requests[-1] == "auto", "usb fix: stopping puts things back")
+    card.dry_run = True
+    card.runningChanged.disconnect(running.append)
+    card.refresh()
+
+
+def q_message_box():
+    from PySide6.QtWidgets import QMessageBox
+    return QMessageBox
+
+
 def fand_sample(**changes):
     now = datetime.now(timezone.utc)
     s = dict(version=1, t=now.isoformat(), elapsed_s=100.0, dry_run=False, mode="auto", applied=True,
@@ -1009,6 +1142,7 @@ def main():
     service_tabs(w, q)
     autotune_tests(w)
     overview_tests(w)
+    usb_fix_tests(w)
 
     # ---- monitor: synthetic IRQ counts, no aplay ----
     wu = q.core.StallRate()
